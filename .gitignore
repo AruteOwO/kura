@@ -1,0 +1,26 @@
+# Your data: settings, AniList / Crunchyroll sign-ins, lists, history, caches (never uploaded)
+*.json
+*.bin
+*.log
+*.tmp
+cover_cache/
+backups/
+subtitle_backups/
+
+# Notes for working on Kura (kept on this PC)
+notes/
+CLAUDE.md
+
+# Built app and bundled programs (releases carry these)
+Kura.exe
+Kura.old-*.exe
+kura_runtime/
+kura_runtime.old-*/
+mpv/
+tools/
+release/
+update/
+
+# Python
+__pycache__/
+*.pyc

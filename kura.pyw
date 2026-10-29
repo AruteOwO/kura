@@ -1033,6 +1033,20 @@ def startup_command():
     return cmd + " --startup"
 
 
+def startup_target():
+    """The program the startup entry starts (None: no entry, or it can't be read)."""
+    if os.name != "nt":
+        return None
+    import shlex
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            cmd = winreg.QueryValueEx(key, APP_NAME)[0]
+        return Path(shlex.split(cmd, posix=False)[0].strip('"'))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def get_startup():
     if os.name != "nt":
         return False
@@ -29613,9 +29627,13 @@ def main():
     server.newConnection.connect(lambda: (server.nextPendingConnection(), win.show_window()))
     server.listen(instance)
 
-    if get_startup():
+    # Kura moved (the entry's program is gone): point the startup entry at this copy. Only then: a second copy (a
+    # test install, a self-test) taking over another copy's entry looked like malware to Windows Defender, which
+    # quarantined both exes and deleted the entry (Behavior:Win32/Persistence.A!ml, Oct 29 2026)
+    target = startup_target() if "--selftest" not in sys.argv else None
+    if target is not None and not target.exists():
         try:
-            set_startup(True)   # keep the startup entry pointing at this copy (script or exe)
+            set_startup(True)
         except OSError:
             pass
     if splash is None:

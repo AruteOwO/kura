@@ -43,11 +43,22 @@ and plays everything in its own player. Jellyfin can stream the same library.
 
 ## Install
 
-Download the newest `Kura-x.y.z.zip` and `Kura-runtime-*.zip` from [Releases](../../releases), unzip both into one
-folder (the runtime zip into a `kura_runtime` subfolder) and run `Kura.exe`. After that, Kura updates itself:
-Settings → App → Updates.
+Download **`Kura-Setup-x.y.z.exe`** from the [latest release](../../releases/latest) and run it. It installs for your
+Windows user only (no admin needed) into `%LOCALAPPDATA%\Programs\Kura`, with a Start menu shortcut and an entry in
+Windows' Apps list for uninstalling. After that, Kura updates itself: Settings → App → Updates.
 
-Your settings, sign-ins and caches are kept next to `Kura.exe` and are never part of a release.
+Kura isn't code-signed yet, so Windows SmartScreen may say "Windows protected your PC": choose **More info → Run
+anyway**.
+
+Your settings, sign-ins and caches are kept next to `Kura.exe` and are never part of a release. Uninstalling asks
+whether to remove them too (your anime library folders are never touched).
+
+<details>
+<summary>Portable copy instead (no installer)</summary>
+
+Download `Kura-x.y.z.zip` and the `Kura-runtime-*.zip` its release names, unzip both into one folder (the runtime zip
+into a `kura_runtime` subfolder) and run `Kura.exe`.
+</details>
 
 ## Run from source
 

@@ -6,8 +6,9 @@ Publish a new Kura version on GitHub (the in-app updater picks it up).
     python release.py 1.1.0 --dry-run          # build and package, publish nothing
 
 Needs git and the GitHub CLI (gh, logged in). Close Kura first (it builds Kura.exe). Steps: set APP_VERSION,
-build, zip the app (and the runtime, only when it changed since the last release), write manifest.json, commit +
-tag + push, create the release with those files.
+build, zip the app (and the runtime, only when it changed since the last release), write manifest.json, build the
+installer (Kura-Setup-x.y.z.exe, Inno Setup's ISCC: installer.iss), commit + tag + push, create the release with those
+files. The zips are what the in-app updater downloads; the installer is for a first install.
 """
 import argparse
 import json
@@ -35,6 +36,24 @@ def set_version(version):
     if not n:
         sys.exit("APP_VERSION not found in kura.pyw")
     p.write_bytes(new.encode("utf-8"))
+
+
+def find_iscc():
+    import os
+    import shutil
+    for p in (shutil.which("ISCC"), Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Inno Setup 6/ISCC.exe",
+              Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"), Path(r"C:\Program Files\Inno Setup 6\ISCC.exe")):
+        if p and Path(p).is_file():
+            return str(p)
+    sys.exit("Inno Setup 6 not found (it builds the installer): winget install JRSoftware.InnoSetup --scope user")
+
+
+def build_installer(version):
+    """Kura-Setup-<version>.exe in release/: the app, the whole runtime and manifest.json (as kura_installed.json)."""
+    print("Building the installer...")
+    run(find_iscc(), "/Q", f"/DAppVersion={version}", f"/DSourceDir={HERE}", f"/DManifest={OUT / 'manifest.json'}",
+        f"/O{OUT}", str(HERE / "installer.iss"))
+    return OUT / f"Kura-Setup-{version}.exe"
 
 
 def zip_files(target, files):
@@ -96,6 +115,7 @@ def main():
                 "scripts": {n: updater.sha256(HERE / n) for n in updater.SCRIPTS}}
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     upload.append(OUT / "manifest.json")
+    upload.append(build_installer(version))
     print("Packaged:", ", ".join(f"{p.name} ({p.stat().st_size / 2 ** 20:.1f} MB)" for p in upload))
     if a.dry_run:
         print("Dry run: nothing published. (kura.pyw now says", version, "- undo with git checkout kura.pyw)")

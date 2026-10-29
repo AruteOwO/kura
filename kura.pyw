@@ -9099,6 +9099,7 @@ class SchedulePage(AccountPage):
     def week_page(self, have_ids):
         from datetime import date as _date, timedelta
         days, by_day, needs = self.week_data(have_ids)
+        self.week_made = (have_ids, days, by_day)   # check_fit on show: the same week, no second pass
         today = _date.today()
         all_days, days = days, self.fit_days(days, by_day, today)
         wrap = QWidget()
@@ -9145,6 +9146,7 @@ class SchedulePage(AccountPage):
         bottom = QWidget()
         narrow = self.scroll.viewport().width() < 1180   # Needs you on its own row, the other two under it
         self.shown_days = (len(days), narrow)
+        self.shown_width = self.scroll.viewport().width()
         bottom.setFixedHeight(620 if narrow else 300)
         grid = QGridLayout(bottom)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -9286,6 +9288,13 @@ class SchedulePage(AccountPage):
         if self.account and self.account.connected:
             self.account.refresh(max_age=3600)
         super().showEvent(e)
+        if self.settings.get("schedule_view", "week") == "week":
+            # built while hidden (the loading screen) its width was a guess: how many days fit / where Needs you
+            # goes is checked again at the real width before it paints
+            if self.layout():
+                self.layout().activate()
+            if self.scroll.viewport().width() != getattr(self, "shown_width", None):
+                self.check_fit()
         if not hasattr(self, "ticker"):
             self.ticker, self.ticks = QTimer(self, interval=30000, timeout=self.on_tick), 0
         self.ticker.start()
@@ -9307,7 +9316,12 @@ class SchedulePage(AccountPage):
         from datetime import date as _date, timedelta
         if not getattr(self, "shown_days", None) or not (self.account and self.account.connected):
             return
-        days, by_day, _ = self.week_data(None if self.show_all.isChecked() else self.library.library_ids())
+        have = None if self.show_all.isChecked() else self.library.library_ids()
+        made = getattr(self, "week_made", None)
+        if made and not self.dirty and made[0] == have:
+            days, by_day = made[1], made[2]
+        else:
+            days, by_day, _ = self.week_data(have)
         fits = (len(self.fit_days(days, by_day, _date.today())), self.scroll.viewport().width() < 1180)
         if fits != self.shown_days:
             self.rebuild()
@@ -18730,9 +18744,15 @@ class KickoffPage(Page):
         if getattr(self, "dirty", True) or time.time() - getattr(self, "built_at", 0) > 1800:
             self.fresh_rebuild()
 
-    def fresh_rebuild(self):
+    def fresh_rebuild(self, force=False):
+        """force: the loading screen builds it while hidden. Otherwise a hidden page only updates its sidebar
+        count and stays dirty (marking it fresh there left Kickoff blank until a list change)."""
+        if not (force or self.isVisible()):
+            self.dirty = True
+            self.count_changed.emit(self.count())
+            return
         self.dirty, self.built_at = False, time.time()
-        self.rebuild()
+        self.rebuild(force)
 
     def schedule(self, *_):
         """Your list changed. While you're looking at the page it isn't redrawn under you (only the sidebar count
@@ -18764,8 +18784,8 @@ class KickoffPage(Page):
                       key=lambda x: -((x["media"].get("startDate") or {}).get("year") or 0))
         return starting, airing, coming, done
 
-    def rebuild(self):
-        if not self.isVisible():
+    def rebuild(self, force=False):
+        if not (force or self.isVisible()):
             self.count_changed.emit(self.count())
             return
         body = QWidget()
@@ -29410,6 +29430,35 @@ class KuraSplash(QWidget):
         pass
 
 
+def lay_out_hidden(page, draw=False):
+    """Give a page in the hidden window its real size before building it: a stack only sizes the page it shows, and
+    a hidden widget's layouts wait for its first show (Schedule built at 640 px fitted 3 days, narrow)."""
+    from PySide6.QtGui import QResizeEvent
+
+    def settle(w):
+        w.ensurePolished()   # its style sheet now, not all at once on the first show
+        if QWidget.layout(w):
+            QWidget.layout(w).activate()
+        if w.testAttribute(Qt.WA_PendingResizeEvent):
+            w.setAttribute(Qt.WA_PendingResizeEvent, False)
+            QApplication.sendEvent(w, QResizeEvent(QWidget.size(w), QWidget.size(w)))
+    chain, w = [], page.parentWidget()
+    while w is not None:
+        chain.insert(0, w)
+        w = w.parentWidget()
+    for w in chain:
+        settle(w)
+    if page.parentWidget() is not None:
+        page.resize(QWidget.size(page.parentWidget()))
+    todo = [page]
+    while todo:
+        w = todo.pop()
+        settle(w)
+        todo += [c for c in w.children() if isinstance(c, QWidget) and not c.isWindow()]
+    if draw:   # paint it once off screen: covers scaled, text laid out (the first show was ~250 ms of that)
+        page.grab()
+
+
 def warm_up(win, splash, finish):
     """The loading screen's steps: wait for the library scan and the AniList sync, make today's Live TV line-up, start
     this season's Seasonal list, build Settings and Statistics; each step waits at most a few seconds."""
@@ -29440,9 +29489,13 @@ def warm_up(win, splash, finish):
                 win.stats.render()
             elif i == 5:   # they keep what they made until something changes (mark_dirty / dirty)
                 for page in (win.todo, win.schedule):
+                    lay_out_hidden(page)
                     page.dirty, page.built_at = False, time.time()
                     page.rebuild()
-                win.kickoff.fresh_rebuild()
+                    lay_out_hidden(page, draw=True)   # and what it made
+                lay_out_hidden(win.kickoff)
+                win.kickoff.fresh_rebuild(force=True)
+                lay_out_hidden(win.kickoff, draw=True)
         except Exception:
             klog.exception(f"Warm-up step '{text}'")
 

@@ -32,3 +32,11 @@ The built-in player needs `libmpv-2.dll` in an `mpv` folder next to `kura.pyw` (
 
 `release.py` uploads the big runtime only when it changed since the last release; the in-app updater downloads only
 what's different, checks every file, backs up your data, then restarts Kura on the new version.
+
+## License
+
+Kura is free software under the **GNU General Public License v3.0**: see [LICENSE](LICENSE). You can use, study,
+share and change it; if you share a changed version, it has to stay under the GPL with its source available.
+
+The release bundles other projects under their own licenses: mpv / libmpv and FFmpeg (GPL / LGPL), Qt for Python
+(PySide6, LGPL v3, kept as separate replaceable libraries in `kura_runtime`) and yt-dlp (Unlicense).

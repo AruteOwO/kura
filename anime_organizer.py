@@ -69,11 +69,9 @@ MAKE_ICONS = True
 # Give Season 1 / Season 2 / OVAs / Specials / Movies folders their own covers
 SEASON_ICONS = True
 
-# Fix a wrong season cover. Key = show folder name, lowercase.
-# Value = {season number: AniList ID of that season}
-SEASON_COVERS = {
-    # "shingeki no kyojin": {4: 110277},
-}
+# Which AniList entry a season folder is. Key = show folder name, lowercase. Value = {season number: AniList ID}.
+# Filled from user_overrides.json (Kura: a show page's Edit info), not by editing this file.
+SEASON_COVERS = {}
 
 # Put a junction (a folder that opens the real one) to each spin-off / side story
 # inside its parent show, e.g.  Parent / Spin Offs / Spinoff Name.
@@ -99,13 +97,13 @@ RELATED_OVERRIDES = {
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".webm"}
 SIDECAR_EXTS = {".ass", ".ssa", ".srt", ".vtt", ".sub", ".idx"}  # moved along with the video
 
-# Fix a wrong match. Key = the title as parsed from the filename, lowercase
-# (check the log to see it). Value = AniList ID (the number in anilist.co/anime/<ID>),
-# or {"id": ..., "season": N} to also force the season folder.
-OVERRIDES = {
-    # "sousou no frieren": 154587,
-    # "mushoku tensei ii": {"id": 108465, "season": 2},
-}
+# Fix a wrong match. Key = a title (a show folder's name, or one parsed from a file name), lowercase. Value = AniList
+# ID, or {"id": ..., "season": N} to also force the season folder. Filled from user_overrides.json (Kura: a show
+# page's Edit info → change the match), not by editing this file.
+OVERRIDES = {}
+FOLDER_SEASONS = {}   # {show folder name, lowercase: {subfolder name: season number}} ("counts as Season 2")
+DISPLAY_TITLES = {}   # {AniList ID as text: the title Kura shows}
+EPISODE_SPLIT = {}    # {AniList ID as text: AniList episodes per file} (two-in-one episodes)
 
 # ======================================================================
 
@@ -115,8 +113,43 @@ SCRIPT_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", Fa
 CACHE_FILE = SCRIPT_DIR / "anilist_cache.json"
 LIST_FILE = SCRIPT_DIR / "anilist_list.json"   # your AniList list, saved by the app when you connect
 LOG_FILE = SCRIPT_DIR / "anime_organizer.log"
+USER_OVERRIDES_FILE = SCRIPT_DIR / "user_overrides.json"   # your own fixes (Kura: Edit info on a show page)
 IS_WINDOWS = os.name == "nt"
 USER_AGENT = "AnimeOrganizer/1.0"
+
+
+def load_user_overrides():
+    """Your fixes from user_overrides.json into OVERRIDES / SEASON_COVERS / FOLDER_SEASONS / DISPLAY_TITLES /
+    EPISODE_SPLIT (kept as the same dict objects, so every module that holds them sees the change). The file:
+    {"titles": {folder or title, lowercase: AniList id}, "seasons": {show folder, lowercase: {"2": id}},
+     "folder_seasons": {show folder, lowercase: {subfolder: n}}, "display": {"id": title}, "split": {"id": 2}}."""
+    try:
+        data = json.loads(USER_OVERRIDES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    OVERRIDES.clear()
+    OVERRIDES.update({k.lower(): v for k, v in (data.get("titles") or {}).items()})
+    SEASON_COVERS.clear()
+    SEASON_COVERS.update({k.lower(): {int(n): i for n, i in v.items()} for k, v in (data.get("seasons") or {}).items()})
+    FOLDER_SEASONS.clear()
+    FOLDER_SEASONS.update({k.lower(): dict(v) for k, v in (data.get("folder_seasons") or {}).items()})
+    DISPLAY_TITLES.clear()
+    DISPLAY_TITLES.update(data.get("display") or {})
+    EPISODE_SPLIT.clear()
+    EPISODE_SPLIT.update({k: int(v) for k, v in (data.get("split") or {}).items() if int(v) > 1})
+    return data
+
+
+def save_user_overrides(data):
+    """Write the fixes (empty parts dropped) and load them again."""
+    data = {k: v for k, v in data.items() if v}
+    tmp = USER_OVERRIDES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, USER_OVERRIDES_FILE)
+    return load_user_overrides()
+
+
+load_user_overrides()
 
 log = logging.getLogger("organizer")
 
@@ -367,9 +400,11 @@ def choose(results, search, want_movie):
                 if want_movie is None or (m.get("format") == "MOVIE") == want_movie:
                     return m
         for m in pool:
-            if m.get("format") in preferred:
+            if m.get("format") in preferred and title_fits(search, to_entry(m)):
                 return m
-    return results[0]
+    # nothing like the name (AniList's search answered "Momoiro Paradox Classroom Special" with Kemono Friends):
+    # no match beats a wrong show
+    return next((m for m in results if title_fits(search, to_entry(m))), None)
 
 
 def plain_title(text):
@@ -403,7 +438,7 @@ def to_entry(media):
     cover = (media.get("coverImage") or {})
     return {"id": media["id"], "romaji": t.get("romaji"), "english": t.get("english"),
             "format": media.get("format"), "cover": cover.get("extraLarge") or cover.get("large"),
-            "adult": media.get("isAdult")}
+            "adult": media.get("isAdult"), "synonyms": media.get("synonyms") or []}
 
 
 def preferred_name(entry):
@@ -437,6 +472,9 @@ def lookup(title, want_movie, cache):
         return fetch_by_id(oid, cache), season
 
     key = f"{title.lower()}|{'movie' if want_movie else 'show'}"
+    hit = cache.get(key)
+    if hit and "synonyms" not in hit and not title_fits(title, hit):
+        cache.pop(key)   # matched before results had to resemble the name: look again (now with its other names)
     if key not in cache:
         miss_key = f"miss:{key}"
         if time.time() - cache.get(miss_key, 0) < MISS_RETRY_DAYS * 86400:
@@ -588,10 +626,10 @@ def show_family(entry, cache, offline=False):
 
 
 def classify_folder(name, fam):
-    """What a subfolder of a show is: {"season": n, "group": n, "entry"} for a season
-    ("Season 2", "Season 2 - The Evil Eye", or named after it), {"entry"} for an OVA/special/
-    side story named after its AniList entry, {"kind": "OVA"/"SPECIAL"/"MOVIE"} for a generic
-    "OVAs"/"Specials" folder, or None."""
+    """What a subfolder of a show is: {"season": n, "group": n, "entry"} for a TV season
+    ("Season 2", "Season 2 - The Evil Eye", or named after it), {"kind": "OVA"/"SPECIAL"/"MOVIE"}
+    for a generic "OVAs"/"Specials" folder, or None. Only TV seasons belong in a show's folder (user's
+    rule), so a folder named after an OVA / side story isn't matched to it: that entry gets its own folder."""
     import difflib
     m = SEASON_DIR_RE.fullmatch(name.strip())
     if m:
@@ -601,11 +639,11 @@ def classify_folder(name, fam):
     key = norm_title(name)
     if key in KIND_WORD:   # plain "OVAs" / "Specials" / "Movies": the kind, not a title that ends that way
         return {"kind": KIND_WORD[key]}
-    # "Queen's Blade Vanquished Queens" for the entry "Vanquished Queens": also try without the show's name
+    # "Queen's Blade Rebellion" for the season "Rebellion": also try without the show's name
     base = franchise_norm(fam)
     short = key[len(base):].strip() if base and key.startswith(base + " ") else None
     best, score = None, 0.0
-    for mem in (fam or {}).get("members", []):
+    for mem in (fam or {}).get("seasons", []):
         for t in (mem["entry"].get("english"), mem["entry"].get("romaji")):
             tk = norm_title(t)
             if not tk or not key:
@@ -624,20 +662,6 @@ def classify_folder(name, fam):
     if k:
         return {"kind": KIND_WORD[k.group(1).lower()]}
     return None
-
-
-def classify_folder_online(name, fam, cache):
-    """classify_folder, plus an AniList search for folders AniList doesn't link to the show
-    ("Queen's Blade Grimoire"): accepted only when the result's title starts with the show's name."""
-    c = classify_folder(name, fam)
-    if c and (c.get("entry") or c.get("season")):
-        return c
-    base = franchise_norm(fam)
-    if base and norm_title(name).startswith(base + " "):
-        e, _ = lookup(name, False, cache)
-        if e and any(norm_title(t).startswith(base) for t in (e.get("english"), e.get("romaji")) if t):
-            return {"season": None, "group": None, "entry": e}
-    return c
 
 
 def _common_prefix(titles):
@@ -848,8 +872,12 @@ def version_for_file(base, filename):
 
 def season_dir(show_dir, group, fam):
     """The folder for a season (by release-group count): the one you already have, whatever it's
-    called, else a new one named the way SEASON_FOLDER_STYLE says."""
+    called (or the one you said counts as that season: Edit info), else a new one named the way
+    SEASON_FOLDER_STYLE says."""
     if show_dir.is_dir():
+        for name, n in (FOLDER_SEASONS.get(show_dir.name.lower()) or {}).items():
+            if n == group and (show_dir / name).is_dir():
+                return show_dir / name
         for d in sorted(show_dir.iterdir()):
             if d.is_dir() and not is_link(d) and d.name not in (SPINOFF_FOLDER, SIDE_STORY_FOLDER):
                 c = classify_folder(d.name, fam)
@@ -1366,7 +1394,7 @@ def make_season_icons(show_dir, entry, cache, dry, force=False):
         named = None if m else classify_folder(d.name, show_family(entry, cache) if entry else None)
         if n is not None and n in overrides:
             sub_entry = fetch_by_id(overrides[n], cache)
-        elif named and named.get("entry"):     # "Queen's Blade Rebellion", "Vanquished Queens"...
+        elif named and named.get("entry"):     # a season named after itself ("Queen's Blade Rebellion")
             sub_entry = named["entry"]
         elif smap:
             if n is not None and 1 <= n <= len(smap["seasons"]):
@@ -1383,11 +1411,29 @@ def make_season_icons(show_dir, entry, cache, dry, force=False):
 
 # ---------------------------------------------------------------- sorting
 
-def find_show_folder(library, names):
-    existing = {p.name.lower(): p for p in library.iterdir() if p.is_dir()}
+def folder_key(name):
+    """A title reduced to its letters and digits: "KAMUI ---He's Behind You", "KAMUI Hes Behind You" and
+    "KAMUI.---Hes.behind.you" are one show, whatever the release did with apostrophes, dashes and dots."""
+    import unicodedata
+    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", name or "").lower())
+
+
+def find_show_folder(library, names, loose=True):
+    """The library folder for a show: by exact name first, then (`loose`) ignoring punctuation (folder_key).
+    Not found: where it would go (the first name)."""
+    folders = [p for p in library.iterdir() if p.is_dir()]
+    existing = {p.name.lower(): p for p in folders}
     for n in names:
         if n and n.lower() in existing:
             return existing[n.lower()]
+    if loose:
+        keys = {}
+        for p in folders:
+            keys.setdefault(folder_key(p.name), p)
+        for n in names:
+            k = folder_key(n)
+            if len(k) >= 4 and k in keys:
+                return keys[k]
     return library / names[0]
 
 
@@ -1443,6 +1489,78 @@ def folder_season(video, title, library):
     return None
 
 
+GENERIC_WORDS = {"op", "ed", "nc", "ncop", "nced", "pv", "cm", "menu", "menus", "bd", "dvd", "episode", "episodes",
+                 "ep", "e", "s", "ending", "endings", "opening", "openings", "clean", "creditless", "textless", "full",
+                 "audio", "preview", "previews", "trailer", "teaser", "promo", "spot", "vol", "volume", "special",
+                 "specials", "bonus", "extra", "extras", "tv", "version", "ver", "song", "theme", "and", "the", "part",
+                 "video", "movie", "ova", "oad"}
+
+
+def generic_title(title):
+    """A name that says nothing about the show ("OP", "PV1", "Episode 12", "S1 ED 01", "BD Menu (Vol 2)",
+    "Clean Ending"): searching AniList for it finds some random show."""
+    words = re.findall(r"[a-z]+|\d+", (title or "").lower())
+    return all(w in GENERIC_WORDS or re.fullmatch(r"\d+|[se]p?\d+|v\d+|vol\d+|op\d+|ed\d+|pv\d+|cm\d+", w)
+               for w in words)
+
+
+GENERIC_FOLDERS = {"anime", "downloads", "download", "completed", "complete", "torrents", "torrent", "incoming",
+                   "new", "tv", "videos", "seeding"}
+
+
+def batch_title(video, library):
+    """The show a batch folder is named after ("[Group] Show (BD 1080p)/03 - Episode Title.mkv"): some batches name
+    their files after the episodes. The nearest folder above the file that holds two or more videos and has a
+    title (not "Season 2", not your downloads folder). None otherwise."""
+    roots = {os.path.normcase(str(library))}
+    try:
+        s = json.loads((SCRIPT_DIR / "gui_settings.json").read_text(encoding="utf-8"))
+        roots |= {os.path.normcase(str(Path(s[k]))) for k in ("downloads", "library") if s.get(k)}
+    except (OSError, ValueError):
+        pass
+    for folder in list(video.parents)[:3]:
+        if not folder.name or os.path.normcase(str(folder)) in roots or folder.name.lower() in GENERIC_FOLDERS:
+            return None
+        ftitle = anitopy_parse(folder.name).get("anime_title") or ""
+        ftitle = ftitle if isinstance(ftitle, str) else ftitle[0]
+        if not ftitle or SEASON_DIR_RE.fullmatch(folder.name) or generic_title(folder.name):
+            continue   # "Season 2" / "Extras" / "Openings & Endings" inside the batch: look one level up
+        try:
+            videos = sum(1 for f in folder.rglob("*") if f.suffix.lower() in VIDEO_EXTS)
+        except OSError:
+            return None
+        return ftitle if videos >= 2 else None
+    return None
+
+
+def title_fits(title, entry):
+    """Whether a parsed title really is this AniList entry's (and not an episode title that happened to match)."""
+    import difflib
+    key = folder_key(title)
+    for name in (entry.get("english"), entry.get("romaji"), preferred_name(entry), other_name(entry),
+                 *(entry.get("synonyms") or [])):
+        k = folder_key(name)
+        if k and key and (k in key or key in k or difflib.SequenceMatcher(None, k, key).ratio() >= 0.6):
+            return True
+    return False
+
+
+KIND_NAMES = {"OVA": ("OVA", "OAD"), "SPECIAL": ("Specials", "Special"), "MOVIE": ("Movie",)}
+
+
+def named_kind_entry(title, kind, cache):
+    """An entry AniList names exactly after the show and the kind ("Queen's Blade OVA" for "Queen's Blade OVA - 01"),
+    which the relations alone can't single out. None otherwise."""
+    fmts = {"OVA": ("OVA", "SPECIAL"), "SPECIAL": ("SPECIAL", "OVA"), "MOVIE": ("MOVIE",)}[kind]
+    for word in KIND_NAMES[kind]:
+        name = f"{title} {word}"
+        e, _ = lookup(name, kind == "MOVIE", cache)
+        if e and e.get("format") in fmts and any(plain_title(n) == plain_title(name)
+                                                  for n in (e.get("romaji"), e.get("english")) if n):
+            return e
+    return None
+
+
 OWN_ENTRY_RELATIONS = ("SIDE_STORY", "SEQUEL", "PREQUEL", "SUMMARY", "OTHER", "ALTERNATIVE", "COMPILATION")
 
 
@@ -1480,7 +1598,28 @@ def sort_file(video, library, cache, dry):
     want_movie = bool(types & {"MOVIE", "GEKIJOUBAN"}) or (
         episode is None and season is None and not types & (EXTRA_TYPES - {"MOVIE", "GEKIJOUBAN"}))
 
-    entry, forced_season = lookup(title, want_movie, cache)
+    generic = generic_title(title)
+    entry, forced_season = (None, None) if generic else lookup(title, want_movie, cache)
+    lead_named = False
+    if entry is None or not title_fits(title, entry):
+        # named after its episode, not the show ("03 - The Beginning.mkv"): the batch folder's name says which show
+        btitle = batch_title(video, library)
+        if btitle and folder_key(btitle) != folder_key(title):
+            lead = re.match(r"\s*(?:E|EP|Episode\s*)?(\d{1,3})(?:v\d)?(?!\d)", video.stem, re.IGNORECASE)
+            if episode is None and lead:   # "01 - Maomao" (anitopy takes it all for a title): episode 1, not a movie
+                episode, want_movie, lead_named = lead.group(1), False, True
+            bentry, bseason = lookup(btitle, want_movie, cache)
+            if bentry:
+                log.info(f"  ('{title}' doesn't look like the show's name: the batch folder says '{btitle}')")
+                entry, forced_season, title = bentry, bseason, btitle
+                generic = False
+    if generic:   # "OP.mkv" with nothing around it that says which show: better left than sorted into a random one
+        log.info(f"{video.name}\n  '{title}' doesn't say which show and no batch folder does either: left where it is")
+        if PLAN is not None:
+            PLAN.append({"src": str(video), "dest": str(video.parent), "name": video.name, "show": "", "folder": "",
+                         "match": "", "parsed": title, "subs": 0, "new_show": False,
+                         "skip": "the name doesn't say which show"})
+        return None, None
     season = forced_season or season
     if entry and ADULT_LIBRARY_DIR and is_adult_entry(entry, cache):   # 18+: the adult library instead
         library = Path(ADULT_LIBRARY_DIR)
@@ -1502,7 +1641,8 @@ def sort_file(video, library, cache, dry):
         if season and season > 1:   # "S3 - OVA1": the title matched season 1, the OVA belongs to season 3
             fam = show_family(entry, cache) or {}
             base = next((m["entry"] for m in fam.get("seasons", []) if m["group"] == season), None)
-        own = own_entry(base, kind, episode_number(episode), cache) if base else None
+        own = (named_kind_entry(title, kind, cache) or own_entry(base, kind, episode_number(episode), cache)
+               if base else None)
         if own:
             log.info(f"  ({kind.lower()} of #{base['id']}: AniList has it as #{own['id']} "
                      f"'{preferred_name(own)}', so it gets a folder of its own)")
@@ -1510,6 +1650,20 @@ def sort_file(video, library, cache, dry):
             # its subfolder follows AniList's format, so "13 (Special)" and "14 (OVA)" of one entry stay together
             types = (set(types) - {"OVA", "OAD", "OAV", "SPECIAL", "SPECIALS", "SP"}) | (
                 {"SPECIAL"} if own["format"] == "SPECIAL" else {"OVA"} if own["format"] == "OVA" else set())
+    # a later season named on its own ("High School DxD NEW - 01", "Queen's Blade Rebellion - 01"): only TV seasons
+    # go in a show's folder, so it's that season of the show, in the show's folder (not a folder of its own)
+    first = None
+    if entry and not own_folder and not is_movie and entry.get("format") in TV_FORMATS:
+        try:
+            fam = show_family(entry, cache) or {}
+        except Exception:
+            fam = {}
+        mem = next((m for m in fam.get("seasons", []) if m["entry"]["id"] == entry["id"]), None)
+        if mem and mem["group"] and mem["group"] > 1:
+            first = next((m["entry"] for m in fam["seasons"] if m["group"] == 1), None)
+            if first and season is None:
+                season = mem["group"]
+                log.info(f"  (#{entry['id']} is season {season} of '{preferred_name(first)}': into its folder)")
     # "Show - 13" with no season in the name, when season 1 has 12 episodes: season 2 (and named "Show - S02E01")
     n = episode_number(episode)
     renamed = None
@@ -1534,10 +1688,19 @@ def sort_file(video, library, cache, dry):
         names = [safe_name(preferred_name(entry)), safe_name(other_name(entry) or "")]
         if not own_folder:   # the parsed title is the parent show's ("Bikini Warriors"): it would find its folder
             names.append(safe_name(title))
+        if first:   # the show's own folder first; a folder you kept for this season alone still counts after it
+            names = [safe_name(preferred_name(first)), safe_name(other_name(first) or "")] + names
         log.info(f"{video.name}\n  parsed '{title}' -> AniList #{entry['id']} '{preferred_name(entry)}'")
     else:
         names = [safe_name(title)]
         log.info(f"{video.name}\n  parsed '{title}' -> no AniList match, using parsed title")
+        # the release spelled it differently ("Hes" for "He's"): the folder you already have finds it on AniList
+        known = find_show_folder(library, names)
+        if known.exists() and known.name != names[0]:
+            entry, _ = lookup(known.name, want_movie, cache)
+            log.info(f"  (your folder '{known.name}' has the same name"
+                     + (f": AniList #{entry['id']} '{preferred_name(entry)}')" if entry else ")"))
+            names = [known.name]
 
     show_dir = find_show_folder(library, names)
     sub = pick_subfolder(season, types, is_movie)
@@ -1558,13 +1721,17 @@ def sort_file(video, library, cache, dry):
         dest_dir = version
 
     name = renamed[0] if renamed else video.name
+    if lead_named and entry:   # "01 - Maomao.mkv" → "The Apothecary Diaries - 01 - Maomao.mkv": Kura and Jellyfin can read it
+        named = f"{safe_name(preferred_name(entry))} - {video.name}"
+        if episode_number(parse(named)[3]) == episode_number(episode):
+            name, renamed = named, renamed or (named, None, None)
     moved = transfer(video, dest_dir / name, dry)
     if moved:
         subs = list(sidecars(video))
         for sub in subs:
             transfer(sub, dest_dir / (renamed_sidecar(sub, video, name) if renamed else sub.name), dry)
         log.info(f"  -> {dest_dir}" + (f" as {name}" if renamed else ""))
-        if renamed and not dry:
+        if renamed and renamed[1] and not dry:
             remember_start(show_dir, renamed[1], renamed[2])
     if dry and PLAN is not None:
         PLAN.append({"src": str(video), "dest": str(dest_dir), "name": name, "show": show_dir.name,
@@ -1959,10 +2126,10 @@ def supports_links(library):
 
 
 def extras_season_label(show_dir, fam, names):
-    """The show's own folder an extra belongs to: a season ("Season 2", "Freezing Vibration") or an OVA / side
-    story kept as a named folder ("Queen's Blade Grimoire"), from the names around it ("S2 Extras", the file's title
-    "High School DxD BorN"); None when the show has fewer than two such folders or nothing says which."""
-    folders = {}   # ("season", n) / ("entry", id) → folder name
+    """The season folder an extra belongs to ("Season 2", "Freezing Vibration"), from the names around it
+    ("S2 Extras", the file's title "High School DxD BorN"); None when the show has fewer than two seasons or
+    nothing says which."""
+    folders = {}   # ("season", n) → folder name
     try:
         for d in sorted(show_dir.iterdir()):
             if not d.is_dir() or is_link(d) or d.name in (EXTRAS_FOLDER, "Specials", SPINOFF_FOLDER, SIDE_STORY_FOLDER):
@@ -1973,10 +2140,6 @@ def extras_season_label(show_dir, fam, names):
                 folders.setdefault(("season", c["season"]), d.name)
             elif m:
                 folders.setdefault(("season", int(m.group(1))), d.name)
-            elif c and c.get("entry"):
-                folders.setdefault(("entry", c["entry"]["id"]), d.name)
-            else:   # a folder AniList doesn't link ("Queen's Blade Grimoire"): matched by its name
-                folders.setdefault(("name", d.name), d.name)
     except OSError:
         return None
     if len(folders) < 2:
@@ -1990,11 +2153,6 @@ def extras_season_label(show_dir, fam, names):
         c = classify_folder(name, fam) if fam else None
         if c and c.get("season") and not c.get("numbered") and ("season", c["season"]) in folders:
             return folders[("season", c["season"])]
-        if c and c.get("entry") and ("entry", c["entry"]["id"]) in folders:
-            return folders[("entry", c["entry"]["id"])]
-        for (k, _), folder in folders.items():   # the folder's own name in it ("Queen's Blade Grimoire")
-            if norm_title(folder) and norm_title(folder) == norm_title(name):
-                return folder
     return None
 
 
@@ -2192,7 +2350,8 @@ def main():
             for video in list(collect(paths, library)):
                 try:
                     show_dir, entry = sort_file(video, library, cache, args.dry_run)
-                    touched.setdefault(show_dir, entry)
+                    if show_dir is not None:
+                        touched.setdefault(show_dir, entry)
                 except Exception:
                     log.exception(f"Failed on {video.name}")
 

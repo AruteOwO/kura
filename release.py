@@ -72,6 +72,7 @@ def main():
     app_files += [(rt / n, f"{updater.RUNTIME}/{n}") for n in updater.APP_ONLY]
     app_files += [(f, f"fonts/{f.name}") for f in sorted((HERE / "fonts").iterdir()) if f.is_file()]
     app_files += [(HERE / n, n) for n in updater.SCRIPTS]
+    app_files += [(HERE / "LICENSE", "LICENSE")]   # GPL-3.0: the license ships with every copy
     app = zip_files(OUT / f"Kura-{version}.zip", app_files)
     app["url"] = base + app["name"]
 

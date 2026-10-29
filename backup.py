@@ -27,12 +27,14 @@ FILES = [
     ("crunchyroll_history.json", "Crunchyroll history"),
     ("crunchyroll_map.json", "Crunchyroll matches"),
     ("anilist_cache.json", "AniList matches for your folders"),
+    ("user_overrides.json", "Your show fixes (Edit info)"),
+    ("season_starts.json", "Where renamed seasons started counting"),
     ("anilist_list.json", "Your AniList list (offline copy)"),
     ("alerts_cache.json", "Sequel alerts already seen"),
     ("anilist_token.bin", "AniList sign-in"),
     ("crunchyroll_token.bin", "Crunchyroll sign-in"),
 ]
-REFERENCE = [("anime_organizer.py", "Organizer script with your overrides (a copy to look at, not restored)")]
+REFERENCE = [("anime_organizer.py", "Organizer script (a copy to look at, not restored)")]
 NAMES = dict(FILES + REFERENCE)
 PENDING = "restore_pending.json"
 PREFIX = "Kura backup "

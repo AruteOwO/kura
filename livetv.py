@@ -107,9 +107,11 @@ class Durations:
             d = float((r.stdout or "0").strip() or 0)
         except (OSError, ValueError, subprocess.SubprocessError):
             d = 0.0
-        if d > 0:
+        try:   # a file ffprobe can't read is remembered as 0 too (it isn't asked again until the file changes)
             with self.lock:
-                self.data[os.path.normcase(f)] = [self.key(f), round(d, 3)]
+                self.data[os.path.normcase(f)] = [self.key(f), round(max(d, 0.0), 3)]
+        except OSError:
+            pass
         return d or None
 
     def fill(self, files, progress=None, cancelled=None, workers=4):
@@ -117,13 +119,16 @@ class Durations:
         todo = [f for f in files if self.get(f) is None]
         from concurrent.futures import ThreadPoolExecutor
         done = 0
-        with ThreadPoolExecutor(workers) as pool:
+        pool = ThreadPoolExecutor(workers)
+        try:
             for _ in pool.map(self.probe, todo):
                 done += 1
                 if progress and done % 10 == 0:
                     progress(done, len(todo))
                 if cancelled and cancelled():
                     break
+        finally:   # stopped early: the ones not started yet are dropped, not waited for
+            pool.shutdown(wait=True, cancel_futures=True)
         self.save()
         return done
 

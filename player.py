@@ -12,6 +12,7 @@ A/S cycle audio/subtitles · [ ] speed · O skip opening/ending · E episode lis
 """
 
 import json
+import logging
 import os
 import re
 import threading
@@ -22,8 +23,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import (QColor, QFont, QFontDatabase, QIcon, QImage, QLinearGradient, QOpenGLContext, QPainter,
+from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QLinearGradient, QOpenGLContext, QPainter,
                            QPainterPath, QPen, QPixmap)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
@@ -76,9 +77,10 @@ _skip_store = None
 SKIP_NAMES = {"op": "Opening", "mixed-op": "Opening", "ed": "Ending", "mixed-ed": "Ending", "recap": "Recap"}
 
 
-def aniskip(mal, episode, fetch=True):
+def aniskip(mal, episode, fetch=True, empty_days=7):
     """AniSkip's opening / ending / recap times for an episode: [(start, end, "Opening")...], from the cache
-    (30 days; "nothing known" 7 days) or asked once. None when it isn't cached and fetch is off."""
+    (30 days; "nothing known" `empty_days`: the player asks again after half a day, since times for a new
+    episode are submitted after it airs) or asked once. None when it isn't cached and fetch is off."""
     global _skip_store
     key = f"{mal}:{int(episode)}"
     with _skip_lock:
@@ -88,7 +90,7 @@ def aniskip(mal, episode, fetch=True):
             except (OSError, ValueError):
                 _skip_store = {}
         hit = _skip_store.get(key)
-    if hit and time.time() - hit["t"] < (30 if hit["marks"] else 7) * 86400:
+    if hit and time.time() - hit["t"] < (30 if hit["marks"] else empty_days) * 86400:
         return [tuple(m) for m in hit["marks"]]
     if not fetch:
         return None
@@ -1222,6 +1224,279 @@ class LiveCard(QWidget):
             p.drawText(tx, y + 150, f"Starts in {left // 60}:{left % 60:02d}" if left >= 60 else f"Starts in {left} s")
 
 
+class LiveGuide(QWidget):
+    """The guide inside the player (user's pick: Player C, Oct 2026): the whole screen dark, the channel playing
+    shrunk into the top right corner (PlayerView moves the video there), the selected programme described top left,
+    the channel × time grid below with the now line. Arrows move, Enter tunes in (on now) or sets a reminder
+    (later), G / Esc go back to the video. Painted, no child widgets (it sits over an OpenGL surface)."""
+    PAD, TOP, HEAD, ROW, NAMES, SPAN = 32, 300, 32, 54, 210, 90 * 60
+    VIDEO = (420, 236)
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        self.rows, self.sel_r, self.sel_t, self.first_row, self.t0 = [], 0, 0.0, 0, 0.0
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setMouseTracking(True)
+        self.timer = QTimer(self, interval=15000, timeout=self.update)
+        self.hide()
+
+    # ---- opening
+    def open_at(self, cid):
+        chans = LIVE.channels() if LIVE else []
+        self.rows = [c for c in chans if c.get("programs")]
+        ids = [c["id"] for c in self.rows]
+        self.sel_r = ids.index(cid) if cid in ids else 0
+        now = time.time()
+        self.t0 = now - now % 1800
+        self.sel_t = now
+        self.keep_visible()
+        self.setGeometry(self.parentWidget().rect())
+        self.show()
+        self.raise_()
+        self.timer.start()
+        self.update()
+
+    def hideEvent(self, e):
+        self.timer.stop()
+
+    def video_rect(self):
+        w, h = self.VIDEO
+        return QRect(self.width() - self.PAD - w, 28, w, h)
+
+    # ---- what's where
+    def progs(self, row):
+        ch = self.rows[row]
+        return LIVE.programs(ch["id"], self.t0, self.t0 + self.SPAN) if LIVE else []
+
+    def selected(self):
+        if not self.rows:
+            return None, None
+        ch = self.rows[self.sel_r]
+        prog, _ = LIVE.now(ch["id"], self.sel_t) if LIVE else (None, 0)
+        return ch, prog
+
+    def visible_rows(self):
+        return max(1, (self.height() - self.TOP - self.HEAD - 16) // self.ROW)
+
+    def keep_visible(self):
+        n = self.visible_rows() if self.height() > self.TOP else 6
+        if self.sel_r < self.first_row:
+            self.first_row = self.sel_r
+        elif self.sel_r >= self.first_row + n:
+            self.first_row = self.sel_r - n + 1
+        while self.sel_t >= self.t0 + self.SPAN - 600:   # keep the selection on screen, half an hour at a time
+            self.t0 += 1800
+        while self.sel_t < self.t0:
+            self.t0 -= 1800
+
+    def x_of(self, t):
+        gx = self.PAD + self.NAMES
+        gw = self.width() - gx - self.PAD
+        return gx + (t - self.t0) / self.SPAN * gw
+
+    # ---- moving
+    def step_prog(self, d):
+        _ch, prog = self.selected()
+        if prog is None:
+            return
+        self.sel_t = (prog["end"] + 1) if d > 0 else max(time.time() - 3600, prog["start"] - 1)
+        self.keep_visible()
+        self.update()
+
+    def key(self, e):
+        k = e.key()
+        if k in (Qt.Key_Up, Qt.Key_Down):
+            self.sel_r = max(0, min(len(self.rows) - 1, self.sel_r + (1 if k == Qt.Key_Down else -1)))
+            self.sel_t = max(self.sel_t, time.time())
+            self.keep_visible()
+            self.update()
+        elif k in (Qt.Key_Left, Qt.Key_Right):
+            self.step_prog(1 if k == Qt.Key_Right else -1)
+        elif k in (Qt.Key_Return, Qt.Key_Enter):
+            self.activate()
+        elif k in (Qt.Key_G, Qt.Key_Escape):
+            self.view.toggle_guide()
+        else:
+            return False
+        return True
+
+    def activate(self):
+        ch, prog = self.selected()
+        if not ch or not prog:
+            return
+        now = time.time()
+        if prog["start"] <= now < prog["end"]:
+            self.view.toggle_guide()
+            self.view.tune(ch["id"])
+        elif prog["start"] > now and LIVE is not None and hasattr(LIVE, "remind"):
+            on = LIVE.remind(ch["id"], prog)
+            self.view.show_osd(f"Reminder set: {prog.get('title')} at {clock(prog['start'])}" if on else "Reminder removed")
+            self.update()
+
+    def hit(self, pos):
+        """(row, timestamp) under the mouse, or None."""
+        y0 = self.TOP + self.HEAD
+        if pos.y() < y0 or pos.x() < self.PAD + self.NAMES:
+            return None
+        r = self.first_row + int((pos.y() - y0) // self.ROW)
+        if r >= len(self.rows):
+            return None
+        gx = self.PAD + self.NAMES
+        t = self.t0 + (pos.x() - gx) / max(1, self.width() - gx - self.PAD) * self.SPAN
+        return r, t
+
+    def mousePressEvent(self, e):
+        h = self.hit(e.position())
+        if h:
+            self.sel_r, self.sel_t = h[0], max(h[1], time.time() - 3600)
+            self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if self.hit(e.position()):
+            self.activate()
+
+    def wheelEvent(self, e):
+        self.sel_r = max(0, min(len(self.rows) - 1, self.sel_r + (1 if e.angleDelta().y() < 0 else -1)))
+        self.keep_visible()
+        self.update()
+
+    # ---- painting
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(8, 9, 12))
+        ch, prog = self.selected()
+        now = time.time()
+        f = QFont(self.font())
+        # top left: the selected channel and programme
+        x, y = self.PAD, 34
+        right = self.video_rect().left() - 28
+        if ch:
+            colour = QColor(ch.get("colour") or ACCENT)
+            f.setPointSizeF(30)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(colour)
+            num = str(ch.get("number", ""))
+            p.drawText(QRectF(x, y, 120, 54), Qt.AlignLeft | Qt.AlignVCenter, num)
+            nw = QFontMetrics(f).horizontalAdvance(num) + 14
+            f.setPointSizeF(15)
+            p.setFont(f)
+            p.setPen(QColor("white"))
+            p.drawText(QRectF(x + nw, y, right - x - nw, 54), Qt.AlignLeft | Qt.AlignVCenter,
+                       f"{ch.get('name', '')}   ")
+            f.setPointSizeF(11)
+            f.setBold(False)
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255, 140))
+            p.drawText(QRectF(x, y, right - x, 54), Qt.AlignRight | Qt.AlignVCenter, clock(now))
+        if prog:
+            on = prog["start"] <= now < prog["end"]
+            f.setPointSizeF(9)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor("#ff5d73") if on else QColor("#9184ff"))
+            p.drawText(QPointF(x, y + 86), ("ON NOW" if on else "LATER") + f"  ·  {clock(prog['start'])} – {clock(prog['end'])}")
+            f.setPointSizeF(21)
+            p.setFont(f)
+            p.setPen(QColor("white"))
+            fm = QFontMetrics(f)
+            p.drawText(QPointF(x, y + 128), fm.elidedText(prog.get("title") or "", Qt.ElideRight, int(right - x)))
+            f.setPointSizeF(11)
+            f.setBold(False)
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255, 170))
+            sub = (f"Season {prog['season']} · " if prog.get("season") else "") + f"Episode {prog['ep']}" \
+                if prog.get("kind") == "episode" and prog.get("ep") is not None else "Break"
+            p.drawText(QPointF(x, y + 158), sub)
+            hint = "Tune in" if on else ("Remind me" if prog["start"] > now else "")
+            keys = ([("Enter", hint)] if hint else []) + [("↑ ↓ ← →", "Move"), ("G", "Back to the video")]
+            kx = x
+            f.setPointSizeF(9)
+            for key, text in keys:
+                f.setBold(True)
+                p.setFont(f)
+                kw = QFontMetrics(f).horizontalAdvance(key) + 14
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(255, 255, 255, 30))
+                p.drawRoundedRect(QRectF(kx, y + 186, kw, 24), 6, 6)
+                p.setPen(QColor("white"))
+                p.drawText(QRectF(kx, y + 186, kw, 24), Qt.AlignCenter, key)
+                f.setBold(False)
+                p.setFont(f)
+                p.setPen(QColor(255, 255, 255, 170))
+                tw = QFontMetrics(f).horizontalAdvance(text)
+                p.drawText(QPointF(kx + kw + 8, y + 203), text)
+                kx += kw + tw + 30
+        # the video's frame (the video itself is a sibling, moved into this rect)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(self.video_rect()).adjusted(-1, -1, 1, 1), 10, 10)
+        # times
+        gx = self.PAD + self.NAMES
+        hy = self.TOP
+        f.setPointSizeF(9)
+        f.setBold(False)
+        p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 120))
+        for k in range(4):
+            t = self.t0 + k * 1800
+            if self.x_of(t) + 50 < self.width() - self.PAD:   # a label that wouldn't fit isn't drawn (cut off)
+                p.drawText(QPointF(self.x_of(t) + 4, hy + 20), clock(t))
+        p.setPen(QColor(255, 255, 255, 25))
+        p.drawLine(QPointF(self.PAD, hy + self.HEAD - 1), QPointF(self.width() - self.PAD, hy + self.HEAD - 1))
+        # rows
+        y0 = hy + self.HEAD
+        playing = (self.view.live or {}).get("cid")
+        p.save()
+        p.setClipRect(QRectF(self.PAD, y0, self.width() - 2 * self.PAD, self.height() - y0))
+        for i in range(self.first_row, min(len(self.rows), self.first_row + self.visible_rows() + 1)):
+            c = self.rows[i]
+            ry = y0 + (i - self.first_row) * self.ROW
+            if c["id"] == playing:
+                p.fillRect(QRectF(self.PAD, ry, self.width() - 2 * self.PAD, self.ROW), QColor(255, 93, 115, 16))
+            f.setPointSizeF(12)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor("#ff5d73") if c["id"] == playing else QColor(255, 255, 255, 140))
+            p.drawText(QRectF(self.PAD, ry, 34, self.ROW), Qt.AlignRight | Qt.AlignVCenter, str(c.get("number", "")))
+            f.setPointSizeF(10)
+            p.setFont(f)
+            p.setPen(QColor("white"))
+            p.drawText(QRectF(self.PAD + 46, ry, self.NAMES - 56, self.ROW), Qt.AlignLeft | Qt.AlignVCenter,
+                       QFontMetrics(f).elidedText(c.get("name", ""), Qt.ElideRight, self.NAMES - 56))
+            for pr in self.progs(i):
+                x1, x2 = max(gx, self.x_of(pr["start"])), min(self.width() - self.PAD, self.x_of(pr["end"]))
+                if x2 - x1 < 3:
+                    continue
+                cell = QRectF(x1 + 2, ry + 4, x2 - x1 - 4, self.ROW - 8)
+                sel = i == self.sel_r and pr["start"] <= self.sel_t < pr["end"]
+                p.setPen(QPen(QColor("#9184ff"), 2) if sel else Qt.NoPen)
+                p.setBrush(QColor(124, 108, 255, 76) if sel else QColor(255, 255, 255, 14))
+                p.drawRoundedRect(cell, 6, 6)
+                if cell.width() > 30:
+                    f.setPointSizeF(9.5)
+                    f.setBold(True)
+                    p.setFont(f)
+                    p.setPen(QColor("white"))
+                    inner = cell.adjusted(9, 5, -6, -5)
+                    p.drawText(QRectF(inner.left(), inner.top(), inner.width(), 18), Qt.AlignLeft | Qt.AlignVCenter,
+                               QFontMetrics(f).elidedText(pr.get("title") or "Break", Qt.ElideRight, int(inner.width())))
+                    f.setBold(False)
+                    f.setPointSizeF(8.5)
+                    p.setFont(f)
+                    p.setPen(QColor(255, 255, 255, 130))
+                    small = (f"S{pr['season']} E{pr['ep']}" if pr.get("season") else f"E{pr['ep']}") \
+                        if pr.get("kind") == "episode" and pr.get("ep") is not None else "Break"
+                    p.drawText(QRectF(inner.left(), inner.top() + 18, inner.width(), 16), Qt.AlignLeft | Qt.AlignVCenter,
+                               QFontMetrics(f).elidedText(small, Qt.ElideRight, int(inner.width())))
+        p.restore()
+        nx = self.x_of(now)
+        if gx <= nx <= self.width() - self.PAD:
+            p.fillRect(QRectF(nx - 1, hy + self.HEAD - 6, 2, self.height() - hy - self.HEAD + 6), QColor("#ff5d73"))
+
+
 class CaptureCard(QFrame):
     """Bottom right: the screenshot just taken / the clip being made, with Copy and Folder."""
 
@@ -1751,11 +2026,20 @@ class PlayerView(QWidget):
         self.live = None   # Live TV: {cid, prog, delay, last, typed}
         self.live_card = LiveCard(self)
         self.live_banner = LiveBanner(self)
+        self.live_guide = LiveGuide(self)
         self.live_badge = QPushButton("●  LIVE")
         self.badge_slot.addWidget(self.live_badge, 0, Qt.AlignTop)
         self.live_badge.setCursor(Qt.PointingHandCursor)
         self.live_badge.clicked.connect(self.jump_live)
         self.live_badge.hide()
+        self.guide_btn = QPushButton("  Guide")   # Live TV: the guide over the video (G)
+        self.guide_btn.setToolTip("Channel guide (G)")
+        self.guide_btn.setCursor(Qt.PointingHandCursor)
+        self.guide_btn.setStyleSheet("QPushButton { background: rgba(255,255,255,0.14); color: white; border-radius: 10px;"
+                                     " padding: 4px 12px; font-weight: 600; } QPushButton:hover { background: rgba(255,255,255,0.24); }")
+        self.guide_btn.clicked.connect(self.toggle_guide)
+        self.badge_slot.addWidget(self.guide_btn, 0, Qt.AlignTop)
+        self.guide_btn.hide()
         self.typed_timer = QTimer(self, singleShot=True, interval=1400, timeout=self.typed_done)
         self.cap_card = CaptureCard(self)   # the screenshot / clip just made
         self.clip_bar = ClipBar(self)
@@ -2058,7 +2342,12 @@ class PlayerView(QWidget):
     def resizeEvent(self, e):
         if e is not None:
             super().resizeEvent(e)
-        self.video.setGeometry(self.rect())
+        g = getattr(self, "live_guide", None)
+        if g is not None and g.isVisible():   # the guide fills the view, the video sits in its corner
+            self.live_guide.setGeometry(self.rect())
+            self.video.setGeometry(self.live_guide.video_rect())
+        else:
+            self.video.setGeometry(self.rect())
         mini = self.mode == "mini"
         self.top.setGeometry(0, 0, self.width(), 60 if mini else 76)
         margin = 6 if mini else 24
@@ -2263,17 +2552,24 @@ class PlayerView(QWidget):
         self.refresh_episodes()
         self.seekbar.marks, self.seekbar.chapters = [], []
         if self.settings.get("player_aniskip", True) and self.current.get("mid") and self.current.get("episode"):
-            threading.Thread(target=self._fetch_aniskip, args=(dict(self.current),), daemon=True).start()
+            nxt = self.playlist[i + 1] if i + 1 < len(self.playlist) else None
+            threading.Thread(target=self._fetch_aniskip, args=(dict(self.current), dict(nxt) if nxt else None),
+                             daemon=True).start()
         self.show_controls()
 
-    def _fetch_aniskip(self, item):
-        """Opening/ending times from AniSkip (community timestamps, keyed by MyAnimeList id)."""
+    def _fetch_aniskip(self, item, upcoming=None):
+        """Opening/ending times from AniSkip (community timestamps, keyed by MyAnimeList id), when the episode plays:
+        cached ones at once, else asked now (an empty answer from more than half a day ago is asked again). Then
+        the next episode's too, so they're ready when it starts."""
         try:
             mal = self.mal_lookup(item["mid"]) if self.mal_lookup else None
-            if not mal:
-                return
-            marks = aniskip(mal, item["episode"])   # cached (Tools → Library metadata), else asked now
-            self.marks_ready.emit(item["path"], marks or [])
+            if mal:
+                marks = aniskip(mal, item["episode"], empty_days=0.5)
+                self.marks_ready.emit(item["path"], marks or [])
+            if upcoming and upcoming.get("mid") and upcoming.get("episode"):
+                mal = mal if upcoming["mid"] == item["mid"] else (self.mal_lookup(upcoming["mid"]) if self.mal_lookup else None)
+                if mal:
+                    aniskip(mal, upcoming["episode"], empty_days=0.5)
         except Exception:
             pass
 
@@ -2423,8 +2719,18 @@ class PlayerView(QWidget):
 
     # ---- actions
     def toggle_pause(self):
+        t0 = time.perf_counter()
+        resuming = bool(self.mpv.pause)
         self.mpv.pause = not self.mpv.pause
         self.show_controls()
+        # Lag after a long pause (user report Oct 2026): how long un-pausing takes, in kura.log, to find out why
+        if not resuming:
+            self.paused_at = time.time()
+        elif time.time() - (getattr(self, "paused_at", None) or time.time()) >= 300:
+            away = (time.time() - self.paused_at) / 60
+            took = time.perf_counter() - t0
+            logging.getLogger("kura").info(f"Player: un-paused after {away:.0f} min, the command took {took:.2f} s")
+            self.paused_at = None
 
     def skip(self, seconds):
         self.mpv.seek(seconds, "relative")
@@ -2875,6 +3181,8 @@ class PlayerView(QWidget):
 
     def keyPressEvent(self, e):
         self.note_input()
+        if self.live_guide.isVisible() and self.live_guide.key(e):   # the guide gets its keys first
+            return
         if self.menu is not None and e.key() == Qt.Key_Escape:
             self.menu.close_menu()
             return
@@ -2977,6 +3285,9 @@ class PlayerView(QWidget):
             self.live_card.hide()
             self.live_banner.hide()
             self.live_badge.hide()
+            self.guide_btn.hide()
+            if self.live_guide.isVisible():
+                self.toggle_guide()
             self.ep_btn.setVisible(self.mode != "mini")
             self.prev_btn.setToolTip("Previous episode (P)")
             self.next_btn.setToolTip("Next episode (N)")
@@ -3109,6 +3420,7 @@ class PlayerView(QWidget):
             self.live_badge.setStyleSheet("QPushButton { background: #e5484d; color: white; border-radius: 10px;"
                                           " padding: 4px 10px; font-weight: 700; }")
         self.live_badge.show()
+        self.guide_btn.show()
         return not showing_video
 
     def live_advance(self):
@@ -3124,6 +3436,22 @@ class PlayerView(QWidget):
             ch = LIVE.channel(cid) or {}
             self.live_banner.show_for(ch, nxt, LIVE.after(cid, nxt), 4500)
             self.place_floating()
+
+    def toggle_guide(self):
+        """Live TV's guide over everything, the video shrunk into its top right corner; again to go back."""
+        g = self.live_guide
+        if g.isVisible():
+            g.hide()
+            self.resizeEvent(None)
+            self.show_controls()
+            return
+        if not self.live or LIVE is None:
+            return
+        self.live_banner.hide()
+        g.open_at(self.live.get("cid"))
+        self.video.setGeometry(g.video_rect())
+        self.video.raise_()   # over the guide's dark background (a break's card stays under the guide: live_tick
+        # reads whether it shows)
 
     def jump_live(self):
         if self.live:
@@ -3166,6 +3494,9 @@ class PlayerView(QWidget):
             self.jump_live()
         elif k in (Qt.Key_N, Qt.Key_P):
             self.channel_step(1 if k == Qt.Key_N else -1)
+        elif k == Qt.Key_G and not e.modifiers():   # the channel guide (Player C)
+            self.toggle_guide()
+            return True
         elif k == Qt.Key_I and not self.clip_bar.isVisible():   # what's on (the banner again)
             ch = LIVE.channel(self.live["cid"]) or {}
             if self.live.get("prog"):
@@ -3226,8 +3557,8 @@ class PlayerView(QWidget):
                 capture.remember(st, dest, info, at, "screenshot")
                 if CAPTURE_SAVED is not None:
                     CAPTURE_SAVED(str(dest), "screenshot")
-            except Exception as e:
-                QTimer.singleShot(0, self, lambda: self.cap_card.done("Screenshot failed", None, None, str(e)))
+            except Exception as e:   # the text now: `e` is gone once this block ends
+                QTimer.singleShot(0, self, lambda err=str(e): self.cap_card.done("Screenshot failed", None, None, err))
         threading.Thread(target=save, daemon=True).start()
         if capture.opt(st, "shot_clipboard"):
             QApplication.clipboard().setImage(preview)
@@ -3483,6 +3814,15 @@ class PlayerView(QWidget):
 
     def stop(self):
         """Stop for good: remember where you were, save settings, shut mpv down."""
+        t0 = time.perf_counter()
+        long_pause = time.time() - (getattr(self, "paused_at", None) or time.time()) >= 300
+        try:
+            self._stop()
+        finally:
+            if long_pause:   # see toggle_pause: closing after a long pause, timed
+                logging.getLogger("kura").info(f"Player: closed after a long pause, took {time.perf_counter() - t0:.2f} s")
+
+    def _stop(self):
         self.end_live()
         for timer in (self.tick_timer, self.hide_timer, self.osd_timer):
             timer.stop()

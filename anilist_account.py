@@ -223,6 +223,21 @@ class Worker(QThread):
             self.done.emit(None, e)
 
 
+PROGRESS_SCALE = {}   # {media id: AniList episodes per file}: two-in-one episodes (Kura's Edit info)
+
+
+def kura_units(e):
+    """Your progress the way Kura counts: in files when each holds several of AniList's episodes ("progress" =
+    files watched, "progress_anilist" = what AniList has). Run on every entry that comes from AniList or the file."""
+    s = PROGRESS_SCALE.get(e.get("mediaId")) or 1
+    raw = e["progress_anilist"] if "progress_anilist" in e else (e.get("progress") or 0)
+    if s > 1:
+        e["progress_anilist"], e["progress"] = raw, (raw or 0) // s
+    elif "progress_anilist" in e:
+        e["progress"] = e.pop("progress_anilist")
+    return e
+
+
 class Account(QObject):
     changed = Signal()            # signed in/out or the whole list reloaded
     entry_changed = Signal(int)   # one entry edited (media id)
@@ -241,6 +256,12 @@ class Account(QObject):
             self.entries = {int(k): v for k, v in (data.get("entries") or {}).items()}
         except (OSError, ValueError):
             pass
+        self.rescale()
+
+    def rescale(self):
+        """Two-in-one episodes changed (PROGRESS_SCALE): count every entry again."""
+        for e in self.entries.values():
+            kura_units(e)
 
     @property
     def connected(self):
@@ -327,6 +348,7 @@ class Account(QObject):
                 self._error(err)
                 return
             self.user, self.entries = result
+            self.rescale()
             self.fetched = time.time()
             self._save_file()
             self.changed.emit()
@@ -343,7 +365,11 @@ class Account(QObject):
         if media and not e.get("media"):
             e["media"] = {k: media.get(k) for k in MEDIA_KEYS}
         e.update(fields)
-        self.pending.setdefault(media_id, {}).update(fields)
+        send = dict(fields)
+        scale = PROGRESS_SCALE.get(media_id) or 1
+        if "progress" in fields and scale > 1:   # files watched → AniList's episodes (file 3 of 2-in-1 = 6)
+            send["progress"] = e["progress_anilist"] = fields["progress"] * scale
+        self.pending.setdefault(media_id, {}).update(send)
         self.entry_changed.emit(media_id)
         timer = self.timers.get(media_id)
         if timer is None:
@@ -367,7 +393,10 @@ class Account(QObject):
             e = self.entries.get(media_id)
             if e is not None:
                 newer = self.pending.get(media_id, {})
+                if "progress" in result and "progress" not in newer:   # AniList's count: back to Kura's
+                    e.pop("progress_anilist", None)
                 e.update({k: v for k, v in result.items() if k not in newer})
+                kura_units(e)
             self._save_file()
             self.entry_changed.emit(media_id)
         self._run(lambda: gql(save_mutation(fields), {"mediaId": media_id, **fields}, token=token)["SaveMediaListEntry"],

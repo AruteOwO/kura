@@ -16,6 +16,7 @@ SEASON_COVERS and RELATED_OVERRIDES are still edited at the top of anime_organiz
 Connecting an AniList account (Settings) is optional; see anilist_account.py.
 """
 
+import functools
 import hashlib
 import html
 import json
@@ -137,6 +138,20 @@ def setup_kura_log():
 
 
 DEFAULT_SEARCH_URL = "https://nyaa.si/?f=0&c=1_2&q={query}"
+# icon: "site" (the website's own, fetched once) / "glyph:<Material name>" / "letter" / "none"; side: anime / adult / both
+DEFAULT_SEARCHES = [
+    {"id": "nyaa_en", "name": "Nyaa · English", "url": DEFAULT_SEARCH_URL, "icon": "site", "side": "anime", "default": True},
+    {"id": "nyaa_all", "name": "Nyaa · All anime", "url": "https://nyaa.si/?f=0&c=1_0&q={query}", "icon": "site",
+     "side": "anime", "default": False},
+    {"id": "sukebei", "name": "Sukebei", "url": "https://sukebei.nyaa.si/?f=0&c=1_1&q={query}", "icon": "site",
+     "side": "adult", "default": True},
+]
+DEFAULT_LINKS = [   # the user's presets (Oct 2026)
+    {"id": "wotaku", "name": "Wotaku!", "url": "https://wotaku.wiki/", "icon": "site", "side": "anime"},
+    {"id": "everythingmoe", "name": "EverythingMoe", "url": "https://everythingmoe.com/", "icon": "site", "side": "anime"},
+    {"id": "nyaa", "name": "Nyaa", "url": "https://nyaa.si/", "icon": "site", "side": "anime"},
+    {"id": "sukebei", "name": "Sukebei", "url": "https://sukebei.nyaa.si/", "icon": "site", "side": "adult"},
+]
 CR_ORANGE = "#f47521"   # Crunchyroll's colour (its sign-in card and the import tool)
 
 
@@ -208,10 +223,10 @@ QPushButton { background: rgba(255, 255, 255, 0.055); border: 1px solid rgba(255
 QPushButton:hover { background: rgba(255, 255, 255, 0.10); border-color: rgba(255, 255, 255, 0.16); }
 QPushButton:pressed { background: rgba(255, 255, 255, 0.04); }
 QPushButton:disabled { color: @faint; background: rgba(255, 255, 255, 0.025); border-color: rgba(255, 255, 255, 0.05); }
-QPushButton#primary { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #8f80ff, stop:1 #6a59ee);
-                      border: 1px solid rgba(255, 255, 255, 0.10); border-top-color: rgba(255, 255, 255, 0.26);
+QPushButton#primary { background: #7767f4;   /* flat (user's choice): no gradient, no lit top edge */
+                      border: 1px solid transparent;
                       border-radius: 10px; color: white; font-weight: 600; padding: 9px 18px; }
-QPushButton#primary:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #9d90ff, stop:1 #7767f4); }
+QPushButton#primary:hover { background: #8f80ff; }
 QPushButton#primary:pressed { background: #6656e6; }
 QPushButton#primary:disabled { background: #3a3566; color: #8f8ab5; border-color: transparent; }
 QPushButton#ghost { background: transparent; border: none; color: @muted; padding: 6px 10px; }
@@ -848,7 +863,9 @@ def default_settings():
         "dry_run": False,
         "geometry": "",
         "anilist_client_id": "",
-        "search_url": DEFAULT_SEARCH_URL,
+        "search_url": DEFAULT_SEARCH_URL,   # (from before search_sites: kept for the migration)
+        "search_sites": [dict(x) for x in DEFAULT_SEARCHES],   # To download's searches (Settings → Account)
+        "links": [dict(x) for x in DEFAULT_LINKS],             # the sidebar's LINKS (user's pick: Links 1)
         "schedule_planning": True,
         # Player: "builtin" (Kura's, mpv engine), "external" (player_path) or "system" (Windows default)
         "player": "builtin",
@@ -984,6 +1001,11 @@ def load_settings():
         s["torrent_new_action"] = "download"
     if "torrent_app" not in saved and saved.get("torrent_client"):
         s["torrent_app"] = "custom"
+    own = (saved.get("search_url") or "").strip()
+    if "search_sites" not in saved and own and own != DEFAULT_SEARCH_URL:   # your one search from before: first
+        s["search_sites"] = [{"id": "own", "name": "My search", "url": own, "icon": "site", "side": "anime",
+                              "default": True}] + [dict(x, default=False) for x in DEFAULT_SEARCHES if x["side"] == "anime"] \
+            + [dict(x) for x in DEFAULT_SEARCHES if x["side"] == "adult"]
     s.pop("_anime", None)   # always starts on the Anime side
     return s
 
@@ -1500,10 +1522,13 @@ def season_folders(show_dir):
     folders = {}
     loose = False
     groups = org.season_version_groups(show_dir)
+    mine = org.FOLDER_SEASONS.get(show_dir.name.lower(), {})   # Edit info: this folder counts as Season N
     try:
         for c in show_dir.iterdir():
             m = SEASON_RE.fullmatch(c.name)
-            if m and c.is_dir() and not org.is_link(c):
+            if c.name in mine and c.is_dir():
+                folders[mine[c.name]] = c
+            elif m and c.is_dir() and not org.is_link(c) and int(m.group(1)) not in mine.values():
                 folders[int(m.group(1))] = c
             elif c.is_file() and c.suffix.lower() in org.VIDEO_EXTS:
                 loose = True
@@ -1575,7 +1600,9 @@ def library_index(show_dir, cache, details, list_media, title_ids):
     """Which AniList entries a show folder covers, and the episodes on disk for each season."""
     name = show_dir.name.lower()
     entry = cache.get(f"{name}|show") or cache.get(f"{name}|movie")
-    mid = title_ids.get(name) or (entry.get("id") if isinstance(entry, dict) else None)
+    mine = org.OVERRIDES.get(name)   # Edit info: you picked this folder's AniList entry
+    mid = ((mine["id"] if isinstance(mine, dict) else mine) or title_ids.get(name)
+           or (entry.get("id") if isinstance(entry, dict) else None))
     if not mid:
         return None
     chain = cached_chain(mid, cache)
@@ -1593,9 +1620,8 @@ def library_index(show_dir, cache, details, list_media, title_ids):
         holder = media_holder(show_dir)
         if holder is not None:
             folders[1] = holder
-    extra_local = {}
     fam = org.show_family({"id": mid}, cache, offline=True)
-    if fam:   # folders named after a season or an OVA/side story ("Queen's Blade Rebellion")
+    if fam:   # folders named after a season ("Queen's Blade Rebellion")
         try:
             subs = [c for c in show_dir.iterdir() if c.is_dir() and not org.is_link(c)
                     and not SEASON_RE.fullmatch(c.name) and c.name not in (org.SPINOFF_FOLDER, org.SIDE_STORY_FOLDER)]
@@ -1605,9 +1631,6 @@ def library_index(show_dir, cache, details, list_media, title_ids):
             k = org.classify_folder(c.name, fam)
             if k and k.get("season") and k["season"] not in folders:
                 folders[k["season"]] = c
-            elif k and k.get("entry"):
-                extra_local[k["entry"]["id"]] = fit_numbering(
-                    local_videos(c)[0], media_info(k["entry"]["id"], cache, details, list_media).get("episodes"))
     local, offset, versions, version_files = {}, 0, {}, []
     for n, sid in enumerate(seasons, 1):
         if not sid:
@@ -1624,9 +1647,6 @@ def library_index(show_dir, cache, details, list_media, title_ids):
             versions[sid] = {name: sorted(shift_episodes(eps, offset, total)) for name, eps in vers.items()}
             version_files.extend(f for eps in vers.values() for f in eps.values())
         offset = offset + total if (offset is not None and total) else None
-    for eid, eps in extra_local.items():
-        local.setdefault(eid, eps)
-    chain = chain + [e for e in extra_local if e not in chain]
     adult = entry.get("adult") if isinstance(entry, dict) and entry.get("adult") is not None else cache.get(f"adult:{mid}")
     return {"mid": mid, "chain": chain, "seasons": seasons, "local": local, "versions": versions,
             "version_files": version_files, "adult": adult}
@@ -1862,7 +1882,9 @@ def fix_episodes(media_by_id):
         if owner and owner != m["id"] and m.get("streamingEpisodes"):
             m["streamingEpisodes_shared"], m["streamingEpisodes"] = m["streamingEpisodes"], []
         orig = m.get("episodes_anilist", m.get("episodes"))
-        n = mine.get(str(m["id"])) or EPISODE_FIX.get(m["id"]) or watchlist_count(dict(m, episodes=orig))
+        split = org.EPISODE_SPLIT.get(str(m["id"]))   # two-in-one: AniList's 24 are 12 files
+        n = (mine.get(str(m["id"])) or (-(-orig // split) if split and orig else None) or EPISODE_FIX.get(m["id"])
+             or watchlist_count(dict(m, episodes=orig)))
         if n and n != orig:
             EPISODE_FIX[m["id"]] = n
             m["episodes_anilist"], m["episodes"] = orig, n
@@ -2161,7 +2183,28 @@ def aired_count(d):
     nxt = d.get("nextAiringEpisode")
     if nxt and nxt.get("episode"):
         return nxt["episode"] - 1
+    if d.get("status") == "RELEASING":
+        # still airing but AniList has no date for the next one: not every planned episode is out (Cheng Ye Xiao He,
+        # 16 planned, 12 aired). The last one logged as aired, else don't guess.
+        now = time.time()
+        logged = [int(k) for k, ts in (_cached_air_log().get(str(d.get("id"))) or {}).items()
+                  if ts <= now and k.isdigit()]
+        return max(logged) if logged else None
     return d.get("episodes")
+
+
+_AIR_LOG_CACHE = {"mtime": None, "data": {}}
+
+
+def _cached_air_log():
+    """airing_log.json, read again only when it changed (aired_count runs for every show, often)."""
+    try:
+        mtime = AIR_LOG_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if _AIR_LOG_CACHE["mtime"] != mtime:
+        _AIR_LOG_CACHE.update(mtime=mtime, data=_read_json(AIR_LOG_FILE))
+    return _AIR_LOG_CACHE["data"]
 
 
 def when(ts):
@@ -2337,7 +2380,7 @@ class DetailLoader(QThread):
         save_lookup_cache(cache)
 
         # Local folders: seasons ("Season 2", "Season 2 - The Evil Eye", or named after the season),
-        # then everything else: OVAs, specials, side stories (matched to their AniList entry), extras
+        # then everything else: generic OVAs / Specials folders, extras
         fam = org.show_family(entry, cache) if entry else None
         local_seasons, local_other, extra_entries = {}, [], {}
         groups = org.season_version_groups(show_dir) if show_dir else {}
@@ -2346,17 +2389,19 @@ class DetailLoader(QThread):
             subs = sorted(show_dir.iterdir() if show_dir else [], key=lambda p: p.name.lower())
         except OSError:
             subs = []
+        mine = org.FOLDER_SEASONS.get(show_dir.name.lower(), {}) if show_dir else {}   # Edit info: "counts as"
         for c in subs:
             if not c.is_dir() or org.is_link(c) or c.name in (org.SPINOFF_FOLDER, org.SIDE_STORY_FOLDER) or c in grouped:
                 continue
-            k = org.classify_folder_online(c.name, fam, cache) if fam else org.classify_folder(c.name, None)
+            if mine.get(c.name) and mine[c.name] not in local_seasons:
+                local_seasons[mine[c.name]] = c
+                continue
+            k = org.classify_folder(c.name, fam)
             if k and k.get("season") and k["season"] not in local_seasons:
                 local_seasons[k["season"]] = c
                 continue
             local_other.append(c)
-            if k and k.get("entry"):
-                extra_entries[c] = k["entry"]
-            elif k and k.get("kind"):
+            if k and k.get("kind"):
                 extra_entries[c] = (smap or {}).get(k["kind"])
         extra_entries = {c: e for c, e in extra_entries.items() if e}
         for n, g in groups.items():
@@ -2388,6 +2433,7 @@ class DetailLoader(QThread):
             one = n == 1 and entry is not None and entry.get("format") not in org.TV_FORMATS and len(seasons) == 1
             head = FORMAT_TEXT.get(entry.get("format"), "Season 1") if one else f"Season {n}"   # "OVA", "Movie"...
             sec = build_section(head, d, local_seasons.get(n), offset, count_missing=d is not None)
+            sec["n"] = n   # which season it is (Edit info: "counts as", this season's AniList entry)
             sections.append(sec)
             count = sec["total"] or sec["aired"]
             offset = offset + count if (offset is not None and count) else None
@@ -2451,7 +2497,7 @@ class DetailLoader(QThread):
             "seasons_have": sum(1 for s in counted if s["has_folder"]),
             "seasons_out": sum(1 for s in counted if s["aired"] != 0),
             "error": None if entry else "Couldn't find this show on AniList. If the folder name is unusual, "
-                                        "add it to OVERRIDES at the top of anime_organizer.py.",
+                                        "press Edit info and pick the right entry.",
         }
 
     REL_ORDER = ["PARENT", "PREQUEL", "SEQUEL", "SIDE_STORY", "SUMMARY", "ALTERNATIVE", "SPIN_OFF", "COMPILATION",
@@ -2680,6 +2726,7 @@ class DropZone(QFrame):
 PATH_ROLE, COVER_ROLE, SUB_ROLE = Qt.UserRole + 1, Qt.UserRole + 2, Qt.UserRole + 3
 INDEX_ROLE, STATUS_ROLE, NEW_ROLE, PROG_ROLE = Qt.UserRole + 4, Qt.UserRole + 5, Qt.UserRole + 6, Qt.UserRole + 7
 MID_ROLE, NOTDL_ROLE, MEDIA_ROLE = Qt.UserRole + 8, Qt.UserRole + 9, Qt.UserRole + 10
+ADDED_ROLE, LATEST_ROLE, META_ROLE = Qt.UserRole + 11, Qt.UserRole + 12, Qt.UserRole + 13   # Library filters / sort
 
 
 def show_all_toggle(settings, key, on_change):
@@ -2779,18 +2826,19 @@ class CoverDelegate(QStyledItemDelegate):
         p.setClipping(False)
 
         new = index.data(NEW_ROLE)
-        if new:
+        added = (index.data(ADDED_ROLE) or 0) >= time.time() - RECENT_DAYS * 86400
+        if new or added:
             f = QFont(option.font)
             f.setPointSizeF(8)
             f.setWeight(QFont.Bold)
             p.setFont(f)
-            text = f"{new} new"
+            text = f"{new} new" if new else "Added"
             w = QFontMetrics(f).horizontalAdvance(text) + 14
             pill = QRectF(poster.right() - w - 8, poster.top() + 8, w, 20)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(C["accent"]))
+            p.setBrush(QColor(C["accent"] if new else C["ok"]))
             p.drawRoundedRect(pill, 10, 10)
-            p.setPen(QColor("white"))
+            p.setPen(QColor("white" if new else "#08130d"))
             p.drawText(pill, Qt.AlignCenter, text)
 
         p.setBrush(Qt.NoBrush)
@@ -2859,32 +2907,181 @@ def show_state(index, account):
     return status, new, prog, nxt
 
 
+RECENT_DAYS = 14   # Library "Recently added": the show's first file arrived within this many days
+LIB_FORMATS = {"TV": ("TV", "TV_SHORT", "ONA"), "MOVIE": ("MOVIE",), "OVA": ("OVA", "SPECIAL", "MUSIC")}
+LIB_FORMAT_TEXT = {"TV": "TV", "MOVIE": "Movies", "OVA": "OVAs and specials"}
+LIB_STATUS_TEXT = {"CURRENT": "Watching", "PLANNING": "Planning", "COMPLETED": "Completed", "PAUSED": "Paused",
+                   "DROPPED": "Dropped", "NONE": "Not on my list"}
+
+
+def lib_view_match(view, it_data):
+    """Library quick chips: does a show (data(role) getter) belong to this view?"""
+    if view == "NEW":
+        return (it_data(NEW_ROLE) or 0) > 0
+    if view == "ADDED":
+        return (it_data(ADDED_ROLE) or 0) >= time.time() - RECENT_DAYS * 86400
+    if view == "NOTSTARTED":
+        prog = it_data(PROG_ROLE)
+        return it_data(STATUS_ROLE) in (None, "PLANNING") and not it_data(NOTDL_ROLE) or bool(prog and not prog[0])
+    if view == "FINISHED":
+        return it_data(STATUS_ROLE) == "COMPLETED"
+    return True
+
+
 class LibraryFilter(QSortFilterProxyModel):
+    """Library grid: quick chip (view), the Filters pop-over (your list / format / genre / years) and the search,
+    sorted by title, newest episode or recently added (user's pick: Library A + Filters pop-over, Oct 2026)."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.status = "ALL"
-
-    def set_status(self, status):
-        self.status = status
-        self.refilter()
+        self.view = "ALL"
+        self.statuses, self.formats, self.genres = set(), set(), set()
+        self.years = (None, None)
+        self.sort_key = "title"
 
     def refilter(self):
         """Re-run filterAcceptsRow (Qt 6.10+ way of saying the filter changed)."""
         self.beginFilterChange()
         self.endFilterChange()
 
+    def active(self):
+        """How many pop-over filters are on (the Filters button's count)."""
+        return len(self.statuses) + len(self.formats) + len(self.genres) + (1 if any(self.years) else 0)
+
     def filterAcceptsRow(self, row, parent):
-        if self.status != "ALL":
-            st = self.sourceModel().index(row, 0, parent).data(STATUS_ROLE)
-            if self.status == "NONE":
-                if st:
-                    return False
-            elif self.status == "CURRENT":
-                if st not in ("CURRENT", "REPEATING"):
-                    return False
-            elif st != self.status:
+        idx = self.sourceModel().index(row, 0, parent)
+        if not lib_view_match(self.view, idx.data):
+            return False
+        if self.statuses:
+            st = idx.data(STATUS_ROLE)
+            st = "NONE" if not st else "CURRENT" if st == "REPEATING" else st
+            if st not in self.statuses:
+                return False
+        meta = idx.data(META_ROLE) or {}
+        if self.formats and not any(meta.get("format") in LIB_FORMATS[f] for f in self.formats):
+            return False
+        if self.genres and not self.genres <= set(meta.get("genres") or ()):
+            return False
+        lo, hi = self.years
+        if lo or hi:
+            y = meta.get("year")
+            if not y or (lo and y < lo) or (hi and y > hi):
                 return False
         return super().filterAcceptsRow(row, parent)
+
+    def lessThan(self, a, b):
+        if self.sort_key in ("latest", "added"):
+            role = LATEST_ROLE if self.sort_key == "latest" else ADDED_ROLE
+            ta, tb = a.data(role) or 0, b.data(role) or 0
+            if ta != tb:
+                return ta > tb   # newest first
+        return super().lessThan(a, b)
+
+
+class LibraryFilterPopup(QFrame):
+    """The Library's Filters pop-over: your list, format, genre and years in two columns, Clear all / Done.
+    Changes apply at once (changed); the grid behind never moves."""
+    changed = Signal()
+
+    def __init__(self, page):
+        super().__init__(page.window(), Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setFixedWidth(560)
+        self.page, f = page, page.proxy
+        box = QFrame(self)
+        box.setObjectName("libpop")
+        box.setStyleSheet(f"QFrame#libpop {{ background: {C['surface2']}; border: 1px solid {C['border_hi']};"
+                          f" border-radius: 14px; }} QLabel {{ background: transparent; }}")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
+        v = QVBoxLayout(box)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(14)
+        cols = QHBoxLayout()
+        cols.setSpacing(24)
+        left, right = QVBoxLayout(), QVBoxLayout()
+        left.setSpacing(6)
+        right.setSpacing(6)
+        cols.addLayout(left, 1)
+        cols.addLayout(right, 1)
+        v.addLayout(cols)
+
+        def head(text):
+            h = QLabel(text.upper())
+            h.setStyleSheet(f"color: {C['faint']}; font-size: 7.5pt; font-weight: 700; letter-spacing: 1px; padding-top: 4px;")
+            return h
+
+        def pills(lay, title, items, chosen):
+            """Toggle pills (on = accent), the same for every section."""
+            lay.addWidget(head(title))
+            w = QWidget()
+            w.setStyleSheet("background: transparent;")
+            flow = FlowLayout(w, spacing=6)
+            for key, text in items:
+                b = QPushButton(text)
+                b.setCheckable(True)
+                b.setChecked(key in chosen)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setStyleSheet(f"QPushButton {{ background: {C['hover']}; border: 1px solid transparent; border-radius: 11px;"
+                                f" padding: 3px 10px; font-size: 9pt; color: {C['text']}; }}"
+                                f" QPushButton:checked {{ background: rgba({accent_rgb()},0.30); border-color: {C['accent']}; }}")
+                b.toggled.connect(lambda on, k=key, s=chosen: (s.add(k) if on else s.discard(k), self.changed.emit()))
+                flow.addWidget(b)
+            lay.addWidget(w)
+
+        if page.account and page.account.connected:
+            pills(left, "Your list", LIB_STATUS_TEXT.items(), f.statuses)
+            left.addSpacing(8)
+        pills(left, "Format", LIB_FORMAT_TEXT.items(), f.formats)
+        left.addStretch(1)
+
+        pills(right, "Genre", [(g, g) for g in page.genre_list()], f.genres)
+        right.addSpacing(8)
+        right.addWidget(head("Aired"))
+        years = page.year_range()
+        yr = QHBoxLayout()
+        yr.setSpacing(6)
+        self.y_from, self.y_to = QComboBox(), QComboBox()
+        for combo, val, any_text in ((self.y_from, f.years[0], "Any"), (self.y_to, f.years[1], "Any")):
+            combo.addItem(any_text, None)
+            for y in years:
+                combo.addItem(str(y), y)
+            combo.setCurrentIndex(max(0, combo.findData(val)) if val else 0)
+            combo.currentIndexChanged.connect(self.set_years)
+        yr.addWidget(self.y_from, 1)
+        yr.addWidget(label("to", "faint"))
+        yr.addWidget(self.y_to, 1)
+        right.addLayout(yr)
+        right.addStretch(1)
+
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background: {C['border']};")
+        v.addWidget(line)
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        clear = QPushButton("Clear all")
+        clear.clicked.connect(lambda: (page.clear_filters(), self.close()))
+        done = QPushButton("Done")
+        done.setObjectName("primary")
+        done.clicked.connect(self.close)
+        foot.addWidget(clear)
+        foot.addWidget(done)
+        v.addLayout(foot)
+
+    def set_years(self):
+        self.page.proxy.years = (self.y_from.currentData(), self.y_to.currentData())
+        self.changed.emit()
+
+    def show_under(self, button):
+        self.adjustSize()
+        pos = button.mapToGlobal(QPoint(button.width() - self.width(), button.height() + 6))
+        screen = (button.screen() or QApplication.primaryScreen()).availableGeometry()
+        pos.setX(max(screen.left() + 8, min(pos.x(), screen.right() - self.width() - 8)))
+        self.move(pos)
+        self.show()
 
 
 # ---------------------------------------------------------------- pages
@@ -2916,8 +3113,9 @@ class LibraryPage(Page):
     open_show = Signal(str, object)          # folder, cover QImage or None
     open_media = Signal(int, str, object)    # not downloaded: AniList id, title, cover
 
-    TABS = [("ALL", "All"), ("CURRENT", "Watching"), ("PLANNING", "Planning"), ("COMPLETED", "Completed"),
-            ("PAUSED", "Paused"), ("DROPPED", "Dropped"), ("NONE", "Not on list")]
+    VIEWS = [("ALL", "All"), ("NEW", "New episodes"), ("ADDED", "Recently added"), ("NOTSTARTED", "Not started"),
+             ("FINISHED", "Finished")]
+    SORTS = [("title", "Title A–Z"), ("latest", "Newest episode first"), ("added", "Recently added")]
 
     def __init__(self, settings, account):
         super().__init__("Library", "")
@@ -2948,16 +3146,51 @@ class LibraryPage(Page):
         self.actions.addWidget(self.search)
         self.actions.addWidget(refresh)
 
-        # Your AniList statuses (only when connected)
-        self.tabs = Segmented(self.TABS, "ALL")
-        self.tabs.changed.connect(self.on_tab)
-        tabs_row = QHBoxLayout()
-        tabs_row.addWidget(self.tabs)
-        tabs_row.addStretch(1)
+        # Quick chips (All / New episodes / Recently added / Not started / Finished), Filters pop-over, sort
+        # (user's pick: Library A + Filters pop-over with a "Showing only" line, Oct 2026)
+        self.view_btns = {}
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(8)
+        group = QButtonGroup(self)
+        for key, text in self.VIEWS:
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setObjectName("libchip")
+            b.clicked.connect(lambda _=False, k=key: self.set_view(k))
+            group.addButton(b)
+            bar.addWidget(b)
+            self.view_btns[key] = b
+        self.view_btns["ALL"].setChecked(True)
+        bar.addStretch(1)
+        self.filters_btn = QPushButton(" Filters")
+        self.filters_btn.setIcon(glyph_icon("filter_list", C["text"]))
+        self.filters_btn.setCursor(Qt.PointingHandCursor)
+        self.filters_btn.clicked.connect(self.open_filters)
+        bar.addWidget(self.filters_btn)
+        self.sort_box = QComboBox()
+        for key, text in self.SORTS:
+            self.sort_box.addItem(text, key)
+        self.sort_box.setCurrentIndex(max(0, self.sort_box.findData(settings.get("library_sort", "title"))))
+        self.sort_box.currentIndexChanged.connect(self.set_sort)
+        bar.addWidget(self.sort_box)
         self.tabs_box = QWidget()
-        self.tabs_box.setLayout(tabs_row)
-        tabs_row.setContentsMargins(0, 0, 0, 0)
+        self.tabs_box.setLayout(bar)
+        self.tabs_box.setStyleSheet(
+            f"QPushButton#libchip {{ background: {C['surface']}; border: 1px solid {C['border']}; border-radius: 12px;"
+            f" padding: 5px 14px; color: {C['muted']}; }}"
+            f" QPushButton#libchip:hover {{ color: {C['text']}; border-color: {C['border_hi']}; }}"
+            f" QPushButton#libchip:checked {{ background: rgba({accent_rgb()},0.18); border-color: {C['accent']};"
+            f" color: {C['text']}; }}")   # no bold: a wider checked text was cut off
         self.outer.addWidget(self.tabs_box)
+        self.showing = QWidget()   # "Showing only: Watching ×  Fantasy ×  Clear"
+        self.showing_row = QHBoxLayout(self.showing)
+        self.showing_row.setContentsMargins(0, 0, 0, 0)
+        self.showing_row.setSpacing(6)
+        self.showing.hide()
+        self.outer.addWidget(self.showing)
+        self.outer.setSpacing(14)
 
         self.stack = QStackedWidget()
         self.outer.addWidget(self.stack, 1)
@@ -2995,7 +3228,10 @@ class LibraryPage(Page):
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy.setSortCaseSensitivity(Qt.CaseInsensitive)
-        self.proxy.sort(0)   # downloaded and not-downloaded shows mixed alphabetically
+        self.proxy.sort_key = settings.get("library_sort", "title")
+        self.proxy.sort(0)   # downloaded and not-downloaded shows mixed alphabetically (or newest first)
+        self.file_times = {}   # show folder → (first file's mtime, newest file's mtime), read in the background
+        self.times_job = None
         self.search.textChanged.connect(self.proxy.setFilterFixedString)
 
         self.grid = QListView()
@@ -3147,6 +3383,9 @@ class LibraryPage(Page):
                                                             self.hidden_other else ""))
         self.scanned = True
         self.apply_account()
+        self.read_file_times()
+        if not on:   # the loading screen's wall: your anime's covers next time (never the hentai side's)
+            remember_wall([s["index"]["mid"] for s in shows if s.get("index") and s["index"].get("mid")][:80])
 
     def on_cover(self, scan_id, path, img):
         self.covers[path] = img
@@ -3229,34 +3468,166 @@ class LibraryPage(Page):
     def apply_account(self):
         connected = bool(self.account and self.account.connected)
         self.sync_extra()
-        self.tabs_box.setVisible(connected and bool(self.items or self.extra))
+        self.tabs_box.setVisible(bool(self.items or self.extra))
         self.show_all.setVisible(connected)
         self.show_all_label.setVisible(connected)
-        counts = dict.fromkeys([k for k, _ in self.TABS], 0)
         for path, it in list(self.items.items()) + list(self.extra.items()):
-            status, new, prog, nxt = show_state(it.data(INDEX_ROLE), self.account)
+            idx = it.data(INDEX_ROLE)
+            status, new, prog, nxt = show_state(idx, self.account)
             it.setData(status, STATUS_ROLE)
             it.setData(new, NEW_ROLE)
             it.setData(prog if status == "CURRENT" else None, PROG_ROLE)
-            counts["ALL"] += 1
-            counts["NONE" if not status else "CURRENT" if status == "REPEATING" else status] += 1
+            m = media_for((idx or {}).get("mid"), self.account) if idx else {}
+            it.setData({"format": m.get("format"), "genres": m.get("genres") or [], "year": m.get("seasonYear")},
+                       META_ROLE)
+            times = self.file_times.get(path) if isinstance(path, str) else None
+            it.setData(times[0] if times else None, ADDED_ROLE)
+            it.setData(times[1] if times else None, LATEST_ROLE)
         if self.settings.get("library") and Path(self.settings["library"]).is_dir():
             sub = f"{len(self.items)} shows  ·  {getattr(self, 'episode_total', 0):,} episodes"
             if self.extra:
                 sub += f"  ·  {len(self.extra)} on your list not downloaded"
             self.subtitle.setText(sub)
             self.stack.setCurrentIndex(1 if (self.items or self.extra) else 2)
-        for key, text in self.TABS:
-            self.tabs.buttons[key].setText(f"{text}  {counts[key]}" if key != "ALL" else text)
-        if not connected and self.proxy.status != "ALL":
-            self.tabs.buttons["ALL"].setChecked(True)
-            self.proxy.set_status("ALL")
-        else:
-            self.proxy.refilter()
+        for key in ("NOTSTARTED", "FINISHED"):   # they read your AniList list
+            self.view_btns[key].setVisible(connected)
+        if not connected:
+            self.proxy.statuses.clear()
+            if self.proxy.view in ("NOTSTARTED", "FINISHED"):
+                self.set_view("ALL")
+        self.update_counts()
+        self.refilter()
         self.updated.emit()
 
-    def on_tab(self, status):
-        self.proxy.set_status(status)
+    def update_counts(self):
+        """Each quick chip's count (All has none)."""
+        rows = list(self.items.values()) + list(self.extra.values())
+        for key, text in self.VIEWS:
+            n = sum(1 for it in rows if lib_view_match(key, it.data)) if key != "ALL" else 0
+            self.view_btns[key].setText(f"{text}  ·  {n}" if key != "ALL" and n else text)
+
+    def read_file_times(self):
+        """When each show's first and newest files arrived (Recently added, Newest episode first): file times
+        read on a worker thread, thousands of files on a hard drive."""
+        if self.times_job is not None:
+            return
+        todo = {path: [f for eps in (it.data(INDEX_ROLE) or {}).get("local", {}).values() for f in eps.values()]
+                for path, it in self.items.items()}
+
+        def work():
+            out = {}
+            for path, files in todo.items():
+                ts = []
+                for f in files:
+                    try:
+                        ts.append(os.path.getmtime(f))
+                    except OSError:
+                        pass
+                if ts:
+                    out[path] = (min(ts), max(ts))
+            return out
+
+        def done(out, err):
+            self.times_job = None
+            if err:
+                klog.warning(f"Library file times: {err}")
+                return
+            self.file_times.update(out or {})
+            for path, it in self.items.items():
+                times = self.file_times.get(path)
+                it.setData(times[0] if times else None, ADDED_ROLE)
+                it.setData(times[1] if times else None, LATEST_ROLE)
+            self.update_counts()
+            self.refilter()
+        self.times_job = BgCall(work)
+        self.times_job.done.connect(done)
+        self.times_job.start()
+
+    def refilter(self):
+        self.proxy.refilter()
+        if self.proxy.sort_key != "title":
+            self.proxy.invalidate()   # the times / list changed: sort again
+        n = self.proxy.active()
+        self.filters_btn.setText(f" Filters  ·  {n}" if n else " Filters")
+        self.filters_btn.setStyleSheet(f"QPushButton {{ border-color: {C['accent']}; background: rgba({accent_rgb()},0.18);"
+                                       f" font-weight: 600; }}" if n else "")
+        self.update_showing()
+
+    def set_view(self, key):
+        self.proxy.view = key
+        self.view_btns[key].setChecked(True)
+        self.refilter()
+
+    def set_sort(self):
+        key = self.sort_box.currentData()
+        self.proxy.sort_key = key
+        self.settings["library_sort"] = key
+        save_settings(self.settings)
+        self.proxy.invalidate()
+        self.proxy.sort(0)
+
+    def open_filters(self):
+        pop = LibraryFilterPopup(self)
+        pop.changed.connect(self.refilter)
+        pop.show_under(self.filters_btn)
+
+    def clear_filters(self):
+        f = self.proxy
+        f.statuses.clear()
+        f.formats.clear()
+        f.genres.clear()
+        f.years = (None, None)
+        self.refilter()
+
+    def genre_list(self):
+        """Genres of the shows here, most common first."""
+        count = {}
+        for it in list(self.items.values()) + list(self.extra.values()):
+            for g in (it.data(META_ROLE) or {}).get("genres") or ():
+                count[g] = count.get(g, 0) + 1
+        return sorted(count, key=lambda g: (-count[g], g))
+
+    def year_range(self):
+        ys = {(it.data(META_ROLE) or {}).get("year") for it in list(self.items.values()) + list(self.extra.values())}
+        ys.discard(None)
+        return sorted(ys, reverse=True)
+
+    def update_showing(self):
+        """The line under the chips: every active pop-over filter as a removable chip, then Clear."""
+        lay = self.showing_row
+        while lay.count():
+            w = lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        f = self.proxy
+        parts = ([(LIB_STATUS_TEXT[s], lambda s=s: f.statuses.discard(s)) for s in sorted(f.statuses)]
+                 + [(LIB_FORMAT_TEXT[x], lambda x=x: f.formats.discard(x)) for x in sorted(f.formats)]
+                 + [(g, lambda g=g: f.genres.discard(g)) for g in sorted(f.genres)])
+        lo, hi = f.years
+        if lo or hi:
+            text = f"{lo}–{hi}" if lo and hi else f"From {lo}" if lo else f"Until {hi}"
+            parts.append((text, lambda: setattr(f, "years", (None, None))))
+        self.showing.setVisible(bool(parts))
+        if not parts:
+            return
+        lay.addWidget(label("Showing only", "faint"))
+        for text, remove in parts:
+            b = QPushButton(f"{text}  ")
+            b.setIcon(glyph_icon("close", C["muted"], C["text"], px=14))
+            b.setLayoutDirection(Qt.RightToLeft)   # the × after the text
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip("Remove this filter")
+            b.setStyleSheet(f"QPushButton {{ background: {C['surface2']}; border: none; border-radius: 10px;"
+                            f" padding: 3px 8px 3px 10px; font-size: 9pt; color: {C['text']}; }}"
+                            f" QPushButton:hover {{ background: {C['hover']}; }}")
+            b.clicked.connect(lambda _=False, r=remove: (r(), self.refilter()))
+            lay.addWidget(b)
+        clear = QPushButton("Clear")
+        clear.setObjectName("ghost")
+        clear.setCursor(Qt.PointingHandCursor)
+        clear.clicked.connect(self.clear_filters)
+        lay.addWidget(clear)
+        lay.addStretch(1)
 
     def _path(self, idx):
         return self.proxy.data(idx, PATH_ROLE) if idx.isValid() else None
@@ -4128,8 +4499,10 @@ class SettingsPage(Page):
         fil.setSpacing(8)
         info = QVBoxLayout()
         info.setSpacing(2)
-        info.addWidget(label("Script & overrides", "h2"))
-        info.addWidget(label("Fix wrong matches with OVERRIDES, SEASON_COVERS and RELATED_OVERRIDES.", "faint", wrap=True))
+        info.addWidget(label("Fixing a show", "h2"))
+        info.addWidget(label("A wrong match, episode count, two-in-one episodes or season: open the show's page and "
+                             "press Edit info. Your fixes are kept in user_overrides.json (the organizer uses them "
+                             "too).", "faint", wrap=True))
         fil.addLayout(info, 1)
         show_script = QPushButton("Show in Explorer")
         show_script.clicked.connect(self.reveal_script)
@@ -4168,21 +4541,79 @@ class SettingsPage(Page):
         self.divider(bl)
         lock = Toggle(bool(s.get("adult_lock")))
 
+        def choose_pin():
+            d = PinDialog(self, "Choose a PIN", "4 to 12 digits or letters, asked when you switch to Hentai. "
+                                                "Windows Hello works too when it's set up.", new=True)
+            if d.exec() != QDialog.Accepted:
+                return False
+            salt = os.urandom(8).hex()
+            s["adult_pin"] = {"salt": salt, "hash": pin_hash(d.pin.text(), salt)}
+            save_settings(s)
+            return True
+
+        def ask_current(title):
+            """The PIN you have now, or Windows Hello. True when it's you."""
+            pin = s.get("adult_pin") or {}
+            if not pin:
+                return True
+            d = PinDialog(self, title, "Enter your current PIN, or use Windows Hello.", hello=True, ok_text="Continue")
+            res = {}
+
+            def hello():
+                ok = windows_hello(title)
+                if ok:
+                    res["ok"] = True
+                    d.accept()
+                elif ok is None:
+                    QMessageBox.information(d, APP_NAME, "Windows Hello isn't set up on this PC. Use your PIN.")
+            d.hello.clicked.connect(hello)
+            if d.exec() != QDialog.Accepted:
+                return False
+            if res.get("ok") or pin_hash(d.pin.text(), pin.get("salt", "")) == pin.get("hash"):
+                return True
+            QMessageBox.warning(self, APP_NAME, "That PIN isn't right.")
+            return False
+
         def set_lock(v):
-            if v and not s.get("adult_pin"):
-                d = PinDialog(self, "Choose a PIN", "4 to 12 digits or letters, asked when you switch to Hentai. "
-                                                    "Windows Hello works too when it's set up.")
-                if d.exec() != QDialog.Accepted or len(d.pin.text()) < 4:
-                    lock.blockSignals(True)
-                    lock.setChecked(False)
-                    lock.blockSignals(False)
-                    return
-                salt = os.urandom(8).hex()
-                s["adult_pin"] = {"salt": salt, "hash": pin_hash(d.pin.text(), salt)}
+            # on: a PIN first (if there's none yet); off: only with the PIN, or the lock would be pointless
+            ok = (choose_pin() if not s.get("adult_pin") else True) if v else ask_current("Turn off the lock")
+            if not ok:
+                lock.blockSignals(True)
+                lock.setChecked(not v)
+                lock.blockSignals(False)
+                return
             self.set("adult_lock", v)
+            pin_btns.setEnabled(bool(s.get("adult_pin")))
         lock.toggled.connect(set_lock)
         self.row(bl, "Lock the hentai side", label("Ask for a PIN (or Windows Hello) when switching to Hentai, once until "
                                                 "Kura closes.", "faint", wrap=True), lock)
+        self.divider(bl)
+        pin_btns = QWidget()
+        ph = QHBoxLayout(pin_btns)
+        ph.setContentsMargins(0, 0, 0, 0)
+        ph.setSpacing(8)
+        change = QPushButton("Change PIN")
+
+        def change_pin():
+            if ask_current("Change your PIN") and choose_pin():
+                QMessageBox.information(self, APP_NAME, "Your PIN is changed.")
+        change.clicked.connect(change_pin)
+        forgot = QPushButton("Forgot PIN")
+
+        def forgot_pin():
+            ok = windows_hello("Reset your Kura PIN")
+            if ok is None:
+                QMessageBox.information(self, APP_NAME, "Windows Hello isn't set up on this PC, so Kura can't check it's "
+                                        "you. Set up Windows Hello (Settings → Accounts → Sign-in options), then try "
+                                        "again.")
+            elif ok and choose_pin():
+                QMessageBox.information(self, APP_NAME, "Your PIN is reset.")
+        forgot.clicked.connect(forgot_pin)
+        ph.addWidget(change)
+        ph.addWidget(forgot)
+        pin_btns.setEnabled(bool(s.get("adult_pin")))
+        self.row(bl, "PIN", label("Change it (you'll need the current one), or reset it with Windows Hello if you "
+                                  "forgot it.", "faint", wrap=True), pin_btns)
         self.divider(bl)
         disc = Toggle(s.get("adult_discord_hide", True))
         disc.toggled.connect(lambda v: self.set("adult_discord_hide", v))
@@ -4370,9 +4801,93 @@ class SettingsPage(Page):
             h.addWidget(go)
             v.addWidget(row)
         self.divider(v)
-        self.text_row(v, "Download search", "Used by the Search buttons on the To download page. {query} is "
-                      "replaced with the show's title.", "search_url", DEFAULT_SEARCH_URL, width=360)
+        v.addWidget(label("Download searches", "h2"))
+        v.addWidget(label("The Search menu on To download. {query} becomes the show and episode; the starred one "
+                          "(one per side) is what a plain click uses.", "faint", wrap=True))
+        self.searches_box = QWidget()
+        self.searches_lay = QVBoxLayout(self.searches_box)
+        self.searches_lay.setContentsMargins(0, 0, 0, 0)
+        self.searches_lay.setSpacing(6)
+        v.addWidget(self.searches_box)
+        self.build_searches()
         self.account_holder.addWidget(box)
+
+    def build_searches(self):
+        lay = self.searches_lay
+        while lay.count():
+            w = lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        items = self.settings.get("search_sites") or []
+        sides = {"anime": "Anime", "adult": "Hentai", "both": "Both"}
+        for k, it in enumerate(items):
+            row = QFrame()
+            row.setObjectName("srow")
+            row.setStyleSheet(f"QFrame#srow {{ background: {C['bg']}; border: 1px solid {C['border']}; border-radius: 10px; }}"
+                              " QLabel { background: transparent; }")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(10, 6, 10, 6)
+            h.setSpacing(10)
+            star = QPushButton()
+            star.setIcon(glyph_icon("star:fill" if it.get("default") else "star", C["warn"] if it.get("default") else C["faint"]))
+            star.setFixedSize(30, 28)
+            star.setToolTip("What a plain click on Search uses (on its side)")
+            star.setStyleSheet("QPushButton { background: transparent; border: none; }")
+            star.clicked.connect(lambda _=False, i=k: self.star_search(i))
+            h.addWidget(star)
+            ic = item_icon(it, 18)
+            if ic is not None:
+                il = QLabel()
+                il.setPixmap(ic.pixmap(18, 18))
+                h.addWidget(il)
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            col.addWidget(label(it.get("name", ""), None))
+            u = label(it.get("url", ""), "faint")
+            u.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            u.setToolTip(it.get("url", ""))
+            col.addWidget(u)
+            h.addLayout(col, 1)
+            h.addWidget(label(sides.get(it.get("side", "anime"), ""), "chip"))
+            for glyph, tip, fn in (("arrow_upward", "Move up", lambda _=False, i=k: self.move_search(i, -1)),
+                                   ("arrow_downward", "Move down", lambda _=False, i=k: self.move_search(i, 1)),
+                                   ("edit", "Edit", lambda _=False, it=it: self.edit_search(it))):
+                b = QPushButton()
+                b.setIcon(glyph_icon(glyph, C["muted"], C["text"]))
+                b.setFixedSize(30, 28)
+                b.setToolTip(tip)
+                b.setStyleSheet("QPushButton { background: transparent; border: none; }")
+                b.clicked.connect(fn)
+                h.addWidget(b)
+            lay.addWidget(row)
+        add = QPushButton(" Add a search")
+        add.setIcon(glyph_icon("add", C["text"]))
+        add.clicked.connect(lambda: self.edit_search(None))
+        lay.addWidget(add, 0, Qt.AlignLeft)
+        self.search_icons = fetch_icons(items, self.build_searches)
+
+    def edit_search(self, item):
+        if edit_item_list(self, self.settings, "search_sites", item, search=True):
+            self.build_searches()
+
+    def star_search(self, i):
+        items = [dict(x) for x in self.settings.get("search_sites") or []]
+        side = items[i].get("side", "anime")
+        for k, x in enumerate(items):   # one starred search per side
+            if x.get("side", "anime") == side or side == "both":
+                x["default"] = k == i
+        self.settings["search_sites"] = items
+        save_settings(self.settings)
+        self.build_searches()
+
+    def move_search(self, i, d):
+        items = [dict(x) for x in self.settings.get("search_sites") or []]
+        j = i + d
+        if 0 <= j < len(items):
+            items[i], items[j] = items[j], items[i]
+            self.settings["search_sites"] = items
+            save_settings(self.settings)
+            self.build_searches()
 
     def _note(self, text):
         n = label(text, "muted", wrap=True)
@@ -4617,7 +5132,8 @@ class RoundedImage(QWidget):
         p.setClipPath(clip)
         if self.img is not None:
             dpr = self.devicePixelRatioF()
-            if self._pm is None or self._pm.devicePixelRatio() != dpr:
+            if (self._pm is None or self._pm.devicePixelRatio() != dpr
+                    or self._pm.width() != round(self.width() * dpr)):   # resized (stretching ones: Live TV tiles)
                 self._pm = cover_pixmap(self.img, self.width(), self.height(), dpr)
             p.drawPixmap(0, 0, self._pm)
         else:
@@ -4837,13 +5353,13 @@ class EpisodeCards(QWidget):
         self.titles = {}
         self.kinds = {}
         mid = self.media.get("id")
-        for text, _state, tip, *_ in chips:
+        for text, _state, tip, path in chips:
             if str(tip).startswith("Recap · "):   # a .5 recap between two episodes
                 self.titles[text] = "Recap"
-            elif text.isdigit() and mid:
-                url, title = episode_still({mid: self.media}, mid, int(text))
-                if title and title.strip(" .-").lower() not in ("untitled", "tba", "tbd"):
-                    self.titles[text] = title
+            elif text.isdigit():   # "Episode 5 - Bakeneko": AniList's title, else the file's
+                name = episode_name({mid: self.media}, mid, int(text), path)
+                if name:
+                    self.titles[text] = f"Episode {text} - {name}"
         self.setMouseTracking(True)
         sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         sp.setHeightForWidth(True)
@@ -5026,6 +5542,10 @@ class EpisodeCards(QWidget):
             # number badge and the watched check
             p.setFont(f_num)
             num = f"E{text}" if text.isdigit() else text
+            split = org.EPISODE_SPLIT.get(str(self.mid)) if self.mid else None
+            if split and text.isdigit():   # two-in-one: which of AniList's episodes this file is
+                k = int(text)
+                num += f"  ·  AniList {(k - 1) * split + 1}–{k * split}"
             nw = QFontMetrics(f_num).horizontalAdvance(num) + 14
             badge = QRectF(r.x() + 8, r.y() + 8, nw, 20)
             p.setPen(Qt.NoPen)
@@ -5177,6 +5697,105 @@ class Hero(QWidget):
         p.fillRect(r, fade)
 
 
+class PosterHero(QWidget):
+    """The show page's top (user's pick E4 v2, Oct 2026): the show's poster, blurred and dimmed, behind the whole
+    header, fading into the page at the bottom."""
+
+    def __init__(self, seed):
+        super().__init__()
+        self.seed, self.img, self._pm = seed, None, None
+
+    def set_image(self, img):
+        self.img, self._pm = img, None
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r = QRectF(self.rect())
+        if self.img is not None and not self.img.isNull():
+            if self._pm is None or self._pm.size() != self.size():
+                # a tiny copy scaled back up = a soft blur, cheap enough to redo on resize
+                small = self.img.scaled(28, 40, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                self._pm = QPixmap.fromImage(small.scaled(self.width(), self.height(), Qt.KeepAspectRatioByExpanding,
+                                                          Qt.SmoothTransformation))
+            p.setOpacity(0.55)
+            p.drawPixmap(int((self.width() - self._pm.width()) / 2), int((self.height() - self._pm.height()) / 2), self._pm)
+            p.setOpacity(1)
+        else:
+            p.setOpacity(0.3)
+            p.fillRect(r, placeholder_gradient(r, self.seed))
+            p.setOpacity(1)
+        bg = QColor(C["bg"])
+        fade = QLinearGradient(0, 0, 0, r.height())
+        fade.setColorAt(0, QColor(bg.red(), bg.green(), bg.blue(), 90))
+        fade.setColorAt(0.6, QColor(bg.red(), bg.green(), bg.blue(), 170))
+        fade.setColorAt(1, bg)
+        p.fillRect(r, fade)
+
+
+class SeasonPick(QPushButton):
+    """A season to show on the show page (E4 v2): its cover, name and where you are in it. Checkable."""
+
+    def __init__(self, title, sub, sub_color):
+        super().__init__()
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName("seasonpick")
+        self.setStyleSheet(f"QPushButton#seasonpick {{ background: {C['surface']}; border: 1px solid {C['border']};"
+                           f" border-radius: 12px; text-align: left; }}"
+                           f" QPushButton#seasonpick:hover {{ border-color: {C['border_hi']}; }}"
+                           f" QPushButton#seasonpick:checked {{ background: rgba({accent_rgb()},0.14);"
+                           f" border: 2px solid {C['accent']}; }}")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(8, 8, 16, 8)
+        h.setSpacing(12)
+        self.art = RoundedImage(44, 62, 6, title)
+        self.art.setAttribute(Qt.WA_TransparentForMouseEvents)
+        h.addWidget(self.art)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(title)
+        t.setStyleSheet(f"color: {C['text']}; font-weight: 600; background: transparent;")
+        s = QLabel(sub)
+        s.setStyleSheet(f"color: {sub_color}; font-size: 8.5pt; background: transparent;")
+        for w in (t, s):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
+            col.addWidget(w)
+        h.addLayout(col)
+        self.setMinimumHeight(80)
+
+    def set_image(self, img):
+        self.art.set_image(img)
+
+    def sizeHint(self):
+        return self.layout().sizeHint()
+
+
+def stat_tile(caption, value, color=None, bar=None):
+    """One of the show page's stat tiles (E4 v2): a caption over a big value, a bar under it if given."""
+    f = QFrame()
+    f.setObjectName("stattile")
+    f.setStyleSheet(f"QFrame#stattile {{ background: {C['surface']}; border: 1px solid {C['border']}; border-radius: 12px; }}"
+                    " QLabel { background: transparent; }")
+    v = QVBoxLayout(f)
+    v.setContentsMargins(16, 12, 16, 12)
+    v.setSpacing(4)
+    v.addWidget(label(caption, "faint"))
+    val = QLabel(value)
+    val.setTextFormat(Qt.RichText)
+    val.setStyleSheet(f"color: {color or C['text']}; font-size: 15pt; font-weight: 800;")
+    v.addWidget(val)
+    if bar is not None:
+        b = ThinBar()
+        b.setMinimumWidth(0)
+        b.setMaximumWidth(16777215)
+        b.set(bar, C["accent"])
+        v.addWidget(b)
+    v.addStretch(1)
+    return f
+
+
 STATUS_TEXT = {"FINISHED": "Finished", "RELEASING": "Airing", "NOT_YET_RELEASED": "Not yet aired",
                "CANCELLED": "Cancelled", "HIATUS": "On hiatus"}
 FORMAT_TEXT = {"TV": "TV", "TV_SHORT": "TV Short", "MOVIE": "Movie", "SPECIAL": "Special", "OVA": "OVA",
@@ -5220,13 +5839,10 @@ class ListBar(QFrame):
             h.addWidget(w)
         h.addSpacing(10)
         self.score_lbl = label("Score", "faint")
-        self.score = QDoubleSpinBox()
-        self.score.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.score.setSpecialValueText("–")   # 0 = no score
-        self.score.setFixedWidth(60)
-        self.score.setAlignment(Qt.AlignCenter)
-        self.score.setToolTip("Your score (Enter to save)")
-        self.score.editingFinished.connect(self.score_changed)
+        self.score = QComboBox()   # a list of the scores your AniList scale allows (1-10), not a number to type
+        self.score.setToolTip("Your score")
+        self.score.setMaxVisibleItems(12)
+        self.score.activated.connect(lambda _i: self.score_changed())
         h.addWidget(self.score_lbl)
         h.addWidget(self.score)
         h.addStretch(1)
@@ -5252,12 +5868,22 @@ class ListBar(QFrame):
             return
         total = self.media.get("episodes")
         self.prog.setText(f"{e.get('progress') or 0} / {total or '?'}")
-        top, decimals = acct.SCORE_RANGES.get(self.account.score_format, (10, 0))
+        fmt = self.account.score_format
+        top, decimals = acct.SCORE_RANGES.get(fmt, (10, 0))
+        step = 0.5 if decimals else (5 if top == 100 else 1)
+        values, v = [], float(top)
+        while v >= step - 1e-9:   # highest first: 10, 9, ... 1
+            values.append(round(v, 1))
+            v -= step
+        mine = e.get("score") or 0
+        if mine and all(abs(mine - x) > 1e-6 for x in values):   # a score set elsewhere (7.3): keep it in the list
+            values = sorted(values + [mine], reverse=True)
         self.score.blockSignals(True)
-        self.score.setDecimals(decimals)
-        self.score.setRange(0, top)
-        self.score.setSingleStep(1 if not decimals else 0.5)
-        self.score.setValue(e.get("score") or 0)
+        self.score.clear()
+        self.score.addItem("–", 0)   # no score
+        for x in values:
+            self.score.addItem(acct.format_score(x, fmt) or str(x), x)
+        self.score.setCurrentIndex(max(0, self.score.findData(mine) if mine else 0))
         self.score.blockSignals(False)
         parts = []
         if acct.format_date(e.get("startedAt")):
@@ -5274,8 +5900,9 @@ class ListBar(QFrame):
 
     def score_changed(self):
         e = self.entry()
-        if e and abs((e.get("score") or 0) - self.score.value()) > 1e-6:
-            self.account.save(self.mid, self.media, score=self.score.value())
+        value = float(self.score.currentData() or 0)
+        if e and abs((e.get("score") or 0) - value) > 1e-6:
+            self.account.save(self.mid, self.media, score=value)
 
     def status_menu(self):
         e = self.entry()
@@ -6360,6 +6987,20 @@ class ExtrasPanel(QWidget):
         self.changed()
 
 
+def edit_chip(text, glyph, on_click, big=False):
+    """A dashed, clickable piece of the show page in Edit info mode (user's pick C)."""
+    b = QPushButton(f" {text}")
+    b.setIcon(glyph_icon(glyph, C["accent_hi"], C["accent_hi"]))
+    b.setCursor(Qt.PointingHandCursor)
+    b.setToolTip("Click to change")
+    size = "font-size: 20pt; font-weight: 700; padding: 6px 14px;" if big else "font-size: 9.5pt; padding: 5px 11px;"
+    b.setStyleSheet(f"QPushButton {{ background: rgba({accent_rgb()},0.08); border: 1px dashed rgba({accent_rgb()},0.75);"
+                    f" border-radius: 9px; color: {C['text']}; {size} text-align: left; }}"
+                    f" QPushButton:hover {{ background: rgba({accent_rgb()},0.18); }}")
+    b.clicked.connect(on_click)
+    return b
+
+
 class DetailPage(QWidget):
     version_changed = Signal()   # you picked another version of a show (the library re-reads it)
     back = Signal()
@@ -6398,6 +7039,7 @@ class DetailPage(QWidget):
         self.images = {}          # pictures already loaded for this show (a rebuild puts them back)
         self.thumb_slots = {}
         self.section_pick = {}    # show folder → the season tab you picked
+        self.editing = False      # Edit info: the page's editable parts are dashed (user's pick C)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.scroll = QScrollArea()
@@ -6406,14 +7048,36 @@ class DetailPage(QWidget):
         self.scroll.verticalScrollBar().setSingleStep(24)
         lay.addWidget(self.scroll)
 
-    def open(self, path, cover=None, force=False, media_id=None, name=None):
-        """path = the show's folder, or None for a show you haven't downloaded (media_id + name)."""
+    def open(self, path, cover=None, force=False, media_id=None, name=None, quiet=False):
+        """path = the show's folder, or None for a show you haven't downloaded (media_id + name).
+        quiet: the same show read again (another version picked): the page stays up, no loading screen, and keeps
+        its scroll position."""
+        if quiet and self.result and path == self.path and media_id is None:
+            for ld in list(self.loaders):
+                ld.requestInterruption()
+            self.load_id += 1
+            ld = DetailLoader(self.load_id, path, False, self.media_id, self.name)
+            pos = self.scroll.verticalScrollBar().value()
+
+            def done(i, r, c=self.cover):
+                if i == self.load_id:
+                    self.render(r, c)
+                    self.restore_images()
+                    QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(pos))
+            ld.loaded.connect(done)
+            ld.image.connect(self.on_image)
+            ld.finished.connect(lambda l=ld: self.loaders.discard(l))
+            self.loaders.add(ld)
+            ld.start()
+            return
         if media_id is not None or path != self.path:
             self.media_id = media_id
         if name or path != self.path:
             self.name = name or (Path(path).name if path else "?")
         if path != self.path or media_id is not None:
             self.images = {}   # another show
+            if path != self.path:
+                self.editing = False
         self.path = path
         self.result = None
         for ld in list(self.loaders):
@@ -6525,12 +7189,16 @@ class DetailPage(QWidget):
         col = QVBoxLayout(content)
         col.setContentsMargins(0, 0, 0, 36)
         col.setSpacing(0)
+        editing = self.editing and not r.get("loading") and bool(r.get("path"))
+        if editing:
+            col.addWidget(self.edit_bar(r))
 
-        # ---- hero
-        hero = Hero(name)
-        self.slots["banner"] = [hero]
+        # ---- hero (user's pick E4 v2, Oct 2026): the poster blurred behind the header
+        hero = PosterHero(name)
+        if cover is not None:
+            hero.set_image(cover)
         hv = QVBoxLayout(hero)
-        hv.setContentsMargins(36, 22, 36, 8)
+        hv.setContentsMargins(36, 22, 36, 26)
         top = QHBoxLayout()
         back = QPushButton(" Back")
         back.setObjectName("overlay")
@@ -6549,56 +7217,51 @@ class DetailPage(QWidget):
                     self.account.refresh()
             refresh.clicked.connect(reload)
             top.addWidget(refresh)
+            if r.get("path") and not editing:
+                edit = QPushButton(" Edit info")
+                edit.setObjectName("overlay")
+                edit.setIcon(glyph_icon("edit", C["text"]))
+                edit.setToolTip("Fix this show's title, AniList match, episode count, two-in-one episodes or seasons")
+                edit.clicked.connect(lambda: self.set_editing(True))
+                top.addWidget(edit)
         hv.addLayout(top)
-        hv.addSpacing(70)
+        hv.addSpacing(22)
 
         row = QHBoxLayout()
-        row.setSpacing(28)
-        poster = RoundedImage(176, 250, 12, name)
+        row.setSpacing(32)
+        poster = RoundedImage(210, 298, 14, name)
         if cover is not None:
             poster.set_image(cover)
-        self.slots["cover"] = [poster]
-        row.addWidget(poster, 0, Qt.AlignTop)
+        self.slots["cover"] = [poster, hero]
+        row.addWidget(poster, 0, Qt.AlignVCenter)
 
         info = QVBoxLayout()
-        info.setSpacing(6)
-        info.addSpacing(40)
-        shown = (t.get("english") if org.TITLE_LANGUAGE == "english" else t.get("romaji")) or t.get("romaji") or name
-        title = label(shown, "title", wrap=True)
-        info.addWidget(title)
-        alts = [x for x in (t.get("romaji"), t.get("native")) if x and x != shown]
-        if alts:
-            info.addWidget(label("  ·  ".join(alts), "muted", wrap=True))
-
-        chips = QHBoxLayout()
-        chips.setSpacing(6)
+        info.setSpacing(8)
+        info.addStretch(1)
+        shown = (org.DISPLAY_TITLES.get(str(hero_d.get("id")))
+                 or (t.get("english") if org.TITLE_LANGUAGE == "english" else t.get("romaji")) or t.get("romaji") or name)
+        if editing:
+            info.addWidget(edit_chip(shown, "edit", lambda: self.edit_title(r, shown), big=True), 0, Qt.AlignLeft)
+        else:
+            title = label(shown, "title", wrap=True)
+            info.addWidget(title)
         seasons = r.get("seasons") or []
-        if self.tracking() and not r.get("loading"):
-            mine = [self.account.entry(s["id"]) for s in r["sections"] if s["id"] and self.account.entry(s["id"])]
-            if mine:
-                st = next((e["status"] for e in mine if e["status"] in ("CURRENT", "REPEATING")), mine[-1]["status"])
-                chip = label(acct.STATUS_NAMES.get(st, st), "chip")
-                chip.setStyleSheet(status_style(st) + "font-weight: 600;")
-                chips.addWidget(chip)
-        if hero_d:
-            statuses = [s.get("status") for s in seasons] or [hero_d.get("status")]
-            out = [s for s in statuses if s != "NOT_YET_RELEASED"]
-            status = "RELEASING" if "RELEASING" in statuses else (out or statuses)[-1]
-            announced = "New season announced" if out and "NOT_YET_RELEASED" in statuses else ""
-            for text in [FORMAT_TEXT.get(hero_d.get("format"), ""), season_label(hero_d),
-                         f"{len(seasons)} seasons" if len(seasons) > 1 else
-                         (f"{hero_d['episodes']} episodes" if hero_d.get("episodes") else ""),
-                         STATUS_TEXT.get(status, ""),
-                         f"★ {hero_d['averageScore']}%" if hero_d.get("averageScore") else "", announced]:
-                if text:
-                    chips.addWidget(label(text, "chip"))
-        chips.addStretch(1)
-        info.addLayout(chips)
-
-        if hero_d.get("genres") or hero_d.get("studios"):
-            studios = ", ".join(n["name"] for n in ((hero_d.get("studios") or {}).get("nodes") or []))
-            meta = "  ·  ".join(x for x in (", ".join(hero_d.get("genres") or []), studios) if x)
-            info.addWidget(label(meta, "muted", wrap=True))
+        alt = next((x for x in (t.get("native"), t.get("romaji")) if x and x != shown), "")
+        statuses = [x.get("status") for x in seasons] or [hero_d.get("status")]
+        announced = "New season announced" if [x for x in statuses if x != "NOT_YET_RELEASED"] and \
+            "NOT_YET_RELEASED" in statuses else ""
+        line = [alt, FORMAT_TEXT.get(hero_d.get("format"), ""), season_label(hero_d),
+                f"{len(seasons)} seasons" if len(seasons) > 1 else "", ", ".join(hero_d.get("genres") or []), announced]
+        if any(line):
+            info.addWidget(label("  ·  ".join(x for x in line if x), "muted", wrap=True))
+        if editing:   # which AniList entry this folder is
+            row_ = QHBoxLayout()
+            row_.setSpacing(8)
+            al_name = ((t.get("english") if org.TITLE_LANGUAGE == "english" else t.get("romaji")) or t.get("romaji")
+                       or "nothing")   # AniList's own name for it (not your title)
+            row_.addWidget(edit_chip(f"Matched to {al_name}  ·  change", "link", lambda: self.edit_match(r)))
+            row_.addStretch(1)
+            info.addLayout(row_)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
@@ -6609,12 +7272,7 @@ class DetailPage(QWidget):
             self.next_btn.setCursor(Qt.PointingHandCursor)
             self.next_btn.clicked.connect(lambda: self.next_path and play_video(self.next_path))
             buttons.addWidget(self.next_btn)
-        if r.get("path"):
-            open_btn = QPushButton(" Open folder")
-            open_btn.setIcon(glyph_icon(G["folder"], C["text"]))
-            open_btn.clicked.connect(lambda: os.name == "nt" and os.startfile(r["path"]))
-            buttons.addWidget(open_btn)
-        elif not r.get("loading"):
+        if not r.get("path") and not r.get("loading"):
             chip = label("Not downloaded", "chip")
             buttons.addWidget(chip)
         if hero_d.get("siteUrl"):
@@ -6628,6 +7286,13 @@ class DetailPage(QWidget):
             find.setToolTip("Search the torrent feed for this show")
             find.clicked.connect(lambda: self.find_torrents.emit(t.get("romaji") or t.get("english") or name))
             buttons.addWidget(find)
+        if r.get("path"):
+            open_btn = QPushButton()
+            open_btn.setIcon(glyph_icon(G["folder"], C["text"]))
+            open_btn.setToolTip("Open folder")
+            open_btn.setFixedWidth(42)
+            open_btn.clicked.connect(lambda: os.name == "nt" and os.startfile(r["path"]))
+            buttons.addWidget(open_btn)
         buttons.addStretch(1)
         info.addSpacing(6)
         info.addLayout(buttons)
@@ -6660,33 +7325,46 @@ class DetailPage(QWidget):
             el.addWidget(label(r["error"], "muted", wrap=True))
             bv.addWidget(err)
 
+        if hero_d:
+            bv.addLayout(self.stats_row(r, hero_d))
+
         desc = clean_description(hero_d.get("description"))
         self.trailer = TrailerCard(r["trailer"]) if r.get("trailer") else None
         if desc or self.trailer:
+            bv.addSpacing(8)
             about = QHBoxLayout()
-            about.setSpacing(28)
-            if desc:
-                d = label(desc, "desc", wrap=True)
-                d.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                d.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-                about.addWidget(d, 1, Qt.AlignTop)
+            about.setSpacing(26)
             if self.trailer:
                 self.slots["trailer"] = [self.trailer]
                 QTimer.singleShot(800, warm_up_trailers)
                 about.addWidget(self.trailer, 0, Qt.AlignTop)
-                if not desc:
-                    about.addStretch(1)
+            text = QVBoxLayout()
+            text.setSpacing(10)
+            text.addWidget(row_title("About"))
+            if desc:
+                d = label(desc, "desc", wrap=True)
+                d.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                d.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+                text.addWidget(d)
+            facts = [("Aired", season_label(hero_d)),
+                     ("Episode length", f"{hero_d['duration']} min" if hero_d.get("duration") else ""),
+                     ("Next episode", f"E{(hero_d.get('nextAiringEpisode') or {}).get('episode')} "
+                      f"{when((hero_d.get('nextAiringEpisode') or {}).get('airingAt'))}"
+                      if (hero_d.get("nextAiringEpisode") or {}).get("airingAt") else "")]
+            facts = [(k, v) for k, v in facts if v]
+            if facts:
+                grid = QGridLayout()
+                grid.setHorizontalSpacing(18)
+                grid.setVerticalSpacing(6)
+                for i, (k, v) in enumerate(facts):
+                    grid.addWidget(label(k, "faint"), i // 2, (i % 2) * 2)
+                    grid.addWidget(label(v, "muted"), i // 2, (i % 2) * 2 + 1)
+                grid.setColumnStretch(4, 1)   # the pairs stay together on the left
+                text.addSpacing(4)
+                text.addLayout(grid)
+            text.addStretch(1)
+            about.addLayout(text, 1)
             bv.addLayout(about)
-
-        # ---- relations, like AniList's (user's pick A): story first, then the rest of the franchise
-        if r.get("relations"):
-            bv.addSpacing(10)
-            bv.addWidget(self.relations_block(r["relations"]))
-
-        # ---- characters (Settings → App: a row of portraits or cast circles)
-        if r.get("characters"):
-            bv.addSpacing(10)
-            bv.addWidget(self.characters_block(r))
 
         # ---- seasons: tabs (pills) and a compact summary with a ring
         cards = []
@@ -6696,20 +7374,17 @@ class DetailPage(QWidget):
             head.setSpacing(6)
             self.tab_btns = []
             if len(r["sections"]) > 1:
-                pills = QWidget()   # wraps onto more lines (Queen's Blade: 3 seasons, 4 OVA folders, Extras)
+                picks = QWidget()   # wraps onto more lines (Queen's Blade: 3 seasons, 4 OVA folders, Extras)
                 sp = QSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
                 sp.setHeightForWidth(True)
-                pills.setSizePolicy(sp)
-                flow = FlowLayout(pills, spacing=6)
-                head.addWidget(pills, 1)
+                picks.setSizePolicy(sp)
+                flow = FlowLayout(picks, spacing=10)
+                head.addWidget(picks, 1)
                 for k, sec in enumerate(r["sections"]):
-                    b = QPushButton(sec["title"])
-                    b.setCheckable(True)
-                    b.setCursor(Qt.PointingHandCursor)
-                    b.setStyleSheet(f"QPushButton {{ background: rgba(255,255,255,0.05); border: 1px solid {C['border']};"
-                                    f" border-radius: 15px; padding: 6px 14px; color: {C['muted']}; }}"
-                                    f" QPushButton:hover {{ color: {C['text']}; }}"
-                                    f" QPushButton:checked {{ background: white; color: #111; border-color: white; font-weight: 600; }}")
+                    sub_text, sub_color = self.section_state(sec)
+                    b = SeasonPick(sec["title"], sub_text, sub_color)
+                    if sec.get("id"):
+                        self.slots.setdefault(f"thumb:{sec['id']}", []).append(b)
                     b.clicked.connect(lambda _=False, n=k: self.pick_section(n))
                     flow.addWidget(b)
                     self.tab_btns.append(b)
@@ -6717,21 +7392,8 @@ class DetailPage(QWidget):
                 head.addWidget(row_title("Episodes"))
                 head.addStretch(1)
             head.addSpacing(12)
-            ring = ProgressRing(36, C["ok"] if not r["missing"] else C["accent"])
-            ring.set(r["have"] / aired if aired else 1)
-            head.addWidget(ring)
-            summ = QVBoxLayout()
-            summ.setSpacing(0)
-            st = QLabel(f"{r['have']} of {aired} episodes downloaded" if aired else f"{r['have']} episodes")
-            st.setStyleSheet("font-weight: 600;")
-            summ.addWidget(st)
-            bits = [f"{r['missing']} missing" if r["missing"] else "nothing missing",
-                    f"{r['seasons_have']} of {r['seasons_out']} season{'s' if r['seasons_out'] != 1 else ''}"]
-            summ.addWidget(label("  ·  ".join(bits), "faint"))
-            head.addLayout(summ)
-            head.addSpacing(12)
-            view = Segmented([("cards", "Cards"), ("compact", "Compact")], APP["settings"].get("detail_ep_view", "cards"))
-            view.setToolTip("Episodes as cards with pictures, or as compact numbered squares")
+            view = Segmented([("cards", "Previews"), ("compact", "Compact")], APP["settings"].get("detail_ep_view", "cards"))
+            view.setToolTip("Episodes with a picture from each one, or as compact numbered squares")
             view.changed.connect(self.set_ep_view)
             head.addWidget(view)
             bv.addSpacing(8)
@@ -6745,6 +7407,16 @@ class DetailPage(QWidget):
             nxt = next_episode(r["sections"], self.account) if self.tracking() else None
             first = next((k for k, sec in enumerate(r["sections"]) if nxt and nxt["section"] is sec), 0)
             self.pick_section(self.section_pick.get(r.get("path") or r["name"], first), remember=False)
+
+        # ---- relations, like AniList's (user's pick A): story first, then the rest of the franchise
+        if r.get("relations"):
+            bv.addSpacing(14)
+            bv.addWidget(self.relations_block(r["relations"]))
+
+        # ---- characters (Settings → App: a row of portraits or cast circles)
+        if r.get("characters"):
+            bv.addSpacing(10)
+            bv.addWidget(self.characters_block(r))
         if r.get("recs"):
             bv.addSpacing(14)
             bv.addLayout(self.recs_header(r["recs"]))
@@ -6755,6 +7427,224 @@ class DetailPage(QWidget):
         self.on_downloads_changed()
         self.restore_images()
         self.load_thumbs()
+
+    def stats_row(self, r, hero_d):
+        """E4 v2's tiles: your progress, status, score, in your library, studio."""
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        aired = r["have"] + r["missing"]
+        if self.tracking():
+            mine = [(sec, self.account.entry(sec["id"])) for sec in r["sections"] if sec.get("id")]
+            total = sum((sec.get("total") or 0) for sec, _ in mine)
+            done = sum(((e or {}).get("progress") or 0) for _, e in mine)
+            row.addWidget(stat_tile("Your progress", f"{done} <span style='font-size:10pt; color:{C['muted']};"
+                                    f" font-weight:500;'>/ {total or '?'}</span>", bar=(done / total) if total else 0), 1)
+            listed = [e for _, e in mine if e]
+            st = next((e["status"] for e in listed if e["status"] in ("CURRENT", "REPEATING")),
+                      listed[-1]["status"] if listed else None)
+            row.addWidget(stat_tile("Status", acct.STATUS_NAMES.get(st, st) if st else "Not on your list",
+                                    STATUS_COLORS.get(st, C["muted"]) if st else C["muted"]), 1)
+        score = hero_d.get("averageScore")
+        row.addWidget(stat_tile("Score", f"★ {score}%" if score else "–", C["warn"] if score else C["muted"]), 1)
+        if r.get("path"):
+            here = "all here" if aired and not r["missing"] else f"{r['missing']} missing" if r["missing"] else ""
+            row.addWidget(stat_tile("In your library", f"{r['have']} <span style='font-size:10pt; color:"
+                                    f"{C['ok'] if not r['missing'] else C['warn']}; font-weight:500;'>{here}</span>"), 1)
+        studios = ", ".join(n["name"] for n in ((hero_d.get("studios") or {}).get("nodes") or []))
+        if studios:
+            tile = stat_tile("Studio", studios)
+            tile.findChildren(QLabel)[-1].setWordWrap(True)
+            row.addWidget(tile, 1)
+        return row
+
+    def section_state(self, sec):
+        """A season card's second line (and its colour): where you are in it, else what's downloaded."""
+        e = self.account.entry(sec["id"]) if self.tracking() and sec.get("id") else None
+        total = sec.get("total")
+        if e and e["status"] == "COMPLETED":
+            return f"Watched · {total or sec['have']}", C["ok"]
+        if e and e["status"] in ("CURRENT", "REPEATING"):
+            return f"Watching · {e.get('progress') or 0} of {total or '?'}", C["accent_hi"]
+        if not sec.get("has_folder") and sec.get("counted"):
+            return ("Not aired yet" if sec.get("aired") == 0 else "Not downloaded"), C["muted"]
+        return f"{sec['have']} episode{'s' if sec['have'] != 1 else ''}", C["muted"]
+
+    # ---- Edit info (user's pick C: edit mode right on the page; saved in user_overrides.json)
+    def set_editing(self, on):
+        self.editing = on
+        if self.result:
+            self.render(self.result, self.cover)
+
+    def edit_bar(self, r):
+        bar = QFrame()
+        bar.setObjectName("editbar")
+        bar.setStyleSheet(f"QFrame#editbar {{ background: rgba({accent_rgb()},0.14);"
+                          f" border-bottom: 1px solid rgba({accent_rgb()},0.35); }}")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(36, 10, 36, 10)
+        h.setSpacing(12)
+        h.addWidget(glyph_label("edit", C["accent_hi"], 20))
+        t = QLabel("Editing this show's info")
+        t.setStyleSheet("font-weight: 600; background: transparent;")
+        h.addWidget(t)
+        h.addWidget(label("Dashed parts are editable. Only Kura uses your changes; AniList isn't touched.", "faint",
+                          wrap=True), 1)
+        reset = QPushButton(" Back to AniList's")
+        reset.setIcon(glyph_icon("restart_alt", C["text"]))
+        reset.setToolTip("Forget every change you made to this show")
+        reset.clicked.connect(lambda: self.reset_edits(r))
+        h.addWidget(reset)
+        done = QPushButton(" Done")
+        done.setObjectName("primary")
+        done.setIcon(glyph_icon("check", "white", "white"))
+        done.clicked.connect(lambda: self.set_editing(False))
+        h.addWidget(done)
+        return bar
+
+    def saved(self, change):
+        save_show_edits(change, self.account)
+        self.open(self.path, self.cover)
+
+    def folder_key(self):
+        return Path(self.path).name.lower()
+
+    def edit_title(self, r, shown):
+        hero = r.get("hero") or {}
+        if not hero.get("id"):
+            return
+        t = hero.get("title") or {}
+        anilist = (t.get("english") if org.TITLE_LANGUAGE == "english" else t.get("romaji")) or t.get("romaji") or ""
+        text, ok = QInputDialog.getText(self, "Title", f"The title Kura shows (empty = AniList's: {anilist}):",
+                                        text=shown)
+        if not ok:
+            return
+        text, hid = text.strip(), str(hero["id"])
+
+        def change(d):
+            disp = d.setdefault("display", {})
+            if text and text != anilist:
+                disp[hid] = text
+            else:
+                disp.pop(hid, None)
+        self.saved(change)
+
+    def edit_match(self, r):
+        dlg = MatchPicker(self, f"Which AniList entry is “{Path(self.path).name}”?", Path(self.path).name)
+        if dlg.exec() != QDialog.Accepted or not dlg.chosen:
+            return
+        key, mid = self.folder_key(), dlg.chosen["id"]
+        self.media_id = None   # the page follows the folder's new match
+        self.saved(lambda d: d.setdefault("titles", {}).__setitem__(key, mid))
+
+    def section_edit_row(self, s):
+        w = QWidget()
+        w.setStyleSheet("background: transparent;")
+        flow = FlowLayout(w, spacing=8)
+        m, sid = s.get("media") or {}, s.get("id")
+        if sid:
+            orig = m.get("episodes_anilist", m.get("episodes"))
+            cur = m.get("episodes")
+            flow.addWidget(edit_chip(f"{cur or '?'} episodes" + (f"  (AniList {orig})" if orig != cur else ""), "tag",
+                                     lambda: self.edit_count(s)))
+            split = org.EPISODE_SPLIT.get(str(sid)) or 1
+            flow.addWidget(edit_chip("Each file holds " + (f"{split} episodes" if split > 1 else "1 episode"),
+                                     "call_split", lambda: self.edit_split(s)))
+        if s.get("n"):
+            flow.addWidget(edit_chip(f"AniList entry: {media_title(m) if m.get('title') else 'none'}  ·  change",
+                                     "link", lambda: self.edit_season_entry(s)))
+        if s.get("folder") and s.get("n") and Path(s["folder"]) != Path(self.path):
+            flow.addWidget(edit_chip(f"Counts as Season {s['n']}", "folder", lambda: self.edit_counts_as(s)))
+        return w
+
+    def edit_count(self, s):
+        m = s.get("media") or {}
+        orig = m.get("episodes_anilist", m.get("episodes")) or 0
+        n, ok = QInputDialog.getInt(self, "Episodes", f"How many episodes does {s['title']} have?\nAniList says "
+                                    f"{orig or 'nothing'}. 0 = use AniList's again.", m.get("episodes") or orig, 0, 5000)
+        if not ok:
+            return
+        settings = APP.get("settings") or {}
+        counts = dict(settings.get("episode_counts") or {})
+        if n and n != orig:
+            counts[str(s["id"])] = n
+        else:
+            counts.pop(str(s["id"]), None)
+        settings["episode_counts"] = counts
+        save_settings(settings)
+        self.saved(lambda d: None)
+
+    def edit_split(self, s):
+        menu = QMenu(self)
+        cur = org.EPISODE_SPLIT.get(str(s["id"])) or 1
+        for k, text in ((1, "1 episode per file (normal)"), (2, "2 episodes per file"), (3, "3 episodes per file")):
+            a = menu.addAction(text)
+            a.setCheckable(True)
+            a.setChecked(k == cur)
+            a.triggered.connect(lambda _=False, k=k: self.set_split(s, k))
+        menu.exec(QCursor.pos())
+
+    def set_split(self, s, k):
+        sid = str(s["id"])
+
+        def change(d):
+            split = d.setdefault("split", {})
+            if k > 1:
+                split[sid] = k
+            else:
+                split.pop(sid, None)
+        self.saved(change)
+
+    def edit_season_entry(self, s):
+        dlg = MatchPicker(self, f"Which AniList entry is {s['title']}?",
+                          media_title(s["media"]) if (s.get("media") or {}).get("title") else Path(self.path).name)
+        if dlg.exec() != QDialog.Accepted or not dlg.chosen:
+            return
+        key, n, mid = self.folder_key(), str(s["n"]), dlg.chosen["id"]
+        self.saved(lambda d: d.setdefault("seasons", {}).setdefault(key, {}).__setitem__(n, mid))
+
+    def edit_counts_as(self, s):
+        menu = QMenu(self)
+        top = max([s["n"]] + [x.get("n") or 0 for x in (self.result or {}).get("sections") or []]) + 2
+        for k in range(1, top + 1):
+            a = menu.addAction(f"Season {k}")
+            a.setCheckable(True)
+            a.setChecked(k == s["n"])
+            a.triggered.connect(lambda _=False, k=k: self.set_counts_as(s, k))
+        menu.exec(QCursor.pos())
+
+    def set_counts_as(self, s, k):
+        key, folder = self.folder_key(), Path(s["folder"]).name
+        m = SEASON_RE.fullmatch(folder)
+
+        def change(d):
+            fs = d.setdefault("folder_seasons", {}).setdefault(key, {})
+            if m and int(m.group(1)) == k:   # "Season 2" counting as season 2: nothing to remember
+                fs.pop(folder, None)
+            else:
+                fs[folder] = k
+        self.saved(change)
+
+    def reset_edits(self, r):
+        box = QMessageBox(QMessageBox.Question, APP_NAME, "Forget every change you made to this show and use "
+                          "AniList's info again?", QMessageBox.Yes | QMessageBox.Cancel, self)
+        box.button(QMessageBox.Yes).setText("Use AniList's")
+        if box.exec() != QMessageBox.Yes:
+            return
+        key = self.folder_key()
+        ids = {str(x["id"]) for x in r.get("sections") or [] if x.get("id")} | {str((r.get("hero") or {}).get("id"))}
+        settings = APP.get("settings") or {}
+        counts = {k: v for k, v in (settings.get("episode_counts") or {}).items() if k not in ids}
+        settings["episode_counts"] = counts
+        save_settings(settings)
+
+        def change(d):
+            for part in ("titles", "seasons", "folder_seasons"):
+                (d.get(part) or {}).pop(key, None)
+            for part in ("display", "split"):
+                for i in ids:
+                    (d.get(part) or {}).pop(i, None)
+        self.media_id = None
+        self.saved(change)
 
     def rec_badge(self, mid):
         e = self.account.entry(mid) if self.tracking() else None
@@ -6916,7 +7806,7 @@ class DetailPage(QWidget):
         settings["version_prefs"] = VERSION_PREFS
         save_settings(settings)
         self.version_changed.emit()
-        self.open(self.path, force=False)
+        self.open(self.path, quiet=True)
 
     def relations_block(self, rels):
         w = QWidget()
@@ -7050,6 +7940,8 @@ class DetailPage(QWidget):
                             f"padding: 4px 12px; font-size: 9pt; font-weight: 600;")
         head.addWidget(badge, 0, Qt.AlignVCenter)
         v.addLayout(head)
+        if self.editing and (s.get("id") or s.get("n")):
+            v.addWidget(self.section_edit_row(s))
         if s.get("versions"):
             v.addWidget(self.version_row(s))
         if s.get("extras"):
@@ -7115,7 +8007,30 @@ def episode_ranges(nums):
     return ", ".join(str(a) if a == b else f"{a}–{b}" for a, b in out)
 
 
+def save_show_edits(change, account=None):
+    """Edit info: change(data) edits user_overrides.json's dict in place; then every part of Kura that uses it
+    catches up (the organizer's lists, two-in-one progress, episode counts) and the library is read again."""
+    data = org.load_user_overrides()
+    change(data)
+    org.save_user_overrides(data)
+    acct.PROGRESS_SCALE.clear()
+    acct.PROGRESS_SCALE.update({int(k): v for k, v in org.EPISODE_SPLIT.items()})
+    EPISODE_FIX.clear()
+    _DETAILS_CACHE.clear()
+    if account is not None:
+        account.rescale()
+        fix_list_episodes(account)
+        account._save_file()
+        account.changed.emit()   # every page counts again
+    lib = APP.get("library")
+    if lib is not None:
+        lib.refresh()
+
+
 def media_title(m):
+    mine = org.DISPLAY_TITLES.get(str((m or {}).get("id")))   # Edit info: your title for it
+    if mine:
+        return mine
     t = (m or {}).get("title") or {}
     return ((t.get("english") if org.TITLE_LANGUAGE == "english" else t.get("romaji"))
             or t.get("romaji") or t.get("english") or "?")
@@ -7329,8 +8244,17 @@ class TodoCard(QFrame):
         if r["query"]:
             m.addAction(glyph_icon("content_copy", C["text"]), f"Copy “{r['query']}”",
                         lambda: QApplication.clipboard().setText(r["query"]))
-            m.addAction(glyph_icon("public", C["text"]), "Search on the website",
-                        lambda: webbrowser.open(page.search_url(r["query"])))
+            sites = page.searches()
+            for it in sites:   # your download searches for this side, the starred one first
+                ic = item_icon(it, 16)
+                text = f"Search {it.get('name', '')}"
+                if ic is not None:
+                    m.addAction(ic, text, lambda it=it: search_with(it, r["query"]))
+                else:
+                    m.addAction(text, lambda it=it: search_with(it, r["query"]))
+            if len(sites) > 1:
+                m.addAction(glyph_icon("open_in_new", C["text"]), "Search all of them (tabs)",
+                            lambda: [search_with(it, r["query"]) for it in sites])
         m.addAction(glyph_icon("info", C["text"]), "Open show page", lambda: page.open_media.emit(r["mid"], title, None))
         m.exec(btn.mapToGlobal(QPoint(0, btn.height() + 4)))
 
@@ -7386,9 +8310,13 @@ class ToDownloadPage(AccountPage):
         refresh.clicked.connect(lambda: self.account.refresh())
         self.actions.addWidget(refresh)
 
+    def searches(self):
+        """Your download searches for this side, the starred one first."""
+        items = side_items(self.settings.get("search_sites")) or [dict(DEFAULT_SEARCHES[0])]
+        return sorted(items, key=lambda x: not x.get("default"))
+
     def search_url(self, query):
-        template = (self.settings.get("search_url") or "").strip() or DEFAULT_SEARCH_URL
-        return template.replace("{query}", urllib.parse.quote_plus(query))
+        return (self.searches()[0].get("url") or DEFAULT_SEARCH_URL).replace("{query}", urllib.parse.quote_plus(query))
 
     def rebuild(self):
         for f in list(self.fetchers):
@@ -7582,6 +8510,17 @@ class NowLine(QWidget):
 
 
 AIR_LOG_FILE = SCRIPT_DIR / "airing_log.json"
+
+
+def on_schedule(m):
+    """Whether a show is on the Schedule: airing (AniList says RELEASING or knows its next episode), or its last
+    episode aired this past week (the airing log still has it)."""
+    if not m:
+        return False
+    if m.get("status") == "RELEASING" or (m.get("nextAiringEpisode") or {}).get("airingAt"):
+        return True
+    times = (_read_json(AIR_LOG_FILE).get(str(m.get("id"))) or {}).values()
+    return any(time.time() - ts < 7 * 86400 for ts in times)
 
 
 def air_log(account=None):
@@ -8750,16 +9689,20 @@ class SeasonalPage(Page):
         prev = QPushButton()
         prev.setObjectName("icon")
         prev.setIcon(glyph_icon("", C["text"], px=14))
-        prev.setToolTip("Previous season")
-        prev.clicked.connect(lambda: self.step(-1))
-        self.year_lbl = label("", "h2")
-        self.year_lbl.setAlignment(Qt.AlignCenter)
-        self.year_lbl.setFixedWidth(48)
+        prev.setToolTip("Previous year")
+        prev.clicked.connect(lambda: self.go_to(self.season, self.year - 1))
+        # the arrows change the year (the season buttons pick the season); the year itself is a list to jump with
+        self.year_lbl = QComboBox()
+        self.year_lbl.setToolTip("Year")
+        for y in range(datetime.now().year + 1, 1959, -1):
+            self.year_lbl.addItem(str(y), y)
+        self.year_lbl.setMaxVisibleItems(15)
+        self.year_lbl.activated.connect(lambda _i: self.go_to(self.season, self.year_lbl.currentData()))
         nxt = QPushButton()
         nxt.setObjectName("icon")
         nxt.setIcon(glyph_icon("", C["text"], px=14))
-        nxt.setToolTip("Next season")
-        nxt.clicked.connect(lambda: self.step(1))
+        nxt.setToolTip("Next year")
+        nxt.clicked.connect(lambda: self.go_to(self.season, self.year + 1))
         now = QPushButton("This season")
         now.setObjectName("ghost")
         now.clicked.connect(lambda: self.go_to(*current_season()))
@@ -8864,10 +9807,15 @@ class SeasonalPage(Page):
 
     # ---- season navigation
     def update_header(self):
-        self.year_lbl.setText(str(self.year))
+        i = self.year_lbl.findData(self.year)
+        if i < 0:   # outside the list (a far year from the keyboard): add it
+            self.year_lbl.addItem(str(self.year), self.year)
+            i = self.year_lbl.count() - 1
+        self.year_lbl.setCurrentIndex(i)
         self.season_pick.buttons[self.season].setChecked(True)
 
     def go_to(self, season, year):
+        year = min(max(int(year), 1940), datetime.now().year + 2)
         if (season, year) != (self.season, self.year):
             self.season, self.year = season, year
             self.update_header()
@@ -8894,8 +9842,8 @@ class SeasonalPage(Page):
     def showEvent(self, e):
         super().showEvent(e)
         self.lib_ids = self.library.library_ids()
-        if self.loaded_key != (self.season, self.year):
-            self.load()
+        if self.loaded_key != (self.season, self.year, acct.ADULT["on"]):   # load() keeps the side too (it reloaded
+            self.load()                                                     # on every visit before)
         else:
             self.grid.viewport().update()
 
@@ -9195,6 +10143,87 @@ class KuraDialog(QDialog):
         row.addWidget(ok)
         self.body.addLayout(row)
         return ok
+
+
+PICK_FIELDS = "id format episodes seasonYear isAdult title { romaji english }"
+QUERY_PICK = ("query ($search: String) { Page(perPage: 12) { media(search: $search, type: ANIME) { "
+              + PICK_FIELDS + " } } }")
+QUERY_PICK_ID = "query ($id: Int) { Media(id: $id, type: ANIME) { " + PICK_FIELDS + " } }"
+
+
+class MatchPicker(KuraDialog):
+    """Edit info: pick the AniList entry a show or season folder is. Search by name, or paste an AniList link."""
+
+    def __init__(self, parent, title, query=""):
+        super().__init__(parent, "AniList entry", 640, 560)
+        self.chosen, self.job = None, None
+        self.body.addWidget(label(title, "h2"))
+        self.body.addWidget(label("Search AniList by any of its names, or paste the show's AniList link "
+                                  "(anilist.co/anime/…). The organizer uses your pick for this folder too.",
+                                  "muted", wrap=True))
+        row = QHBoxLayout()
+        self.search = QLineEdit(query)
+        self.search.setPlaceholderText("Name or AniList link")
+        self.search.returnPressed.connect(self.run)
+        go = QPushButton("Search")
+        go.clicked.connect(self.run)
+        row.addWidget(self.search, 1)
+        row.addWidget(go)
+        self.body.addLayout(row)
+        self.results = QListWidget()
+        self.results.itemDoubleClicked.connect(lambda _i: self.accept())
+        self.results.currentRowChanged.connect(lambda i: self.ok.setEnabled(i >= 0))
+        self.body.addWidget(self.results, 1)
+        self.status = label("", "faint", wrap=True)
+        self.body.addWidget(self.status)
+        self.ok = self.add_buttons("Use this entry")
+        self.ok.setEnabled(False)
+        self.found = []
+        if query:
+            QTimer.singleShot(0, self.run)
+
+    def run(self):
+        q = self.search.text().strip()
+        if not q or self.job is not None:
+            return
+        link = re.search(r"anilist\.co/anime/(\d+)", q) or re.fullmatch(r"(\d+)", q)
+        self.status.setText("Looking it up on AniList…")
+        if link:
+            self.job = BgCall(lambda: [(org.anilist(QUERY_PICK_ID, {"id": int(link.group(1))}) or {}).get("Media")])
+        else:
+            self.job = BgCall(lambda: ((org.anilist(QUERY_PICK, {"search": q}) or {}).get("Page") or {}).get("media"))
+        self.job.done.connect(self.show_results)
+        self.job.start()
+
+    def show_results(self, media, err):
+        self.job.wait()
+        self.job = None
+        self.found = [m for m in media or [] if m]
+        self.results.clear()
+        for m in self.found:
+            t = m.get("title") or {}
+            name = t.get("english") or t.get("romaji") or "?"
+            other = t.get("romaji") if t.get("english") and t.get("romaji") != t.get("english") else ""
+            bits = [FORMAT_TEXT.get(m.get("format"), m.get("format") or ""), str(m.get("seasonYear") or ""),
+                    f"{m['episodes']} episodes" if m.get("episodes") else ""]
+            self.results.addItem(f"{name}" + (f"   ({other})" if other else "") + "\n"
+                                 + "  ·  ".join(b for b in bits if b) + f"  ·  #{m['id']}")
+        self.status.setText(f"Couldn't search AniList: {err}" if err else
+                            "Nothing found. Try another name, or paste the AniList link." if not self.found else
+                            "Pick the right one.")
+        if self.found:
+            self.results.setCurrentRow(0)
+
+    def accept(self):
+        i = self.results.currentRow()
+        if 0 <= i < len(self.found):
+            self.chosen = self.found[i]
+            super().accept()
+
+    def done(self, r):
+        if self.job is not None:
+            self.job.wait()
+        super().done(r)
 
 
 class MissedDialog(KuraDialog):
@@ -9678,21 +10707,57 @@ class ModeMenu(QFrame):
 class PinDialog(KuraDialog):
     """The optional lock on the 18+ side: your Kura PIN (or Windows Hello)."""
 
-    def __init__(self, parent, title="Switch to Hentai", text="Enter your Kura PIN.", hello=False):
-        super().__init__(parent, title, 420, 260)
+    def __init__(self, parent, title="Switch to Hentai", text="Enter your Kura PIN.", hello=False, new=False,
+                 ok_text=None):
+        """`new`: choosing a PIN (typed twice, 4-12 characters); otherwise entering the one you have."""
+        super().__init__(parent, title, 420, 300 if new else 260)
+        self.new = new
         self.body.addWidget(label(title, "h2"))
         self.body.addWidget(label(text, "muted", wrap=True))
-        self.pin = QLineEdit()
-        self.pin.setEchoMode(QLineEdit.Password)
-        self.pin.setPlaceholderText("PIN")
-        self.pin.setMaxLength(12)
-        self.body.addWidget(self.pin)
+        self.fields = []
+        for hint in (["New PIN", "Type it again"] if new else ["PIN"]):
+            f = QLineEdit()
+            f.setEchoMode(QLineEdit.Password)
+            f.setPlaceholderText(hint)
+            f.setMaxLength(12)
+            f.textChanged.connect(self.check)
+            self.body.addWidget(f)
+            self.fields.append(f)
+        self.pin = self.fields[0]
+        # the eye: show what you're typing
+        self.eye = self.pin.addAction(glyph_icon("visibility", C["muted"]), QLineEdit.TrailingPosition)
+        self.eye.setToolTip("Show the PIN")
+        self.eye.triggered.connect(self.toggle_shown)
+        self.hint = label("", "faint")
+        self.body.addWidget(self.hint)
         self.hello = None
         if hello:
             self.hello = QPushButton(" Use Windows Hello")
             self.hello.setIcon(glyph_icon("fingerprint", C["text"]))
             self.body.addWidget(self.hello)
-        self.add_buttons("Unlock")
+        self.ok = self.add_buttons(ok_text or ("Save PIN" if new else "Unlock"))
+        self.check()
+
+    def toggle_shown(self):
+        shown = self.pin.echoMode() == QLineEdit.Password
+        for f in self.fields:
+            f.setEchoMode(QLineEdit.Normal if shown else QLineEdit.Password)
+        self.eye.setIcon(glyph_icon("visibility_off" if shown else "visibility", C["muted"]))
+        self.eye.setToolTip("Hide the PIN" if shown else "Show the PIN")
+
+    def check(self):
+        """OK only when there's something to check (a new PIN: 4 or more characters, typed the same twice)."""
+        t = self.pin.text()
+        if not self.new:
+            ok, hint = bool(t), ""
+        elif len(t) < 4:
+            ok, hint = False, "At least 4 characters." if t else ""
+        elif self.fields[1].text() != t:
+            ok, hint = False, "The two don't match yet." if self.fields[1].text() else "Type it again to confirm."
+        else:
+            ok, hint = True, "Looks good."
+        self.ok.setEnabled(ok)
+        self.hint.setText(hint)
 
 
 def pin_hash(pin, salt):
@@ -11123,7 +12188,7 @@ class TorrentPage(Page):
 
         check = QPushButton(" Check feed")
         check.setIcon(glyph_icon(G["refresh"], C["text"]))
-        check.clicked.connect(lambda: self.check())
+        check.clicked.connect(lambda: self.check(ask=True))
         gear = QPushButton(" Torrent settings")
         gear.setIcon(glyph_icon(G["settings"], C["text"]))
         gear.clicked.connect(lambda: self.open_settings(0))
@@ -11135,9 +12200,21 @@ class TorrentPage(Page):
         self.view_switch.changed.connect(self.set_view)
         self.actions.addWidget(self.view_switch)
         self.actions.addSpacing(8)
-        for w in (gear, check, self.dl_btn):
+        # a manual Check feed that finds episodes you don't have asks to download them (so nothing is missed)
+        ask = QWidget()
+        ah = QHBoxLayout(ask)
+        ah.setContentsMargins(4, 0, 4, 0)
+        ah.setSpacing(8)
+        ask_sw = Toggle(settings.get("torrent_manual_ask", True))
+        ask_sw.toggled.connect(lambda on: (settings.__setitem__("torrent_manual_ask", on), save_settings(settings)))
+        ah.addWidget(label("Ask about new", "muted"))
+        ah.addWidget(ask_sw)
+        ask.setToolTip("When you press Check feed and it finds episodes you don't have, Kura asks whether to "
+                       "download them")
+        self.asked = set()   # torrents already offered after a manual check (asked once each)
+        for w in (gear, ask, check, self.dl_btn):
             self.actions.addWidget(w)
-        self.feed_only = [check, self.dl_btn]
+        self.feed_only = [ask, check, self.dl_btn]
 
         # Two views: the feed (Taiga-style) and your downloads in qBittorrent
         self.stack = QStackedWidget()
@@ -11534,15 +12611,7 @@ class TorrentPage(Page):
             if top > max(aired, m.get("episodes") or 0):
                 continue   # numbered on from an earlier season ("Black Clover - 174"): not gaps
             progress = e.get("progress") or 0
-            if m.get("status") == "FINISHED" and m.get("episodes"):
-                # only when you've watched up to your last file: you're out of episodes
-                rest = [n for n in range(top + 1, m["episodes"] + 1) if free(n)] if 0 < top <= progress else []
-                for n in rest:
-                    add("unfinished", mid, n)
-                gaps = [n for n in range(low + 1, top) if free(n) and n > progress]
-                if 0 < len(gaps) <= 5:
-                    for n in gaps:
-                        add("gap", mid, n, local=sorted(local))
+            if not on_schedule(m):   # user's rule: Needs you is about what's airing now, not older shows' gaps
                 continue
             # holes between your first and last file (starting a show partway is on purpose), and aired ones after
             # your last file but before the newest (that one is the catch-up search's), past what you've watched
@@ -11555,8 +12624,8 @@ class TorrentPage(Page):
         for k in list(out):
             e = out[k]
             e["eps"] = [x for x in e["eps"] if x not in (skipped.get(f"{e['kind']}:{e['mid']}") or [])]
-            if not e["eps"]:
-                del out[k]
+            if not e["eps"] or not on_schedule(media_for(e["mid"], self.account) or {}):
+                del out[k]   # only shows on the Schedule (airing, or finished this past week)
         order = ["filtered", "stuck", "unrecognised", "gap", "unfinished"]
         entries = sorted(out.values(), key=lambda e: (order.index(e["kind"]), -(e.get("aired") or 0)))
         for e in entries:
@@ -12206,9 +13275,11 @@ class TorrentPage(Page):
             return
         self.check()
 
-    def check(self, auto=False):
+    def check(self, auto=False, ask=False):
+        """Load the feed (or the search). `ask`: you pressed Check feed, so new episodes get offered (Ask about new)."""
         if auto and self.query:
             return   # you're looking through a search: the next automatic check does the feed
+        self.ask_after = ask and not auto
         if not auto:
             self.picks, self.seen_pages = {}, set()
         for ld in list(self.loaders):
@@ -12304,6 +13375,7 @@ class TorrentPage(Page):
                 self.feed_cache = {"items": list(items), "at": self.checked_at, "url": self.search_url}
             self.refilter()
         new = [i for i in self.items if i["selected"]]
+        ask, self.ask_after = getattr(self, "ask_after", False), False
         if auto and not self.query and new:
             if self.settings.get("torrent_new_action") == "download":
                 self.download(new, auto=True)
@@ -12313,8 +13385,30 @@ class TorrentPage(Page):
                     self.notified |= {i["hash"] for i in fresh}
                     names = ", ".join(dict.fromkeys(self.titles.get(i["mid"]) or i["facts"]["anime_title"] for i in fresh))
                     self.notify.emit(f"{len(fresh)} new torrent{'s' if len(fresh) != 1 else ''}: {names}")
+        elif ask and not self.query and new and self.settings.get("torrent_manual_ask", True):
+            fresh = [i for i in new if i["hash"] not in self.asked]
+            if fresh:
+                self.asked |= {i["hash"] for i in fresh}
+                QTimer.singleShot(0, lambda f=fresh: self.ask_download(f))
         if auto and not self.query and self.settings.get("torrent_catchup", True):
             QTimer.singleShot(3000, self.catch_up)
+
+    def ask_download(self, items):
+        """After a manual Check feed: these are episodes you don't have. Download them?"""
+        lines = []
+        for i in items[:12]:
+            ep = (i.get("parsed") or {}).get("episodes") or []
+            name = self.titles.get(i.get("mid")) or i["facts"]["anime_title"]
+            lines.append(f"•  {name}" + (f"  episode {episode_ranges(ep)}" if ep else ""))
+        if len(items) > 12:
+            lines.append(f"…and {len(items) - 12} more")
+        box = QMessageBox(QMessageBox.Question, "New episodes",
+                          f"The feed has {len(items)} episode{'s' if len(items) != 1 else ''} you don't have yet:\n\n"
+                          + "\n".join(lines) + "\n\nDownload them now?", QMessageBox.Yes | QMessageBox.No, self)
+        box.button(QMessageBox.Yes).setText("Download")
+        box.button(QMessageBox.No).setText("Not now")
+        if box.exec() == QMessageBox.Yes:
+            self.download(items)
 
     def refilter(self):
         """Re-run the filters (list, library or filters may have changed)."""
@@ -18981,6 +20075,23 @@ class LiveProvider:
     def upcoming(self, cid):
         return self.tv.upcoming(cid)
 
+    def programs(self, cid, t0, t1):
+        """The programmes on a channel between two moments (the player's guide), into tomorrow when needed."""
+        out = []
+        for day in {livetv_mod.day_of(t0), livetv_mod.day_of(t1)}:
+            ch = self.tv.channel(cid, day)
+            out += [p for p in (ch or {}).get("programs") or [] if p["end"] > t0 and p["start"] < t1]
+        return sorted({p["start"]: p for p in out}.values(), key=lambda p: p["start"])
+
+    def remind(self, cid, prog):
+        """Remind me / don't (the player's guide): True when a reminder is now set."""
+        page = getattr(self, "page", None)
+        if page is None:
+            return False
+        on = not any((r["cid"], r["start"]) == (cid, prog["start"]) for r in self.tv.state["reminders"])
+        page.remind(cid, prog, on)
+        return on
+
     def channels(self):
         return self.tv.channels()
 
@@ -19013,6 +20124,297 @@ class LiveProvider:
             return trl.resolve(prog["trailer"])
         except Exception:
             return None
+
+
+def live_banner(mid):
+    """(cached banner QImage or None, banner URL or None) for a show: Live TV's banner and tiles."""
+    if not mid:
+        return None, None
+    for f in COVER_DIR.glob(f"banner_{mid}.*"):
+        img = QImage(str(f))
+        if not img.isNull():
+            return img, None
+    return None, ((details_file().get(str(mid)) or {}).get("data") or {}).get("bannerImage")
+
+
+def prog_line(prog):
+    """'S1 · E7 · 9:22 – 9:46' (or Break · times) for a Live TV programme."""
+    bits = []
+    if prog and prog.get("kind") == "episode" and prog.get("ep") is not None:
+        bits.append((f"Season {prog['season']} · " if prog.get("season") else "") + f"Episode {prog['ep']}")
+    elif prog and prog.get("kind") != "episode":
+        bits.append("Break")
+    if prog:
+        bits.append(f"{player_mod.clock(prog['start'])} – {player_mod.clock(prog['end'])}")
+    return "  ·  ".join(bits)
+
+
+class LiveHero(QWidget):
+    """Live TV's On now banner (user's pick: Live TV A with a full banner like Home's, Oct 2026): the featured
+    channel's show art across the whole top, Home's shade so it runs into the page, the page's own header on it
+    (title, On now / Guide, Channels & breaks, New channel), and what's on with Tune in / Show page."""
+    H = 500
+
+    def __init__(self, page):
+        super().__init__()
+        self.setFixedHeight(self.H)
+        self.img, self.ch, self.prog = None, None, None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(36, 22, 36, 34)
+        lay.setSpacing(8)
+        self.top = QHBoxLayout()
+        self.top.setSpacing(10)
+        t = QLabel("Live TV")
+        t.setStyleSheet("color: white; font-size: 20pt; font-weight: 700; background: transparent;")
+        self.top.addWidget(t)
+        self.top.addSpacing(8)
+        lay.addLayout(self.top)
+        lay.addStretch(1)
+        kick = QHBoxLayout()
+        kick.setSpacing(8)
+        live = QLabel("LIVE")
+        live.setStyleSheet(f"background: {C['bad']}; color: white; border-radius: 5px; padding: 2px 7px;"
+                           " font-size: 8pt; font-weight: 800; letter-spacing: 1px;")
+        kick.addWidget(live)
+        self.channel = QLabel()
+        self.channel.setStyleSheet("color: white; font-weight: 600; background: transparent;")
+        kick.addWidget(self.channel)
+        kick.addStretch(1)
+        lay.addLayout(kick)
+        self.title = QLabel()
+        self.title.setWordWrap(True)
+        self.title.setMaximumWidth(760)
+        self.title.setStyleSheet("color: white; font-family: 'Segoe UI Variable Display'; font-size: 28pt; font-weight: 700;"
+                                 " background: transparent;")
+        lay.addWidget(self.title)
+        self.info = QLabel()
+        self.info.setStyleSheet("color: rgba(255,255,255,0.86); font-size: 10pt; background: transparent;")
+        lay.addWidget(self.info)
+        prow = QHBoxLayout()
+        prow.setSpacing(10)
+        self.bar = ThinBar()
+        self.bar.setFixedWidth(360)
+        prow.addWidget(self.bar)
+        self.left = QLabel()
+        self.left.setStyleSheet("color: rgba(255,255,255,0.75); font-size: 9pt; background: transparent;")
+        prow.addWidget(self.left)
+        prow.addStretch(1)
+        lay.addLayout(prow)
+        self.next = QLabel()
+        self.next.setStyleSheet("color: rgba(255,255,255,0.62); font-size: 9.5pt; background: transparent;")
+        lay.addWidget(self.next)
+        lay.addSpacing(10)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.tune = QPushButton("  Tune in")
+        self.tune.setIcon(glyph_icon("play_arrow:fill", "#0d0f14", "#0d0f14", px=16))
+        self.tune.setIconSize(QSize(18, 18))
+        self.tune.setCursor(Qt.PointingHandCursor)
+        self.tune.setStyleSheet("QPushButton { background: white; color: #0d0f14; border: none; border-radius: 11px;"
+                                " padding: 9px 20px 9px 14px; font-weight: 600; } QPushButton:hover { background: #e4e4ee; }")
+        self.tune.clicked.connect(lambda: self.ch and page.watch.emit(self.ch["id"]))
+        self.show_btn = QPushButton("  Show page")
+        self.show_btn.setIcon(glyph_icon("info", "white", "white", px=16))
+        self.show_btn.setIconSize(QSize(18, 18))
+        self.show_btn.setCursor(Qt.PointingHandCursor)
+        self.show_btn.setStyleSheet("QPushButton { background: rgba(255,255,255,0.13); color: white; border: 1px solid"
+                                    " rgba(255,255,255,0.18); border-radius: 11px; padding: 9px 15px; }"
+                                    " QPushButton:hover { background: rgba(255,255,255,0.22); }")
+        self.show_btn.clicked.connect(lambda: self.prog and self.prog.get("mid") and page.open_media.emit(
+            self.prog["mid"], self.prog.get("title") or "", None))
+        row.addWidget(self.tune)
+        row.addWidget(self.show_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def set_channel(self, ch, prog, nxt, img):
+        self.ch, self.prog = ch, prog
+        self.img = img
+        self.channel.setText(f"{ch.get('number', '')} · {ch.get('name', '')}")
+        self.title.setText(prog.get("title") if prog else "Nothing on")
+        self.info.setText(prog_line(prog))
+        self.next.setText(f"Up next: {nxt['title']} at {player_mod.clock(nxt['start'])}" if nxt else "")
+        self.show_btn.setVisible(bool(prog and prog.get("mid")))
+        self.update_bar()
+        self.update()
+
+    def set_image(self, img):
+        self.img = img
+        self.update()
+
+    def update_bar(self):
+        if not self.prog:
+            return
+        span = max(1, self.prog["end"] - self.prog["start"])
+        f = min(1.0, max(0.0, (time.time() - self.prog["start"]) / span))
+        self.bar.set(f, C["bad"])
+        mins = max(0, round((self.prog["end"] - time.time()) / 60))
+        self.left.setText(f"{mins} min left")
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r = QRectF(self.rect())
+        p.fillRect(r, QColor(C["bg"]))
+        if self.img is not None and not self.img.isNull():
+            p.drawPixmap(0, 0, cover_pixmap(self.img, self.width(), self.height(), self.devicePixelRatioF()))
+        paint_hero_shade(p, r)
+
+
+class LivePreview(QFrame):
+    """Live TV's Guide tab (user's pick: Live TV B): above the guide, the chosen channel playing muted from where it
+    is right now (your own episode file; the show's art for breaks), its details, Watch full screen / Show page."""
+
+    def __init__(self, page):
+        super().__init__()
+        self.page, self.ch, self.prog, self.loaded = page, None, None, None
+        self.setFixedHeight(286)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 16)
+        h.setSpacing(24)
+        self.box = QWidget()
+        self.box.setFixedSize(480, 270)
+        self.art = RoundedImage(480, 270, 12, "")
+        self.art.setParent(self.box)
+        self.video = TrailerVideo(page.settings, self.box, loop=False)
+        self.video.setGeometry(0, 0, 480, 270)
+        self.video.hide()
+        self.video.started.connect(self.video.show)
+        self.video.failed.connect(lambda _e: self.video.hide())
+        live = QLabel("LIVE", self.box)
+        live.setStyleSheet(f"background: {C['bad']}; color: white; border-radius: 5px; padding: 2px 7px;"
+                           " font-size: 8pt; font-weight: 800;")
+        live.adjustSize()
+        live.move(10, 10)
+        muted = QLabel(icon_html("volume_off", 14, "white") + "&nbsp;Preview", self.box)
+        muted.setTextFormat(Qt.RichText)
+        muted.setStyleSheet("background: rgba(15,17,21,0.8); color: white; border-radius: 6px; padding: 3px 8px; font-size: 8.5pt;")
+        muted.adjustSize()
+        muted.move(480 - muted.width() - 10, 270 - muted.height() - 10)
+        self.badges = (live, muted)
+        h.addWidget(self.box)
+        col = QVBoxLayout()
+        col.setSpacing(8)
+        col.addSpacing(4)
+        self.channel = label("", "muted")
+        col.addWidget(self.channel)
+        self.title = QLabel()
+        self.title.setWordWrap(True)
+        self.title.setStyleSheet(f"color: {C['text']}; font-size: 20pt; font-weight: 800;")
+        col.addWidget(self.title)
+        self.info = label("", "muted")
+        col.addWidget(self.info)
+        self.next = label("", "faint", wrap=True)
+        col.addWidget(self.next)
+        col.addStretch(1)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        watch = QPushButton(" Watch full screen")
+        watch.setObjectName("primary")
+        watch.setIcon(glyph_icon("fullscreen", "#ffffff"))
+        watch.clicked.connect(lambda: self.ch and page.watch.emit(self.ch["id"]))
+        self.show_btn = QPushButton("Show page")
+        self.show_btn.clicked.connect(lambda: self.prog and self.prog.get("mid") and page.open_media.emit(
+            self.prog["mid"], self.prog.get("title") or "", None))
+        row.addWidget(watch)
+        row.addWidget(self.show_btn)
+        row.addStretch(1)
+        col.addLayout(row)
+        h.addLayout(col, 1)
+
+    def set_channel(self, ch, prog, nxt, img):
+        self.ch, self.prog = ch, prog
+        self.channel.setText(f"{ch.get('number', '')} · {ch.get('name', '')}")
+        self.title.setText(prog.get("title") if prog else "Nothing on")
+        self.info.setText(prog_line(prog))
+        self.next.setText(f"Next: {nxt['title']} at {player_mod.clock(nxt['start'])}" if nxt else "")
+        self.show_btn.setVisible(bool(prog and prog.get("mid")))
+        self.art.set_image(img)
+        self.play()
+
+    def play(self):
+        """The programme from where it is now (muted); breaks and missing files show the art."""
+        prog = self.prog
+        key = (self.ch or {}).get("id"), (prog or {}).get("start")
+        if not self.isVisible() or key == self.loaded:
+            return
+        self.loaded = key
+        self.video.hide()
+        path = (prog or {}).get("path")
+        if prog and prog.get("kind") == "episode" and path and Path(path).exists():
+            offset = max(0, int(time.time() - prog["start"]))
+            self.video.play_clip(path, start=str(offset), length=max(30, int(prog["end"] - time.time())))
+        else:
+            self.video.stop()
+
+    def stop(self):
+        self.loaded = None
+        self.video.stop()
+        self.video.hide()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self.play)
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.stop()
+
+
+class ChannelTile(QFrame):
+    """On now's channel wall (Live TV A): the show's art 16:9 with the channel's number and name on it and a red
+    progress line, then what's on and what's next. Click = tune in."""
+    clicked = Signal()
+
+    def __init__(self, ch, prog, nxt):
+        super().__init__()
+        self.setObjectName("card")
+        self.setCursor(Qt.PointingHandCursor)
+        self.ch, self.prog = ch, prog
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 10, 10, 12)
+        v.setSpacing(6)
+        self.img = RoundedImage(300, 150, 8, ch.get("name", ""))
+        self.img.setMinimumWidth(0)   # stretches with the tile; the height stays (no sizing in resizeEvent: it
+        self.img.setMaximumWidth(16777215)   # fed back into the grid and overflowed the stack)
+        v.addWidget(self.img)
+        tag = QLabel(f"{ch.get('number', '')} · {ch.get('name', '')}", self.img)
+        tag.setStyleSheet("background: rgba(15,17,21,0.86); color: white; border-radius: 6px; padding: 3px 8px;"
+                          " font-size: 8.5pt; font-weight: 700;")
+        tag.adjustSize()
+        tag.move(8, 8)
+        self.line = QFrame(self.img)
+        self.line.setStyleSheet(f"background: {C['bad']}; border: none;")
+        title = QLabel(prog.get("title") if prog else "Nothing on")
+        title.setStyleSheet(f"color: {C['text']}; font-size: 10.5pt; font-weight: 700;")
+        title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        title.setToolTip(title.text())
+        v.addWidget(title)
+        sub = label(prog_line(prog), "faint")
+        sub.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        v.addWidget(sub)
+        nxt_lbl = label(f"Next: {nxt['title']} at {player_mod.clock(nxt['start'])}" if nxt else "", "faint")
+        nxt_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        nxt_lbl.setToolTip(nxt_lbl.text())
+        v.addWidget(nxt_lbl)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.update_bar()
+
+    def set_image(self, img):
+        self.img.set_image(img)
+
+    def update_bar(self):
+        if not self.prog:
+            self.line.hide()
+            return
+        f = min(1.0, max(0.0, (time.time() - self.prog["start"]) / max(1, self.prog["end"] - self.prog["start"])))
+        self.line.setGeometry(0, self.img.height() - 3, int(self.img.width() * f), 3)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
 
 
 class ChannelCard(QFrame):
@@ -19408,16 +20810,22 @@ class LiveTVPage(Page):
         self.tvs = {False: self.tv, True: None}   # Anime / 18+ (made the first time you're on that side)
         self.durations = livetv_mod.Durations(SCRIPT_DIR / "livetv_durations.json", lambda: subs_mod.FFPROBE)
         self.provider = LiveProvider(self.tv, account)
+        self.provider.page = self   # reminders from the player's guide
         self.job, self.shows, self.cards = None, [], []
-        new = QPushButton(" New channel")
-        new.setObjectName("primary")
-        new.setIcon(glyph_icon("add", "#ffffff"))
-        new.clicked.connect(lambda: self.edit_channel(None))
-        more = QPushButton(" Channels && breaks")
-        more.setIcon(glyph_icon("tune", C["text"]))
-        more.clicked.connect(lambda: self.more_menu(more))
-        self.actions.addWidget(more)
-        self.actions.addWidget(new)
+        # new episodes get their length read in the background a little after they arrive, so opening Live TV
+        # doesn't have to ("Reading episode lengths…")
+        self.warm_job = None
+        self.warm_timer = QTimer(self, singleShot=True, interval=90_000, timeout=self.warm_durations)
+        library.updated.connect(lambda *_: self.warm_timer.start())
+        self.new_btn = QPushButton(" New channel")
+        self.new_btn.setObjectName("primary")
+        self.new_btn.setIcon(glyph_icon("add", "#ffffff"))
+        self.new_btn.clicked.connect(lambda: self.edit_channel(None))
+        self.more_btn = QPushButton(" Channels && breaks")
+        self.more_btn.setIcon(glyph_icon("tune", C["text"]))
+        self.more_btn.clicked.connect(lambda: self.more_menu(self.more_btn))
+        self.actions.addWidget(self.more_btn)
+        self.actions.addWidget(self.new_btn)
         row = QHBoxLayout()
         self.view = Segmented([("now", "On now"), ("guide", "Guide")], settings.get("live_view", "now"))
         self.view.changed.connect(self.switch)
@@ -19427,26 +20835,75 @@ class LiveTVPage(Page):
         row.addWidget(self.status)
         self.outer.addLayout(row)
         self.stack = QStackedWidget()
+        # On now (user's pick: Live TV A with a full banner like Home's): the banner runs edge to edge with the
+        # page's header on it; the page's own header and margins are hidden while it shows (apply_view)
+        self.hero = LiveHero(self)
+        self.hero_view = Segmented([("now", "On now"), ("guide", "Guide")], "now")
+        self.hero_view.changed.connect(self.switch)
+        self.hero.top.addWidget(self.hero_view)
+        self.hero.top.addStretch(1)
+        self.hero_status = QLabel()
+        self.hero_status.setStyleSheet("color: rgba(255,255,255,0.7); background: transparent;")
+        self.hero.top.addWidget(self.hero_status)
+        glass = ("QPushButton { background: rgba(15,17,21,0.55); color: white; border: 1px solid rgba(255,255,255,0.16);"
+                 " border-radius: 9px; padding: 7px 13px; } QPushButton:hover { background: rgba(255,255,255,0.16); }")
+        hmore = QPushButton(" Channels && breaks")
+        hmore.setIcon(glyph_icon("tune", "white", "white"))
+        hmore.setStyleSheet(glass)
+        hmore.clicked.connect(lambda: self.more_menu(hmore))
+        hnew = QPushButton(" New channel")
+        hnew.setIcon(glyph_icon("add", "white", "white"))
+        hnew.setStyleSheet(glass)
+        hnew.clicked.connect(lambda: self.edit_channel(None))
+        self.hero.top.addWidget(hmore)
+        self.hero.top.addWidget(hnew)
+        self.images, self.fetchers = {}, set()   # {show id: banner QImage}
         now_scroll = QScrollArea()
         now_scroll.setWidgetResizable(True)
         now_scroll.setFrameShape(QFrame.NoFrame)
         now_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        now_scroll.verticalScrollBar().setSingleStep(24)
         self.now_inner = QWidget()
         self.now_col = QVBoxLayout(self.now_inner)
-        self.now_col.setContentsMargins(0, 0, 8, 0)
+        self.now_col.setContentsMargins(0, 0, 0, 28)
+        self.now_col.setSpacing(0)
+        self.now_col.addWidget(self.hero)
         now_scroll.setWidget(self.now_inner)
         self.stack.addWidget(now_scroll)
         self.guide_scroll = QScrollArea()
         self.guide_scroll.setFrameShape(QFrame.NoFrame)
         self.guide = GuideView(self.guide_scroll)
-        self.guide.tune.connect(self.watch)
+        self.guide.tune.connect(self.guide_click)
         self.guide.menu_for.connect(self.program_menu)
         self.guide_scroll.setWidget(self.guide)
-        self.stack.addWidget(self.guide_scroll)
+        guide_page = QWidget()   # Live TV B: the chosen channel's muted preview above the guide
+        gl = QVBoxLayout(guide_page)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setSpacing(0)
+        self.preview = LivePreview(self)
+        self.preview_cid = None
+        gl.addWidget(self.preview)
+        gl.addWidget(self.guide_scroll, 1)
+        self.stack.addWidget(guide_page)
         self.outer.addWidget(self.stack, 1)
         self.stack.setCurrentIndex(1 if self.view.value() == "guide" else 0)
+        self.apply_view(self.view.value())
         self.timer = QTimer(self, interval=20000, timeout=self.tick)
         self.shown_day = None
+
+    def set_status(self, text):
+        self.status.setText(text)
+        self.hero_status.setText(text)
+
+    def apply_view(self, v):
+        """On now: no page margins or header (the banner carries them); Guide: the normal page."""
+        now = v == "now"
+        self.outer.setContentsMargins(*((0, 0, 0, 0) if now else (36, 28, 36, 28)))
+        self.outer.setSpacing(0 if now else 20)
+        for w in (self.title_label, self.subtitle, self.more_btn, self.new_btn, self.view, self.status):
+            w.setVisible(not now)
+        self.view.buttons[v].setChecked(True)
+        self.hero_view.buttons[v].setChecked(True)
 
     # ---- making the days
     def showEvent(self, e):
@@ -19457,6 +20914,25 @@ class LiveTVPage(Page):
     def hideEvent(self, e):
         super().hideEvent(e)
         self.timer.stop()
+
+    def warm_durations(self):
+        """Read the lengths of library episodes Live TV doesn't know yet, in the background (2 at a time)."""
+        if SELFTEST or self.job is not None or self.warm_job is not None or not subs_mod.ffmpeg_installed():
+            return
+        files = [p for idx in self.library.indexes().values() if idx
+                 for eps in (idx.get("local") or {}).values() for p in eps.values()]
+        todo = [f for f in files if self.durations.get(f) is None]
+        if not todo:
+            return
+        self.warm_stop = False
+        self.warm_job = BgCall(lambda: self.durations.fill(todo, workers=2, cancelled=lambda: self.warm_stop))
+
+        def done(n, err):
+            self.warm_job.wait()
+            self.warm_job = None
+            klog.info(f"Live TV: read {n or 0} new episode lengths in the background" + (f" ({err})" if err else ""))
+        self.warm_job.done.connect(done)
+        self.warm_job.start()
 
     def ensure(self, force=False):
         """Today's and tomorrow's line-ups (made in the background the first time)."""
@@ -19470,18 +20946,17 @@ class LiveTVPage(Page):
             return
         indexes = dict(self.library.indexes())
         if not indexes:
-            self.status.setText("Waiting for your library…")
+            self.set_status("Waiting for your library…")
             QTimer.singleShot(2000, self.ensure)
             return
-        st = self.status
-        self.status.setText("Making today's line-up…")
+        self.set_status("Making today's line-up…")
         settings = dict(self.settings)
         tv = self.tv   # this side's: you may switch sides while it's made
 
         def work():
             def progress(done, total):
-                QTimer.singleShot(0, st, lambda: st.setText(f"Reading episode lengths… {done} of {total} (only the "
-                                                            "first time)"))
+                QTimer.singleShot(0, self, lambda: self.set_status(f"Reading episode lengths… {done} of {total} (only "
+                                                                   "the first time)"))
             shows, planning = live_snapshot(indexes, self.account, self.durations, progress)
             if force:
                 tv.forget_from(today)
@@ -19500,7 +20975,7 @@ class LiveTVPage(Page):
             return   # made for the other side (you switched meanwhile): it's saved there, nothing to show
         self.job = None
         if err:
-            self.status.setText(f"Couldn't make the line-up: {err}")
+            self.set_status(f"Couldn't make the line-up: {err}")
             klog.error(f"Live TV: {err}")
             return
         self.shows = shows or self.shows
@@ -19517,6 +20992,7 @@ class LiveTVPage(Page):
         self.settings["live_view"] = v
         save_settings(self.settings)
         self.stack.setCurrentIndex(1 if v == "guide" else 0)
+        self.apply_view(v)
         if v == "guide":
             self.scroll_guide_to_now()
 
@@ -19527,32 +21003,59 @@ class LiveTVPage(Page):
         self.subtitle.setText(f"{datetime.now().strftime('%A %d %B')}  ·  {len(chans)} channels  ·  new line-up "
                               "every day at 4:00")
         n_custom = sum(1 for c in chans if not c.get("auto"))
-        self.status.setText(f"{n_custom} of yours" if n_custom else "")
-        # On now
-        while self.now_col.count():
-            it = self.now_col.takeAt(0)
+        self.set_status(f"{n_custom} of yours" if n_custom else "")
+        # On now: the banner (the first channel showing an episode of a show), then every channel as a tile
+        while self.now_col.count() > 1:   # the banner stays (index 0); the wall below is made again
+            it = self.now_col.takeAt(1)
             if it.widget():
                 it.widget().deleteLater()
-        grid = ResponsiveGrid(min_col=380, max_cols=3, spacing=12)
-        self.cards = []
+        self.cards, jobs = [], []
         now = time.time()
+        rows = []
         for ch in chans:
             prog, _ = self.tv.on_at(ch["id"], now)
             nxt = (self.tv.upcoming(ch["id"], now, 1) or [None])[0]
-            card = ChannelCard(ch, prog, nxt, self.provider.cover(prog if prog and prog.get("mid") else (nxt or {})))
-            card.clicked.connect(lambda c=ch["id"]: self.watch.emit(c))
-            card.setContextMenuPolicy(Qt.CustomContextMenu)
-            card.customContextMenuRequested.connect(lambda pos, c=ch, w=card: self.channel_menu(c, w.mapToGlobal(pos)))
-            grid.add(card)
-            self.cards.append(card)
-        self.now_col.addWidget(grid)
+            rows.append((ch, prog, nxt))
+        feat = next((r for r in rows if r[1] and r[1].get("kind") == "episode" and r[1].get("mid")),
+                    rows[0] if rows else None)
+        if feat:
+            mid = (feat[1] or {}).get("mid")
+            self.hero.mid = mid
+            self.hero.set_channel(*feat, self.art(mid, feat[1], jobs))
+        wall = QWidget()
+        wl = QVBoxLayout(wall)
+        wl.setContentsMargins(36, 0, 36, 0)
+        wl.setSpacing(12)
+        wl.addWidget(row_title("All channels"))
+        grid = ResponsiveGrid(min_col=250, max_cols=4, spacing=16)
+        for ch, prog, nxt in rows:
+            tile = ChannelTile(ch, prog, nxt)
+            src = prog if prog and prog.get("mid") else (nxt or {})
+            tile.mid = src.get("mid")
+            img = self.art(tile.mid, src, jobs)
+            if img is not None:
+                tile.set_image(img)
+            tile.clicked.connect(lambda c=ch["id"]: self.watch.emit(c))
+            tile.setContextMenuPolicy(Qt.CustomContextMenu)
+            tile.customContextMenuRequested.connect(lambda pos, c=ch, w=tile: self.channel_menu(c, w.mapToGlobal(pos)))
+            grid.add(tile)
+            self.cards.append(tile)
+        wl.addWidget(grid)
+        self.now_col.addWidget(wall)
         self.now_col.addStretch(1)
+        if jobs:
+            fetcher = ImageFetcher(jobs)
+            fetcher.image.connect(self.on_banner)
+            fetcher.finished.connect(lambda: self.fetchers.discard(fetcher))
+            self.fetchers.add(fetcher)
+            fetcher.start()
         # Guide (today's programmes and tomorrow's, for after 4:00)
         tomorrow = {c["id"]: c for c in self.tv.channels(livetv_mod.next_day(today))}
         merged = []
         for ch in chans:
             progs = list(ch["programs"]) + list((tomorrow.get(ch["id"]) or {}).get("programs") or [])
             merged.append({**ch, "programs": progs})
+        self.update_preview()
         x = self.guide_scroll.horizontalScrollBar().value()
         self.guide.set_channels(merged)
         if keep_scroll:
@@ -19563,6 +21066,60 @@ class LiveTVPage(Page):
     def scroll_guide_to_now(self):
         x = self.guide.x_of(time.time()) - self.guide.NAMES - 120
         self.guide_scroll.horizontalScrollBar().setValue(int(max(0, x)))
+
+    def guide_click(self, cid):
+        """A programme that's on now: the first click shows it in the preview, a second one tunes in."""
+        if cid == self.preview_cid:
+            self.watch.emit(cid)
+            return
+        self.preview_cid = cid
+        self.update_preview()
+
+    def update_preview(self):
+        chans = self.tv.channels(livetv_mod.day_of())
+        ch = next((c for c in chans if c["id"] == self.preview_cid), None) or (self.hero.ch if self.hero.ch else None) \
+            or (chans[0] if chans else None)
+        if not ch:
+            return
+        self.preview_cid = ch["id"]
+        now = time.time()
+        prog, _ = self.tv.on_at(ch["id"], now)
+        nxt = (self.tv.upcoming(ch["id"], now, 1) or [None])[0]
+        jobs = []
+        img = self.art((prog or {}).get("mid"), prog, jobs)
+        self.preview.set_channel(ch, prog, nxt, img)
+        if jobs:
+            fetcher = ImageFetcher(jobs)
+            fetcher.image.connect(self.on_banner)
+            fetcher.finished.connect(lambda: self.fetchers.discard(fetcher))
+            self.fetchers.add(fetcher)
+            fetcher.start()
+
+    def art(self, mid, prog, jobs):
+        """A show's banner for the On now banner / tiles: from memory or disk, else its cover for now and the banner
+        fetched (on_banner)."""
+        if not mid:
+            return None
+        if mid in self.images:
+            return self.images[mid]
+        img, url = live_banner(mid)
+        if img is not None:
+            self.images[mid] = img
+            return img
+        if url and all(j[0] != str(mid) for j in jobs):
+            jobs.append((str(mid), url, f"banner_{mid}"))
+        return self.provider.cover(prog or {"mid": mid})
+
+    def on_banner(self, key, img):
+        mid = int(key)
+        self.images[mid] = img
+        if getattr(self.hero, "mid", None) == mid:
+            self.hero.set_image(img)
+        if (self.preview.prog or {}).get("mid") == mid:
+            self.preview.art.set_image(img)
+        for t in self.cards:
+            if getattr(t, "mid", None) == mid:
+                t.set_image(img)
 
     # ---- menus
     def program_menu(self, cid, prog, pos):
@@ -19677,7 +21234,9 @@ class LiveTVPage(Page):
             self.ensure()
 
     def shutdown(self):
-        for j in [self.job] + getattr(self, "old_jobs", []):
+        self.warm_timer.stop()
+        self.warm_stop = True
+        for j in [self.job, self.warm_job] + getattr(self, "old_jobs", []):
             if j is not None:
                 j.wait(60000)
 
@@ -21131,6 +22690,28 @@ def episode_still(details, mid, ep):
     return None, None
 
 
+NOT_EPISODE_TITLES = {"repack", "proper", "uncensored", "uncut", "end", "final", "v2", "v3", "batch", "complete"}
+
+
+@functools.lru_cache(maxsize=4096)
+def file_episode_title(path):
+    """The episode's name from its file name ("KAMUI ... S01E05 Bakeneko 1080p..." → "Bakeneko"), when it has one."""
+    try:
+        t = org.anitopy_parse(Path(path).name).get("episode_title")
+    except Exception:
+        return None
+    t = (t if isinstance(t, str) else (t or [None])[0] or "").strip(" .-_")
+    return t if len(t) > 1 and not t.isdigit() and t.lower() not in NOT_EPISODE_TITLES else None
+
+
+def episode_name(details, mid, ep, path=None):
+    """An episode's title: AniList's (from its streaming listing), else the one in the file name. None if neither."""
+    title = episode_still(details, mid, ep)[1] if mid and ep else None
+    if title and title.strip(" .-").lower() in ("untitled", "tba", "tbd"):
+        title = None
+    return title or (file_episode_title(str(path)) if path else None)
+
+
 class ThumbWorker(QThread):
     """Preview images, one at a time in the background: a frame from your file (mpv grabs it
     without showing anything, ~1 s, saved in cover_cache/frames) or an AniList image."""
@@ -21421,55 +23002,55 @@ class FreshCard(QFrame):
             self.clicked.emit()
 
 
+FRESH_RANGES = [(1, "Today"), (7, "This week"), (30, "Last 30 days")]
+
+
 class FreshSection(QWidget):
-    """Home's Fresh in your library: tabs (All / New episodes / New shows / New seasons / Complete, with
-    counts) over a grid of FreshCards that fits the width, two rows until "Show all"."""
+    """Home's Fresh in your library (user's pick Fresh 1, Oct 2026): chips with counts (All / New episodes / New
+    shows / New seasons / Complete, empty kinds hidden) and a range menu (Today / This week / Last 30 days) over a
+    grid of FreshCards that fits the width, two rows until "Show all"."""
     GAP, MIN_W, ROWS = 16, 250, 2
 
     def __init__(self, cards, settings):
         super().__init__()
         self.cards, self.settings, self.expanded, self.key = cards, settings, False, "all"
+        self.days = settings.get("home_fresh_days", 7)
+        if self.days not in dict(FRESH_RANGES):
+            self.days = 7
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(16)
-        top = QVBoxLayout()
-        top.setSpacing(0)
         head = QHBoxLayout()
-        head.setSpacing(22)
-        t = row_title("Fresh in your library")
-        t.setContentsMargins(0, 0, 0, 9)
-        head.addWidget(t, 0, Qt.AlignBottom)
-        head.addSpacing(4)
+        head.setSpacing(8)
+        head.addWidget(row_title("Fresh in your library"))
+        head.addSpacing(10)
         self.tabs = {}
-        for key, name, glyph in FRESH_TABS:
-            n = len(cards) if key == "all" else sum(1 for c in cards if c.kind == key)
-            b = QPushButton(f"{name}  {n}")
-            if glyph:
-                b.setIcon(glyph_icon(glyph, C["muted"], C["text"], px=16))
-                b.setIconSize(QSize(16, 16))
+        for key, name, _glyph in FRESH_TABS:
+            b = QPushButton(name)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
-            b.setStyleSheet(f"QPushButton {{ background: transparent; border: none; border-bottom: 2px solid transparent;"
-                            f" color: {C['muted']}; padding: 6px 2px 9px 2px; font-size: 10pt; font-weight: 600; }}"
-                            f" QPushButton:hover {{ color: {C['text']}; }}"
-                            f" QPushButton:checked {{ color: {C['text']}; border-bottom-color: {C['accent']}; }}")
+            b.setStyleSheet(f"QPushButton {{ background: {C['surface']}; border: 1px solid {C['border']}; border-radius: 12px;"
+                            f" padding: 5px 14px; color: {C['muted']}; }}"
+                            f" QPushButton:hover {{ color: {C['text']}; border-color: {C['border_hi']}; }}"
+                            f" QPushButton:checked {{ background: rgba({accent_rgb()},0.18); border-color: {C['accent']};"
+                            f" color: {C['text']}; }}")
             b.clicked.connect(lambda _=False, k=key: self.choose(k))
-            head.addWidget(b, 0, Qt.AlignBottom)
+            head.addWidget(b)
             self.tabs[key] = b
         head.addStretch(1)
-        when = label("Last 30 days", "faint")
-        when.setContentsMargins(0, 0, 0, 11)
-        head.addWidget(when, 0, Qt.AlignBottom)
-        top.addLayout(head)
-        rule = QFrame()
-        rule.setFixedHeight(1)
-        rule.setStyleSheet(f"background: {C['border']};")
-        top.addWidget(rule)
-        v.addLayout(top)
+        self.range_btn = QPushButton()
+        self.range_btn.setIcon(glyph_icon("calendar_today", C["muted"]))
+        self.range_btn.setCursor(Qt.PointingHandCursor)
+        menu = QMenu(self.range_btn)
+        for days, text in FRESH_RANGES:
+            menu.addAction(text, lambda d=days: self.set_days(d))
+        self.range_btn.setMenu(menu)
+        head.addWidget(self.range_btn)
+        v.addLayout(head)
         self.area = QWidget()
         for c in cards:
             c.setParent(self.area)
-        self.empty = label("Nothing like this arrived in the last 30 days.", "faint")
+        self.empty = label("", "faint")
         self.empty.setParent(self.area)
         self.empty.move(0, 8)
         self.area.installEventFilter(self)
@@ -21480,6 +23061,16 @@ class FreshSection(QWidget):
         key = settings.get("home_fresh_tab", "all")
         self.choose(key if key in self.tabs else "all", save=False)
 
+    def in_range(self):
+        cut = time.time() - self.days * 86400
+        return [c for c in self.cards if getattr(c, "t", 0) >= cut]
+
+    def set_days(self, days):
+        self.days, self.expanded = days, False
+        self.settings["home_fresh_days"] = days
+        save_settings(self.settings)
+        self.relayout()
+
     def choose(self, key, save=True):
         self.key, self.expanded = key, False
         for k, b in self.tabs.items():
@@ -21488,6 +23079,15 @@ class FreshSection(QWidget):
             self.settings["home_fresh_tab"] = key
             save_settings(self.settings)
         self.relayout()
+
+    def update_chips(self, cards):
+        """Counts for the range; a kind with nothing in it is hidden (All always shows)."""
+        for key, name, _glyph in FRESH_TABS:
+            n = len(cards) if key == "all" else sum(1 for c in cards if c.kind == key)
+            b = self.tabs[key]
+            b.setText(f"{name}  ·  {n}" if n else name)
+            b.setVisible(key == "all" or n > 0 or key == self.key)
+        self.range_btn.setText(f" {dict(FRESH_RANGES)[self.days]} ")
 
     def toggle_more(self):
         self.expanded = not self.expanded
@@ -21502,7 +23102,10 @@ class FreshSection(QWidget):
         w = self.area.width() if self.area.width() > 50 else 1200
         cols = max(1, min(5, (w + self.GAP) // (self.MIN_W + self.GAP)))
         cw = (w - (cols - 1) * self.GAP) // cols
-        shown = [c for c in self.cards if self.key == "all" or c.kind == self.key]
+        ranged = self.in_range()
+        self.update_chips(ranged)
+        shown = [c for c in ranged if self.key == "all" or c.kind == self.key]
+        self.empty.setText("Nothing like this arrived " + {1: "today.", 7: "this week.", 30: "in the last 30 days."}[self.days])
         visible = shown if self.expanded else shown[:cols * self.ROWS]
         for c in self.cards:
             if c not in visible:
@@ -21760,7 +23363,10 @@ class HomeRow(QWidget):
         self.anim.start()
 
     def update_buttons(self):
-        bar = self.area.horizontalScrollBar()
+        try:
+            bar = self.area.horizontalScrollBar()
+        except RuntimeError:   # Home was rebuilt before this row's first update ran
+            return
         if self.prev_btn.parent() is self:   # no header of its own
             return
         self.prev_btn.setVisible(bar.maximum() > 0)
@@ -21987,7 +23593,7 @@ class HomeHero(QWidget):
         self.thumbs = []
         if len(self.items) > 1:
             for i, it in enumerate(self.items):
-                key = it.get("thumb_key") or it.get("banner_key")
+                key = it.get("banner_key") or it.get("poster_key") or it.get("thumb_key")   # the art, like the banner
                 t = HeroThumb(it["title"], key)
                 if key in self.images:
                     t.set_image(self.images[key])
@@ -22073,8 +23679,33 @@ class HomeHero(QWidget):
         for t in self.thumbs:
             if t.key == key:
                 t.set_image(img)
-        if self.items and key in (self.items[self.index].get("banner_key"), self.items[self.index].get("thumb_key")):
+        if self.items and key in (self.items[self.index].get(k) for k in ("banner_key", "poster_key", "thumb_key")):
             self.update()
+
+    def paint_poster(self, p, r, key, poster):
+        """No wide art: the poster blurred across the banner, and the poster itself on the right."""
+        dpr = self.devicePixelRatioF()
+        cache = getattr(self, "_poster_bg", None)
+        if not cache or cache[0] != (key, self.width(), self.height()):
+            small = poster.scaled(24, 36, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)   # tiny, then up = blurred
+            bg = small.scaled(self.size() * dpr, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            self._poster_bg = cache = ((key, self.width(), self.height()), bg)
+        bg = cache[1]
+        sx, sy = (bg.width() - self.width() * dpr) / 2, (bg.height() - self.height() * dpr) / 2
+        p.drawImage(r, bg, QRectF(sx, sy, self.width() * dpr, self.height() * dpr))
+        p.fillRect(r, QColor(10, 12, 16, 110))
+        ph = self.height() - 190   # between the pills and the previews strip
+        pw = ph * 2 / 3
+        box = QRectF(self.width() - pw - 72, 66, pw, ph)
+        clip = QPainterPath()
+        clip.addRoundedRect(box, 14, 14)
+        p.save()
+        p.setClipPath(clip)
+        p.drawImage(box, poster.scaled(int(pw * dpr), int(ph * dpr), Qt.KeepAspectRatioByExpanding,
+                                       Qt.SmoothTransformation))
+        p.restore()
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.drawRoundedRect(box, 14, 14)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -22082,7 +23713,14 @@ class HomeHero(QWidget):
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         r = QRectF(self.rect())
         it = self.items[self.index] if self.items else {}
-        img = self.images.get(it.get("banner_key")) or self.images.get(it.get("thumb_key"))
+        img = self.images.get(it.get("banner_key"))
+        poster = self.images.get(it.get("poster_key"))
+        if (img is None or img.isNull()) and poster is not None and not poster.isNull():
+            self.paint_poster(p, r, it.get("poster_key"), poster)
+            paint_hero_shade(p, r)
+            return
+        if img is None and not it.get("poster_key"):   # no art at all: the episode's frame after all
+            img = self.images.get(it.get("thumb_key"))
         if img is not None and not img.isNull():
             scaled = img.scaled(self.size() * self.devicePixelRatioF(), Qt.KeepAspectRatioByExpanding,
                                 Qt.SmoothTransformation)
@@ -22791,6 +24429,12 @@ class HomePage(QWidget):
         if banner:
             banner_key = f"banner:{c['mid']}" + (":own" if own else "")
             jobs.insert(0, (banner_key, "url", (banner, f"banner_{c['mid']}")))
+        # no wide art: the poster cover (the episode's own frame is already on its Continue watching card)
+        cover = ((d.get("coverImage") or {}).get("extraLarge") or (m.get("coverImage") or {}).get("extraLarge"))
+        poster_key = None
+        if cover and not banner:
+            poster_key = f"cover:{c['mid']}"
+            jobs.insert(0, (poster_key, "url", (cover, str(c["mid"]))))
         bits = [html.escape(self.episode_line(c))]
         if ep_title:
             bits.append(html.escape(ep_title))
@@ -22802,7 +24446,7 @@ class HomePage(QWidget):
         return {**c, "title": title, "info": info, "can_mark": bool(self.tracking() and self.account.entry(c["mid"])),
                 "desc": clean_description(d.get("description") or ""),
                 "trailer": d.get("trailer") if (d.get("trailer") or {}).get("site") in ("youtube", "dailymotion") else None,
-                "banner_key": banner_key, "thumb_key": key,
+                "banner_key": banner_key, "poster_key": poster_key, "thumb_key": key,
                 "verb": "Resume" if c["kind"] == "resume" else f"Play episode {c['ep']}",
                 "progress": c["pos"] / c["dur"] if c["kind"] == "resume" and c.get("dur") else None}
 
@@ -22828,7 +24472,8 @@ class HomePage(QWidget):
         return {**c, "title": media_title(d) or c["name"], "info": "&nbsp; · &nbsp;".join(b for b in bits if b),
                 "can_mark": False, "desc": clean_description(d.get("description") or ""),
                 "trailer": d.get("trailer") if (d.get("trailer") or {}).get("site") in ("youtube", "dailymotion") else None,
-                "banner_key": banner_key or thumb_key, "thumb_key": thumb_key, "verb": "Show", "progress": None}
+                "banner_key": banner_key, "poster_key": None if banner_key else thumb_key, "thumb_key": thumb_key,
+                "verb": "Show", "progress": None}
 
     def poster(self, m, note=None, jobs=None, tip=None, badge=None):
         if badge is None:
@@ -22871,6 +24516,7 @@ class HomePage(QWidget):
         key, _ = self.thumb_for({**f, "kind": "start"}, jobs)
         tip = f"{title}\n{line}\n{text} · {short_ago(f['t'])}"
         card_ = FreshCard(kind, (glyph, text, color), title, line, short_ago(f["t"]), action, tip)
+        card_.t = f["t"]   # when it arrived: FreshSection's range menu (Today / This week / Last 30 days)
         self.slot(key, card_)
         if kind in ("show", "complete"):
             card_.clicked.connect(lambda f=f: self.open_item(f))
@@ -24963,6 +26609,7 @@ class MainWindow(QMainWindow):
         sv.addWidget(self.brand)
         sv.addSpacing(14)   # the search lives in the title strip (top of the page column)
 
+        acct.PROGRESS_SCALE.update({int(k): v for k, v in org.EPISODE_SPLIT.items()})   # two-in-one (Edit info)
         self.account = acct.Account(self)
         self.pages = QStackedWidget()
         self.library = LibraryPage(self.settings, self.account)
@@ -25010,6 +26657,12 @@ class MainWindow(QMainWindow):
                       ("cloud_download", "Torrents", 4), "YOU",
                       ("insights", "Statistics", 7), ("handyman", "Tools", 8)]:
             if isinstance(entry, str):
+                if entry == "YOU":   # your links (user's pick Links 1), between GET and YOU
+                    self.links_box = QWidget()
+                    self.links_lay = QVBoxLayout(self.links_box)
+                    self.links_lay.setContentsMargins(0, 0, 0, 0)
+                    self.links_lay.setSpacing(sv.spacing())
+                    sv.addWidget(self.links_box)
                 sv.addWidget(label(entry, "navgroup"))
                 continue
             glyph, name, i = entry
@@ -25018,6 +26671,8 @@ class MainWindow(QMainWindow):
             self.nav.addButton(b, i)
             self.nav_buttons[i] = b
             sv.addWidget(b)
+        self.icon_call = None
+        self.build_links()
         sv.addStretch(1)
         self.profile = ProfileChip()   # avatar, name, sync / job status, Settings
         # while organizing ("Organizing…" on the chip) it opens Tools → Organize, else Statistics
@@ -26023,6 +27678,10 @@ class MainWindow(QMainWindow):
         if not self.settings.get("adult_lock") or self.adult_unlocked:
             return True
         pin = self.settings.get("adult_pin") or {}
+        if not pin.get("hash"):   # the lock is on but no PIN was ever saved: nothing could unlock it
+            self.settings["adult_lock"] = False
+            save_settings(self.settings)
+            return True
         dlg = PinDialog(self, hello=True)
         result = {}
 
@@ -26074,8 +27733,84 @@ class MainWindow(QMainWindow):
         self.switch_filter_profile(adult)
         self.apply_mode_look(adult)
         save_settings(s)
+        self.build_links()   # each side has its own links (Sukebei only on the Hentai side)
         self.refresh_for_mode()
         self.notify("Hentai" if adult else "Anime", keep=False)
+
+    # ---- the sidebar's LINKS (user's pick Links 1)
+    def build_links(self):
+        lay = self.links_lay
+        while lay.count():
+            w = lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        items = side_items(self.settings.get("links"))
+        head = QWidget()
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(label("LINKS", "navgroup"), 1)
+        add = QPushButton()
+        add.setIcon(glyph_icon("add", C["muted"], C["text"], px=16))
+        add.setFixedSize(24, 22)
+        add.setToolTip("Add a link")
+        add.setCursor(Qt.PointingHandCursor)
+        add.setStyleSheet("QPushButton { background: transparent; border: none; border-radius: 6px; margin-right: 8px; }"
+                          f" QPushButton:hover {{ background: {C['hover']}; }}")
+        add.clicked.connect(lambda: self.edit_link(None))
+        hl.addWidget(add, 0, Qt.AlignBottom)
+        lay.addWidget(head)
+        for it in items:
+            b = QPushButton("   " + it.get("name", ""))
+            b.setObjectName("nav")
+            ic = item_icon(it, 18)
+            if ic is None:   # no icon: an empty one, so the names still line up
+                blank = QPixmap(18, 18)
+                blank.fill(Qt.transparent)
+                ic = QIcon(blank)
+            b.setIcon(ic)
+            b.setIconSize(QSize(18, 18))
+            b.setToolTip(it.get("url", ""))
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, u=it.get("url"): u and webbrowser.open(u))
+            b.setContextMenuPolicy(Qt.CustomContextMenu)
+            b.customContextMenuRequested.connect(lambda pos, it=it, w=b: self.link_menu(it, w.mapToGlobal(pos)))
+            lay.addWidget(b)
+        if self.icon_call is None:
+            self.icon_call = fetch_icons(items, lambda: (setattr(self, "icon_call", None), self.build_links()))
+
+    def edit_link(self, item):
+        if edit_item_list(self, self.settings, "links", item):
+            self.build_links()
+
+    def link_menu(self, item, pos):
+        m = QMenu(self)
+        m.addAction(glyph_icon("open_in_new", C["text"]), "Open", lambda: webbrowser.open(item["url"]))
+        m.addAction(glyph_icon("edit", C["text"]), "Edit…", lambda: self.edit_link(item))
+        m.addAction(glyph_icon("arrow_upward", C["text"]), "Move up", lambda: self.move_link(item, -1))
+        m.addAction(glyph_icon("arrow_downward", C["text"]), "Move down", lambda: self.move_link(item, 1))
+        m.addSeparator()
+        m.addAction(glyph_icon("delete", C["bad"]), "Remove", lambda: self.remove_link(item))
+        m.exec(pos)
+
+    def move_link(self, item, d):
+        items = [dict(x) for x in self.settings.get("links") or []]
+        i = next((k for k, x in enumerate(items) if x.get("id") == item.get("id")), None)
+        if i is None:
+            return
+        j = i + d   # past the links of the other side too, to the next one shown on this side
+        shown = {x.get("id") for x in side_items(items)}
+        while 0 <= j < len(items) and items[j].get("id") not in shown:
+            j += d
+        if 0 <= j < len(items):
+            items[i], items[j] = items[j], items[i]
+            self.settings["links"] = items
+            save_settings(self.settings)
+            self.build_links()
+
+    def remove_link(self, item):
+        self.settings["links"] = [x for x in self.settings.get("links") or [] if x.get("id") != item.get("id")]
+        save_settings(self.settings)
+        self.build_links()
 
     HENTAI_PROFILE = "Hentai"
 
@@ -26251,6 +27986,7 @@ class MainWindow(QMainWindow):
             url = name = None
             if mid and isinstance(ep, (int, float)) and ep == int(ep):
                 url, name = episode_still({mid: saved or listed}, mid, int(ep))
+            name = name or file_episode_title(it["path"])   # "S01E05 Bakeneko ...": the file's own title
             e = self.account.entry(mid) if mid and self.account and self.account.connected else None
             watched = bool(e and ep and (e.get("status") == "COMPLETED" or (e.get("progress") or 0) >= ep))
             items.append({"name": name, "watched": watched, "minutes": (listed or saved).get("duration"),
@@ -26803,6 +28539,847 @@ class UpdateDialog(QDialog):
         super().reject()
 
 
+# ---------------------------------------------------------------- useful links + download searches
+# (user's pick Links 1: a LINKS group in the sidebar; icons: the site's own, one you pick, a letter, or none)
+
+LINK_GLYPHS = ["public", "travel_explore", "menu_book", "forum", "live_tv", "download", "movie", "star", "bookmark",
+               "school", "newspaper", "help", "search", "subtitles", "music_note", "shopping_bag"]
+LINK_COLORS = ["#7c6cff", "#3ecf8e", "#f5b642", "#ff5d73", "#4aa8ff", "#e86b93", "#2ec4b6", "#a97cff"]
+
+
+def side_items(items):
+    """Links / searches for the side you're on (Anime or Hentai)."""
+    want = "adult" if acct.ADULT["on"] else "anime"
+    return [x for x in items or [] if x.get("side", "anime") in (want, "both")]
+
+
+def site_host(url):
+    try:
+        return urllib.parse.urlparse(url).hostname or ""
+    except ValueError:
+        return ""
+
+
+def site_icon_file(url):
+    host = site_host(url)
+    return COVER_DIR / f"site_{re.sub(r'[^a-z0-9.-]', '_', host.lower())}.png" if host else None
+
+
+def fetch_site_icon(url):
+    """The website's own icon (its <link rel=icon>, else /favicon.ico) saved as a PNG. Worker thread."""
+    dest = site_icon_file(url)
+    if dest is None or dest.exists():
+        return dest
+    parts = urllib.parse.urlparse(url)
+    base = f"{parts.scheme or 'https'}://{parts.netloc}"
+    head = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Kura"}
+    cands = []
+    try:
+        page = urllib.request.urlopen(urllib.request.Request(base + "/", headers=head), timeout=8).read(200000)
+        for tag in re.findall(rb"<link[^>]+>", page, re.I):
+            if re.search(rb"rel=[\"']?[^\"'>]*icon", tag, re.I):
+                m = re.search(rb"href=[\"']([^\"']+)", tag, re.I)
+                if m:
+                    cands.append(urllib.parse.urljoin(base + "/", m.group(1).decode("utf-8", "ignore")))
+    except Exception:
+        pass
+    cands += [base + "/favicon.ico", base + "/static/favicon.png"]
+    for c in cands:
+        try:
+            data = urllib.request.urlopen(urllib.request.Request(c, headers=head), timeout=8).read(2_000_000)
+        except Exception:
+            continue
+        img = QImage.fromData(data)
+        if img.isNull() and b"<svg" in data[:2000]:   # an SVG (Wotaku's): drawn at 64 px
+            from PySide6.QtSvg import QSvgRenderer
+            r = QSvgRenderer(QByteArray(data))
+            if r.isValid():
+                img = QImage(64, 64, QImage.Format_ARGB32)
+                img.fill(Qt.transparent)
+                p = QPainter(img)
+                r.render(p)
+                p.end()
+        if not img.isNull():
+            COVER_DIR.mkdir(exist_ok=True)
+            img.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation).save(str(dest), "PNG")
+            return dest
+    return None
+
+
+def letter_icon(name, px=20):
+    pm = QPixmap(px * 2, px * 2)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(LINK_COLORS[zlib.crc32((name or "?").encode()) % len(LINK_COLORS)]))
+    p.drawRoundedRect(QRectF(0, 0, px, px), px * 0.26, px * 0.26)
+    f = QFont()
+    f.setPixelSize(int(px * 0.6))
+    f.setBold(True)
+    p.setFont(f)
+    p.setPen(QColor("white"))
+    p.drawText(QRectF(0, 0, px, px), Qt.AlignCenter, (name or "?").strip()[:1].upper())
+    p.end()
+    return QIcon(pm)
+
+
+def item_icon(item, px=20):
+    """A link's / search's icon (None = no icon). The site's own icon falls back to a letter until it's fetched."""
+    kind = item.get("icon") or "site"
+    if kind == "none":
+        return None
+    if kind.startswith("glyph:"):
+        return glyph_icon(kind[6:], C["muted"], C["text"], px=px)
+    if kind == "site":
+        f = site_icon_file(item.get("url") or "")
+        if f is not None and f.exists():
+            return QIcon(str(f))
+    return letter_icon(item.get("name"), px)
+
+
+class LinkDialog(KuraDialog):
+    """Add / edit a link or a download search: name, address, icon (site's / pick / letter / none), side."""
+
+    def __init__(self, parent, item=None, search=False):
+        super().__init__(parent, "Download search" if search else "Link", 600, 520)
+        self.item = dict(item or {"id": f"x{int(time.time() * 1000)}", "name": "", "url": "", "icon": "site",
+                                  "side": "adult" if acct.ADULT["on"] else "anime"})
+        self.removed = False
+        self.body.addWidget(label(("Edit" if item else "Add") + (" a download search" if search else " a link"), "h2"))
+        self.name = QLineEdit(self.item.get("name", ""))
+        self.name.setPlaceholderText("Name")
+        self.url = QLineEdit(self.item.get("url", ""))
+        self.url.setPlaceholderText("https://nyaa.si/?q={query}" if search else "https://…")
+        for text, w in (("Name", self.name), ("Address" + ("  ({query} = the show and episode)" if search else ""), self.url)):
+            self.body.addWidget(label(text, "faint"))
+            self.body.addWidget(w)
+        self.body.addWidget(label("Icon", "faint"))
+        kind = self.item.get("icon") or "site"
+        self.icon_pick = Segmented([("site", "The site's icon"), ("glyph", "Pick an icon"), ("letter", "A letter"),
+                                    ("none", "No icon")], "glyph" if kind.startswith("glyph:") else kind)
+        self.icon_pick.changed.connect(self.on_icon)
+        self.body.addWidget(self.icon_pick, 0, Qt.AlignLeft)
+        self.glyphs = QWidget()
+        flow = FlowLayout(self.glyphs, spacing=6)
+        self.glyph = kind[6:] if kind.startswith("glyph:") else LINK_GLYPHS[0]
+        self.glyph_btns = {}
+        for g in LINK_GLYPHS:
+            b = QPushButton()
+            b.setIcon(glyph_icon(g, C["text"]))
+            b.setIconSize(QSize(20, 20))
+            b.setFixedSize(38, 34)
+            b.setCheckable(True)
+            b.setToolTip(g.replace("_", " "))
+            b.clicked.connect(lambda _=False, g=g: self.pick_glyph(g))
+            flow.addWidget(b)
+            self.glyph_btns[g] = b
+        self.body.addWidget(self.glyphs)
+        self.pick_glyph(self.glyph)
+        self.on_icon(self.icon_pick.value())
+        self.body.addWidget(label("Show on", "faint"))
+        self.side = Segmented([("anime", "Anime"), ("adult", "Hentai"), ("both", "Both sides")], self.item.get("side", "anime"))
+        self.body.addWidget(self.side, 0, Qt.AlignLeft)
+        self.body.addStretch(1)
+        if item:
+            rm = QPushButton(" Remove")
+            rm.setIcon(glyph_icon("delete", C["bad"]))
+            rm.clicked.connect(self.remove)
+            self.body.addWidget(rm, 0, Qt.AlignLeft)
+        self.ok = self.add_buttons("Save")
+
+    def on_icon(self, v):
+        self.glyphs.setVisible(v == "glyph")
+
+    def pick_glyph(self, g):
+        self.glyph = g
+        for k, b in self.glyph_btns.items():
+            b.setChecked(k == g)
+
+    def remove(self):
+        self.removed = True
+        self.accept()
+
+    def value(self):
+        v = self.icon_pick.value()
+        return dict(self.item, name=self.name.text().strip() or site_host(self.url.text()) or "Link",
+                    url=self.url.text().strip(), icon=f"glyph:{self.glyph}" if v == "glyph" else v, side=self.side.value())
+
+    def accept(self):
+        if not self.removed and not self.url.text().strip():
+            self.url.setFocus()
+            return
+        super().accept()
+
+
+def edit_item_list(parent, settings, key, item=None, search=False):
+    """Add (item None) / edit / remove one entry of settings[key]; True when something changed."""
+    dlg = LinkDialog(parent, item, search)
+    if dlg.exec() != QDialog.Accepted:
+        return False
+    items = [dict(x) for x in settings.get(key) or []]
+    if dlg.removed:
+        items = [x for x in items if x.get("id") != item.get("id")]
+    else:
+        new = dlg.value()
+        idx = next((i for i, x in enumerate(items) if x.get("id") == new["id"]), None)
+        if idx is None:
+            items.append(new)
+        else:
+            items[idx] = new
+    settings[key] = items
+    save_settings(settings)
+    return True
+
+
+def fetch_icons(items, then):
+    """The site icons not saved yet, fetched in the background; `then()` once any arrived."""
+    todo = [x["url"] for x in items if (x.get("icon") or "site") == "site" and x.get("url")
+            and site_icon_file(x["url"]) is not None and not site_icon_file(x["url"]).exists()]
+    if not todo:
+        return None
+    call = BgCall(lambda: [fetch_site_icon(u) for u in todo])
+    call.done.connect(lambda res, err: then() if res and any(res) else None)
+    call.start()
+    return call
+
+
+def search_with(item, query):
+    webbrowser.open((item.get("url") or DEFAULT_SEARCH_URL).replace("{query}", urllib.parse.quote_plus(query)))
+
+
+# ---------------------------------------------------------------- loading screen + first-time setup
+# (user's picks, Oct 2026: Loading 2 "drifting poster wall" and Setup B "a card over the same wall")
+
+WALL_FILE = SCRIPT_DIR / "wall.json"   # {"mine": [show ids], "popular": [[id, cover url]], "popular_t": time}
+QUERY_WALL = ("query ($season: MediaSeason, $year: Int) { Page(perPage: 40) { media(season: $season, seasonYear: $year,"
+              " type: ANIME, isAdult: false, sort: POPULARITY_DESC) { id coverImage { large } } } }")
+
+
+def remember_wall(ids):
+    """The library scan: which shows you have (the next start's wall shows their covers)."""
+    data = _read_json(WALL_FILE)
+    if data.get("mine") != ids:
+        data["mine"] = ids
+        try:
+            _write_json(WALL_FILE, data)
+        except OSError:
+            pass
+
+
+def wall_images(limit=56):
+    """Covers for the wall: your shows' first, else this season's popular ones (both from cover_cache)."""
+    data = _read_json(WALL_FILE)
+    out = []
+    for group in ([str(i) for i in data.get("mine") or []], [str(i) for i, _ in data.get("popular") or []]):
+        for stem in group:
+            for f in COVER_DIR.glob(f"{stem}.*"):
+                img = QImage(str(f))
+                if not img.isNull():
+                    out.append(img)
+                    break
+            if len(out) >= limit:
+                return out
+        if len(out) >= 12:   # enough of yours: no strangers mixed in
+            return out
+    if not out:   # nothing saved yet (the first start after an update): covers Kura has already shown you
+        for f in sorted(COVER_DIR.glob("*.*"), key=lambda f: -f.stat().st_mtime)[:400]:
+            if f.stem.isdigit():
+                img = QImage(str(f))
+                if not img.isNull():
+                    out.append(img)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def fetch_popular_wall():
+    """This season's popular covers into cover_cache (once a week; works without an AniList login)."""
+    data = _read_json(WALL_FILE)
+    if data.get("popular") and time.time() - data.get("popular_t", 0) < 7 * 86400:
+        return False
+    now = datetime.now()
+    season = ("WINTER", "WINTER", "WINTER", "SPRING", "SPRING", "SPRING", "SUMMER", "SUMMER", "SUMMER", "FALL", "FALL",
+              "FALL")[now.month - 1]
+    res = org.anilist(QUERY_WALL, {"season": season, "year": now.year}) or {}
+    items = [[m["id"], (m.get("coverImage") or {}).get("large")] for m in (res.get("Page") or {}).get("media") or []]
+    items = [x for x in items if x[1]]
+    for mid, url in items:
+        cached_image(url, COVER_DIR / f"{mid}{Path(url.split('?')[0]).suffix or '.jpg'}")
+    data = _read_json(WALL_FILE)
+    data.update(popular=items, popular_t=time.time())
+    _write_json(WALL_FILE, data)
+    return bool(items)
+
+
+class PosterWall(QWidget):
+    """The loading / setup background: covers in tilted columns drifting up and down behind a dark vignette; with
+    no covers at all (offline, nothing yet), soft colour glows and a faint 蔵 pattern."""
+    W, H, GAP = 128, 182, 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.tiles, self.t0 = [], time.time()
+        self.timer = QTimer(self, interval=33, timeout=self.update)
+        self.set_images(wall_images())
+
+    def set_images(self, imgs):
+        dpr = self.devicePixelRatioF() or 1
+        self.tiles = []
+        for img in imgs:
+            pm = cover_pixmap(img, self.W, self.H, dpr)
+            out = QPixmap(pm.size())
+            out.setDevicePixelRatio(dpr)
+            out.fill(Qt.transparent)
+            p = QPainter(out)
+            p.setRenderHint(QPainter.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, self.W, self.H), 10, 10)
+            p.setClipPath(path)
+            p.drawPixmap(0, 0, pm)
+            p.end()
+            self.tiles.append(out)
+        self.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.timer.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.timer.stop()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r = QRectF(self.rect())
+        p.fillRect(r, QColor(11, 13, 18))
+        t = time.time() - self.t0
+        if self.tiles:
+            p.save()
+            p.setOpacity(0.45)
+            p.translate(-30, -20)
+            p.rotate(-8)
+            phase = (t % 60) / 30   # 0..2: down for 30 s, back up for 30 s
+            tri = phase if phase <= 1 else 2 - phase
+            step = self.H + self.GAP
+            rows = int(self.height() / step) + 6
+            for c in range(int(self.width() / (self.W + self.GAP)) + 3):
+                off = -tri * 480 if c % 2 == 0 else -(1 - tri) * 480
+                x = c * (self.W + self.GAP)
+                for k in range(rows):
+                    pm = self.tiles[(c * 5 + k * 3) % len(self.tiles)]
+                    p.drawPixmap(QPointF(x, k * step + off), pm)
+            p.restore()
+        else:   # soft glows + the faint mark
+            for cx, cy, rad, col, sp in ((0.28, 0.35, 0.48, (124, 108, 255, 105), 0.07),
+                                         (0.74, 0.62, 0.55, (232, 107, 147, 70), 0.05),
+                                         (0.48, 1.05, 0.44, (62, 207, 142, 52), 0.09)):
+                x = (cx + 0.08 * math.sin(t * sp * 2)) * r.width()
+                y = (cy + 0.06 * math.cos(t * sp * 2.3)) * r.height()
+                g = QRadialGradient(QPointF(x, y), rad * r.width())
+                g.setColorAt(0, QColor(*col))
+                g.setColorAt(1, QColor(col[0], col[1], col[2], 0))
+                p.fillRect(r, g)
+            p.save()
+            f = QFont(self.font())
+            f.setPixelSize(54)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255, 9))
+            p.rotate(-12)
+            d = (t * 3) % 126
+            for row in range(-2, int(r.height() / 118) + 4):
+                for col in range(-2, int(r.width() / 126) + 4):
+                    p.drawText(QPointF(col * 126 - d, row * 118 - d / 2), "蔵")
+            p.restore()
+        g = QRadialGradient(r.center(), max(r.width(), r.height()) * 0.62)
+        a = (204, 242, 255) if self.tiles else (40, 120, 200)   # the glows need a lighter veil than covers do
+        g.setColorAt(0, QColor(11, 13, 18, a[0]))
+        g.setColorAt(0.65, QColor(11, 13, 18, a[1]))
+        g.setColorAt(1, QColor(11, 13, 18, a[2]))
+        p.fillRect(r, g)
+
+
+def splash_logo(px):
+    lg = QLabel("蔵")
+    lg.setAlignment(Qt.AlignCenter)
+    lg.setFixedSize(px, px)
+    lg.setStyleSheet(f"background: {C['accent']}; color: white; border-radius: {px * 0.27:.0f}px;"
+                     f" font-size: {px * 0.42:.0f}pt; font-weight: 700;")
+    return lg
+
+
+class SetupFlow(QFrame):
+    """First-time setup (Setup B): a card over the wall. Welcome, your library, AniList + downloading, watching +
+    extras; every answer goes straight into Kura's settings (all of it can be changed later in Settings)."""
+    finished = Signal()
+
+    def __init__(self, win):
+        super().__init__()
+        self.win, self.s = win, win.settings
+        self.setObjectName("setupcard")
+        self.setStyleSheet(f"QFrame#setupcard {{ background: rgba(22,25,32,0.94); border: 1px solid rgba(255,255,255,0.08);"
+                           f" border-radius: 20px; }} QLabel {{ background: transparent; }}")
+        self.setFixedWidth(640)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(34, 28, 34, 24)
+        v.setSpacing(12)
+        self.dots_row = QHBoxLayout()
+        self.dots_row.setSpacing(6)
+        self.dots = []
+        for _ in range(5):
+            d = QFrame()
+            d.setFixedHeight(5)
+            self.dots.append(d)
+            self.dots_row.addWidget(d)
+        self.dots_row.addStretch(1)
+        self.step_lbl = label("", "faint")
+        self.dots_row.addWidget(self.step_lbl)
+        self.dots_box = QWidget()
+        self.dots_box.setLayout(self.dots_row)
+        v.addWidget(self.dots_box)
+        self.pages = QStackedWidget()
+        v.addWidget(self.pages)
+        for build in (self.page_welcome, self.page_library, self.page_online, self.page_watching):
+            self.pages.addWidget(build())
+        self.go(0)
+
+    # ---- pieces
+    def title(self, text):
+        t = QLabel(text)
+        t.setWordWrap(True)
+        t.setStyleSheet(f"color: {C['text']}; font-size: 17pt; font-weight: 800;")
+        return t
+
+    def folder_row(self, key, glyph, after=None):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        field = QLineEdit(self.s.get(key) or "")
+        field.addAction(glyph_icon(glyph, C["muted"]), QLineEdit.LeadingPosition)
+        field.textChanged.connect(lambda t: (self.s.__setitem__(key, t.strip()), after and after()))
+        pick = QPushButton("Change")
+
+        def choose():
+            d = QFileDialog.getExistingDirectory(self, "Choose a folder", field.text() or str(Path.home()))
+            if d:
+                field.setText(str(Path(d)))
+        pick.clicked.connect(choose)
+        row.addWidget(field, 1)
+        row.addWidget(pick)
+        return row
+
+    def nav(self, back=True, next_text="Next", extra=None):
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        if back:
+            b = QPushButton("Back")
+            b.clicked.connect(lambda: self.go(self.pages.currentIndex() - 1))
+            row.addWidget(b)
+        row.addStretch(1)
+        if extra:
+            row.addWidget(extra)
+        n = QPushButton(next_text)
+        n.setObjectName("primary")
+        n.setCursor(Qt.PointingHandCursor)
+        n.clicked.connect(self.next)
+        row.addWidget(n)
+        return row
+
+    def go(self, i):
+        i = max(0, min(self.pages.count() - 1, i))
+        self.pages.setCurrentIndex(i)
+        self.dots_box.setVisible(i > 0)
+        for k, d in enumerate(self.dots):   # step k+1 of 5 (the 5th is the loading screen)
+            done, now = k < i, k == i
+            d.setFixedWidth(34 if now else 22)
+            d.setStyleSheet(f"background: {C['ok'] if done else C['accent'] if now else C['border']}; border-radius: 2px;")
+        self.step_lbl.setText(f"Step {i + 1} of 5")
+
+    def next(self):
+        i = self.pages.currentIndex()
+        if i == 1:
+            self.count_library()
+        if i >= self.pages.count() - 1:
+            self.finish()
+        else:
+            self.go(i + 1)
+
+    # ---- 1 welcome
+    def page_welcome(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 8, 0, 0)
+        v.setSpacing(12)
+        v.addWidget(splash_logo(84), 0, Qt.AlignHCenter)
+        t = self.title("Welcome to Kura")
+        t.setAlignment(Qt.AlignCenter)
+        v.addWidget(t)
+        d = label("Your anime library, your AniList list, downloads and your own Live TV, in one place. A few "
+                  "questions and it's ready, about two minutes.", "muted", wrap=True)
+        d.setAlignment(Qt.AlignCenter)
+        v.addWidget(d)
+        v.addSpacing(6)
+        go = QPushButton("Let's set it up")
+        go.setObjectName("primary")
+        go.setCursor(Qt.PointingHandCursor)
+        go.setMinimumHeight(44)
+        go.clicked.connect(lambda: self.go(1))
+        v.addWidget(go)
+        later = QPushButton("I'll do it later in Settings")
+        later.setObjectName("ghost")
+        later.clicked.connect(self.finish)
+        v.addWidget(later, 0, Qt.AlignHCenter)
+        return w
+
+    # ---- 2 your library
+    def page_library(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+        v.addWidget(self.title("Where will your anime live?"))
+        v.addWidget(label("Kura keeps every show in its own folder here and reads it for your Library. It can be "
+                          "empty: Kura fills it as your downloads finish. Jellyfin can use the same folder.",
+                          "muted", wrap=True))
+        v.addLayout(self.folder_row("library", "folder", self.count_library))
+        self.found = label("", "faint", wrap=True)
+        v.addWidget(self.found)
+        v.addWidget(label("NEW DOWNLOADS LAND IN", "faint"))
+        v.addLayout(self.folder_row("downloads", "download"))
+        sort = QHBoxLayout()
+        sort.setSpacing(10)
+        tg = Toggle(bool(self.s.get("qbit_organize", True)))
+        tg.toggled.connect(lambda on: self.s.__setitem__("qbit_organize", on))
+        sort.addWidget(tg)
+        sort.addWidget(label("Sort finished downloads into the library (right show, right season, tidy names, folder "
+                             "icons)", "muted", wrap=True), 1)
+        v.addLayout(sort)
+        v.addStretch(1)
+        v.addLayout(self.nav())
+        self.count_library()
+        return w
+
+    def count_library(self):
+        lib = Path(self.s.get("library") or "")
+        if not str(lib) or not lib.is_dir():
+            self.found.setText("Pick a folder (or make a new one) for your library.")
+            return
+        try:
+            shows = [d for d in lib.iterdir() if d.is_dir() and not d.name.startswith(("$", "."))]
+        except OSError:
+            shows = []
+        self.found.setText(f"Found {len(shows)} show folder{'s' if len(shows) != 1 else ''}" if shows else
+                           "This folder is empty, that's fine. Already have anime somewhere else? Point Kura at that "
+                           "folder and it tidies it up, with a preview before anything moves (Tools → Organize).")
+
+    # ---- 3 AniList + downloading
+    def page_online(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+        v.addWidget(self.title("Your AniList account"))
+        box = QFrame()
+        box.setObjectName("setupbox")
+        box.setStyleSheet(f"QFrame#setupbox {{ background: {C['surface2']}; border-radius: 14px; }}")
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(14, 12, 14, 12)
+        bl.setSpacing(8)
+        self.al_help = label("Your list, progress as you watch, airing times, recommendations. Make a client on "
+                             "AniList's developer page (Redirect URL https://anilist.co/api/v2/oauth/pin) and paste its "
+                             "Client ID here.", "muted", wrap=True)
+        self.al_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)   # never squeezed (cut-off text)
+        bl.addWidget(self.al_help)
+        r = QHBoxLayout()
+        self.client = QLineEdit(self.s.get("anilist_client_id") or "")
+        self.client.setPlaceholderText("Client ID")
+        self.client.textChanged.connect(lambda t: self.s.__setitem__("anilist_client_id", t.strip()))
+        dev = QPushButton("Developer page")
+        dev.clicked.connect(lambda: webbrowser.open(acct.DEVELOPER_URL))
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setObjectName("primary")
+        self.connect_btn.clicked.connect(self.connect_anilist)
+        r.addWidget(self.client, 1)
+        r.addWidget(dev)
+        r.addWidget(self.connect_btn)
+        bl.addLayout(r)
+        self.al_state = label("", "faint")
+        bl.addWidget(self.al_state)
+        v.addWidget(box)
+        self.update_anilist()
+        v.addSpacing(4)
+        v.addWidget(self.title("How do you download?"))
+        self.app_pick = Segmented([("qbit", "qBittorrent Web UI"), ("custom", "The qBittorrent app"),
+                                   ("default", "Not with Kura")], self.s.get("torrent_app") if
+                                  self.s.get("torrent_app") in ("qbit", "custom", "default") else "qbit")
+        self.app_pick.changed.connect(self.set_app)
+        v.addWidget(self.app_pick, 0, Qt.AlignLeft)
+        self.qbit_box = QWidget()
+        q = QHBoxLayout(self.qbit_box)
+        q.setContentsMargins(0, 0, 0, 0)
+        q.setSpacing(8)
+        url = QLineEdit(self.s.get("qbit_url") or "http://localhost:8080")
+        url.textChanged.connect(lambda t: self.s.__setitem__("qbit_url", t.strip()))
+        user = QLineEdit(self.s.get("qbit_user") or "admin")
+        user.textChanged.connect(lambda t: self.s.__setitem__("qbit_user", t.strip()))
+        pw = QLineEdit(secret_decode(self.s.get("qbit_password")))
+        pw.setEchoMode(QLineEdit.Password)
+        pw.setPlaceholderText("Password")
+        pw.textChanged.connect(lambda t: self.s.__setitem__("qbit_password", secret_encode(t)))
+        test = QPushButton("Test")
+        test.clicked.connect(self.test_qbit)
+        q.addWidget(url, 2)
+        q.addWidget(user, 1)
+        q.addWidget(pw, 1)
+        q.addWidget(test)
+        v.addWidget(self.qbit_box)
+        self.qbit_state = label("Turn on qBittorrent's Web UI (Tools → Options → Web UI), then Test.", "faint", wrap=True)
+        v.addWidget(self.qbit_state)
+        self.set_app(self.app_pick.value())
+        v.addStretch(1)
+        v.addLayout(self.nav())
+        return w
+
+    def update_anilist(self):
+        a = self.win.account
+        if a and a.connected:
+            self.al_state.setText(f"Connected as {a.user.get('name') if isinstance(getattr(a, 'user', None), dict) else 'you'}")
+            self.al_state.setStyleSheet(f"color: {C['ok']};")
+            self.connect_btn.setEnabled(False)
+            self.al_help.hide()
+        else:
+            self.al_state.setText("You can skip this and connect later in Settings → Account.")
+
+    def connect_anilist(self):
+        cid = (self.s.get("anilist_client_id") or "").strip()
+        if not cid.isdigit():
+            self.al_state.setText("Paste your Client ID first (the number on the developer page).")
+            self.al_state.setStyleSheet(f"color: {C['warn']};")
+            return
+        webbrowser.open(acct.authorize_url(cid))
+        token, ok = QInputDialog.getText(self, "Connect AniList", "Approve Kura in your browser, then paste the token "
+                                         "AniList shows here:")
+        if not ok or not token.strip():
+            return
+        self.al_state.setText("Connecting…")
+
+        def done(err):
+            if err:
+                self.al_state.setText(f"Couldn't connect: {err}")
+                self.al_state.setStyleSheet(f"color: {C['bad']};")
+            else:
+                self.update_anilist()
+        self.win.account.sign_in(token.strip(), done)
+
+    def set_app(self, key):
+        self.s["torrent_app"] = key
+        if key == "custom" and not self.s.get("torrent_client"):
+            self.s["torrent_client"] = tor.find_qbittorrent() or ""
+        self.qbit_box.setVisible(key == "qbit")
+        self.qbit_state.setVisible(key == "qbit")
+
+    def test_qbit(self):
+        self.qbit_state.setText("Trying…")
+        self.qbit_state.setStyleSheet("")
+        call = BgCall(lambda: qbit_client(self.s).version())
+
+        def done(ver, err):
+            self.qbit_state.setText(f"Connected to qBittorrent {ver}" if not err else f"Couldn't reach it: {err}")
+            self.qbit_state.setStyleSheet(f"color: {C['ok'] if not err else C['bad']};")
+        call.done.connect(done)
+        self.qbit_call = call
+        call.start()
+
+    # ---- 4 watching + extras
+    def page_watching(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+        v.addWidget(self.title("Watching"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        rows = [("Play episodes in", "player", [("builtin", "Kura's player"), ("external", "Another app"),
+                                                 ("system", "Windows default")]),
+                ("Show titles in", "language", [("english", "English"), ("romaji", "Romaji")]),
+                ("Update AniList progress", "progress_mode", [("auto", "Automatically"), ("ask", "Ask me"),
+                                                              ("off", "Never")])]
+        for i, (text, key, opts) in enumerate(rows):
+            grid.addWidget(label(text, "muted"), i, 0)
+            seg = Segmented(opts, self.s.get(key) or opts[0][0])
+            seg.changed.connect(lambda val, k=key: self.s.__setitem__(k, val))
+            grid.addWidget(seg, i, 1, Qt.AlignLeft)
+        grid.setColumnStretch(2, 1)
+        v.addLayout(grid)
+        v.addSpacing(6)
+        v.addWidget(self.title("Extras"))
+        ex = QGridLayout()
+        ex.setHorizontalSpacing(16)
+        ex.setVerticalSpacing(8)
+        self.startup_on = get_startup()
+        items = [("Start with Windows (in the tray)", self.startup_on, self.set_startup_choice),
+                 ("Check for new episodes every 15 min", bool(self.s.get("torrent_auto_check")),
+                  lambda on: self.s.__setitem__("torrent_auto_check", on)),
+                 ("Hentai side (set a PIN in Settings)", bool(self.s.get("adult_enabled")),
+                  lambda on: self.s.__setitem__("adult_enabled", on))]
+        for i, (text, val, fn) in enumerate(items):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            tg = Toggle(val)
+            tg.toggled.connect(fn)
+            row.addWidget(tg)
+            row.addWidget(label(text, "muted"), 1)
+            ex.addLayout(row, i // 2, i % 2)
+        v.addLayout(ex)
+        v.addStretch(1)
+        v.addLayout(self.nav(next_text="Start Kura", extra=label("Next: Kura gets everything ready", "faint")))
+        return w
+
+    def set_startup_choice(self, on):
+        self.startup_on = on
+
+    def finish(self):
+        s = self.s
+        s["setup_done"] = True
+        try:
+            if self.startup_on != get_startup():
+                set_startup(self.startup_on)
+        except OSError:
+            pass
+        save_settings(s)
+        apply_settings(s)
+        self.finished.emit()
+
+
+class KuraSplash(QWidget):
+    """The loading screen (Loading 2): the poster wall with the logo, a progress bar and one line saying what's being
+    made ready; the first time, Setup B's card first. Closes itself when everything is warm (at most ~12 s)."""
+    done = Signal()
+
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowTitle(APP_NAME)
+        self.resize(980, 700)
+        scr = QApplication.primaryScreen().availableGeometry()
+        self.move(scr.center() - self.rect().center())
+        self.wall = PosterWall(self)
+        self.center = QWidget(self)
+        cv = QVBoxLayout(self.center)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(16)
+        cv.addStretch(1)
+        self.loading = QWidget()
+        lv = QVBoxLayout(self.loading)
+        lv.setSpacing(14)
+        logo = splash_logo(96)
+        lv.addWidget(logo, 0, Qt.AlignHCenter)
+        name = QLabel(APP_NAME)
+        name.setAlignment(Qt.AlignCenter)
+        name.setStyleSheet("color: white; font-size: 24pt; font-weight: 800; background: transparent;")
+        lv.addWidget(name)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedSize(300, 4)
+        self.bar.setStyleSheet(f"QProgressBar {{ background: rgba(255,255,255,0.1); border: none; border-radius: 2px; }}"
+                               f" QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                               f" stop:0 {C['accent']}, stop:1 {C['accent_hi']}); border-radius: 2px; }}")
+        lv.addSpacing(6)
+        lv.addWidget(self.bar, 0, Qt.AlignHCenter)
+        self.step = QLabel("Starting…")
+        self.step.setAlignment(Qt.AlignCenter)
+        self.step.setStyleSheet(f"color: {C['muted']}; background: transparent;")
+        lv.addWidget(self.step)
+        cv.addWidget(self.loading, 0, Qt.AlignHCenter)
+        cv.addStretch(1)
+        self.setup = None
+        self.popular = None
+
+    def resizeEvent(self, e):
+        self.wall.setGeometry(self.rect())
+        self.center.setGeometry(self.rect())
+
+    def set_step(self, text, frac):
+        self.step.setText(text)
+        self.bar.setValue(int(frac * 1000))
+        QApplication.processEvents()
+
+    def ensure_wall(self):
+        """Nothing of yours to show yet: this season's popular covers (fetched in the background)."""
+        if self.wall.tiles or org is None:
+            return
+        self.popular = BgCall(fetch_popular_wall)
+        self.popular.done.connect(lambda ok, err: ok and self.wall.set_images(wall_images()))
+        self.popular.start()
+
+    def show_setup(self, win):
+        self.loading.hide()
+        self.setup = SetupFlow(win)
+        lay = self.center.layout()
+        lay.insertWidget(1, self.setup, 0, Qt.AlignHCenter)
+        self.setup.finished.connect(self.after_setup)
+
+    def after_setup(self):
+        self.setup.hide()
+        self.loading.show()
+        self.done.emit()
+
+    def paintEvent(self, _):
+        pass
+
+
+def warm_up(win, splash, finish):
+    """The loading screen's steps: wait for the library scan and the AniList sync, make today's Live TV line-up, start
+    this season's Seasonal list, build Settings and Statistics; each step waits at most a few seconds."""
+    t_end = time.time() + 12
+    steps = [
+        ("Reading your library", lambda: win.library.scanned or not Path(win.settings.get("library") or "").is_dir(), 6),
+        ("Syncing your AniList list", lambda: not (win.account and win.account.connected) or
+         not getattr(win.account, "refreshing", False), 3),
+        ("Making today's Live TV line-up", lambda: win.livetv.job is None, 5),
+        ("This season on AniList", None, 0),
+        ("Settings and statistics", None, 0),
+    ]
+    state = {"i": -1, "since": 0.0}
+
+    def start(i):
+        state["i"], state["since"] = i, time.time()
+        text = steps[i][0]
+        splash.set_step(text + "…", i / len(steps))
+        try:
+            if i == 2:
+                win.livetv.ensure()
+            elif i == 3:
+                win.seasonal.lib_ids = win.library.library_ids()
+                win.seasonal.load()
+            elif i == 4:
+                win.settings_page.build_embedded()
+                win.stats.render()
+        except Exception:
+            klog.exception(f"Warm-up step '{text}'")
+
+    def tick():
+        i = state["i"]
+        if i >= 0:
+            ready, wait = steps[i][1], steps[i][2]
+            if ready is not None and not ready() and time.time() - state["since"] < wait and time.time() < t_end:
+                return
+        if i + 1 >= len(steps):
+            timer.stop()
+            splash.set_step("Ready", 1)
+            finish()
+            return
+        start(i + 1)
+    timer = QTimer(splash, interval=120, timeout=tick)
+    timer.start()
+    tick()
+
+
 def main():
     global ICON_FONT
     if os.name == "nt":
@@ -26874,6 +29451,15 @@ def main():
         QMessageBox.critical(None, APP_NAME, f"Couldn't load anime_organizer.py:\n\n{IMPORT_ERROR}")
         return 1
 
+    started_by_windows = "--startup" in sys.argv
+    quiet = "--selftest" in sys.argv or (started_by_windows and QSystemTrayIcon.isSystemTrayAvailable()
+                                         and load_settings().get("start_minimized", True))
+    first_run = not SETTINGS_FILE.exists()
+    splash = None
+    if not quiet:   # the loading screen (and the first time, setup) while the window is made
+        splash = KuraSplash()
+        splash.show()
+        splash.set_step("Starting…", 0.02)
     win = MainWindow()
     if restored is not None:
         done, err = restored
@@ -26896,11 +29482,27 @@ def main():
             set_startup(True)   # keep the startup entry pointing at this copy (script or exe)
         except OSError:
             pass
-    started_by_windows = "--startup" in sys.argv
-    if started_by_windows and win.settings.get("start_minimized", True) and QSystemTrayIcon.isSystemTrayAvailable():
-        pass   # tray only
+    if splash is None:
+        if not quiet or "--selftest" in sys.argv:
+            win.show()
+        # else: tray only (started with Windows)
     else:
-        win.show()
+        def ready():
+            win.show()
+            win.raise_()
+            win.activateWindow()
+            splash.close()
+
+        def begin():
+            if first_run:   # setup picked the folders: read the library from there
+                win.library.refresh()
+            warm_up(win, splash, ready)
+        if first_run:
+            splash.ensure_wall()
+            splash.show_setup(win)
+            splash.done.connect(begin)
+        else:
+            begin()
 
     if "--selftest" in sys.argv:   # used to check a built Kura.exe: write a report and quit
         report = [f"data folder: {SCRIPT_DIR}", f"frozen: {FROZEN}", f"tray: {win.tray.isVisible()}"]

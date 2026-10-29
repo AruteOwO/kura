@@ -177,6 +177,8 @@ def apply_script(root, stage, pid, exe, scripts, new_runtime):
     lines.append(f"  Copy-Item -Path {q(new / 'fonts' / '*')} -Destination {q(root / 'fonts')} -Force")
     for name in scripts:
         lines.append(f"  Copy-Item -LiteralPath {q(new / name)} -Destination {q(root / name)} -Force")
+    lines.append(f"  if (Test-Path -LiteralPath {q(new / 'LICENSE')}) {{ Copy-Item -LiteralPath {q(new / 'LICENSE')}"
+                 f" -Destination {q(root / 'LICENSE')} -Force }}")
     lines += [
         f"  Copy-Item -LiteralPath {q(stage / 'manifest.json')} -Destination {q(root / INSTALLED)} -Force",
         "  Say 'update installed'",

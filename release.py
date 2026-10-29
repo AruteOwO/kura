@@ -101,7 +101,8 @@ def main():
         return
 
     run("git", "add", "kura.pyw")
-    run("git", "commit", "-m", f"Kura {version}")
+    if run("git", "status", "--porcelain", capture=True):   # the version changed (not when re-releasing it)
+        run("git", "commit", "-m", f"Kura {version}")
     run("git", "tag", tag)
     run("git", "push", "--follow-tags")
     run("gh", "release", "create", tag, *map(str, upload), "--title", f"Kura {version}",

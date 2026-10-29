@@ -64,7 +64,7 @@ DETAILS_FILE = SCRIPT_DIR / "anilist_details.json"   # show info for the detail 
 PLAYBACK_STATE_FILE = SCRIPT_DIR / "playback_state.json"   # where Kura's player left off, per file
 APP_NAME = "Kura"
 APP_ID = "Kura.AnimeLibrary"   # Windows groups the taskbar button and icon under this
-APP_VERSION = "1.0.1"          # release.py sets it
+APP_VERSION = "1.0.2"          # release.py sets it
 UPDATE_REPO = "AruteOwO/kura"               # "owner/name" on GitHub: where updates come from (updater.py); empty = no updates
 
 sys.path.insert(0, str(SCRIPT_DIR))

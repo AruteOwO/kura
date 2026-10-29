@@ -104,7 +104,8 @@ def main():
     if run("git", "status", "--porcelain", capture=True):   # the version changed (not when re-releasing it)
         run("git", "commit", "-m", f"Kura {version}")
     run("git", "tag", tag)
-    run("git", "push", "--follow-tags")
+    run("git", "push")
+    run("git", "push", "origin", tag)   # a plain tag: --follow-tags would skip it, and gh needs it on GitHub
     run("gh", "release", "create", tag, *map(str, upload), "--title", f"Kura {version}",
         "--notes", notes or f"Kura {version}")
     print(f"Published {tag}: https://github.com/{repo}/releases/tag/{tag}")

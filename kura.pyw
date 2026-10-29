@@ -64,7 +64,7 @@ PLAYBACK_STATE_FILE = SCRIPT_DIR / "playback_state.json"   # where Kura's player
 APP_NAME = "Kura"
 APP_ID = "Kura.AnimeLibrary"   # Windows groups the taskbar button and icon under this
 APP_VERSION = "1.0.0"          # release.py sets it
-UPDATE_REPO = ""               # "owner/name" on GitHub: where updates come from (updater.py); empty = no updates
+UPDATE_REPO = "AruteOwO/kura"               # "owner/name" on GitHub: where updates come from (updater.py); empty = no updates
 
 sys.path.insert(0, str(SCRIPT_DIR))
 try:

@@ -186,6 +186,20 @@ def _ints(value):
 
 
 def parse_release(title):
+    """What a release's name says (show, season, episodes, group…). Remembered per name: the feed is filtered
+    again on every visit and anitopy was most of that time."""
+    hit = _PARSED.get(title)
+    if hit is None:
+        if len(_PARSED) > 8000:
+            _PARSED.clear()
+        hit = _PARSED[title] = _parse_release(title)
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in hit.items()}
+
+
+_PARSED = {}
+
+
+def _parse_release(title):
     info = org.anitopy_parse(title)   # never raises (one odd title used to stop a whole results page)
     name = info.get("anime_title") or ""
     if isinstance(name, list):
@@ -210,6 +224,9 @@ def parse_release(title):
             "version": version, "video_term": term}
 
 
+_FOUND = {}   # (normalised title, matcher's names) → AniList id: kept across matchers (made on every refilter)
+
+
 class Matcher:
     """Turns a parsed release (title + season + episode) into an AniList id and episode.
 
@@ -228,6 +245,7 @@ class Matcher:
         close = set(close or ())
         self.near = [(k.replace(" ", ""), mid) for k, mid in names.items() if mid in close]
         self.found = {}
+        self.sig = hash((frozenset(names.items()), tuple(self.near)))
 
     def lookup(self, key):
         """An AniList id for a normalised title: as written, without spaces, or nearly the same (one of the shows
@@ -237,6 +255,10 @@ class Matcher:
             return mid
         if key in self.found:
             return self.found[key]
+        sig = (key, self.sig)   # the same names as a matcher before: its answer (difflib was the slow part)
+        if sig in _FOUND:
+            self.found[key] = _FOUND[sig]
+            return _FOUND[sig]
         flat = key.replace(" ", "")
         mid = self.compact.get(flat)
         if mid is None and len(flat) >= 12 and self.near:
@@ -251,6 +273,9 @@ class Matcher:
                     best, score = m, r
             mid = best
         self.found[key] = mid
+        if len(_FOUND) > 20000:
+            _FOUND.clear()
+        _FOUND[sig] = mid
         return mid
 
     def match(self, name, season, episode):

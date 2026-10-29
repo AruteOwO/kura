@@ -1893,11 +1893,13 @@ def fix_episodes(media_by_id):
 
 
 def details_by_id():
-    """Saved details as {id: media}, with the episode counts Kura trusts (fix_episodes)."""
-    out = {int(k): v["data"] for k, v in _read_json(DETAILS_FILE).items() if (v or {}).get("data")}
-    learn_shared_stills(out)
-    fix_episodes(out)
-    return out
+    """Saved details as {id: media}, with the episode counts Kura trusts (fix_episodes). Made again only when the
+    file changed (it's several MB: reading it on every To download / Torrents / Schedule visit cost ~0.15 s)."""
+    data = details_file()   # (learn_shared_stills + fix_episodes already ran on it)
+    if _DETAILS_CACHE.get("by_id_key") != _DETAILS_CACHE.get("key") or "by_id" not in _DETAILS_CACHE:
+        _DETAILS_CACHE["by_id"] = {int(k): v["data"] for k, v in data.items() if (v or {}).get("data")}
+        _DETAILS_CACHE["by_id_key"] = _DETAILS_CACHE.get("key")
+    return dict(_DETAILS_CACHE["by_id"])
 
 
 def fix_list_episodes(account):
@@ -3126,6 +3128,7 @@ class LibraryPage(Page):
         self.extra_covers = {}   # media id -> cover, so they don't reload on every change
         self.fetchers = set()
         self.scan_id = 0
+        self.scan_sig = None   # (folder, your list) the last scan matched folders with
         self.scanned = False   # the first scan is done (Home waits for it)
         self.covers = {}   # show folder → its cover (kept for the other side's library too)
         self.root_cache, self.root_time, self.hidden_other = {}, {}, 0   # {library folder: shows / scan time} (each side)
@@ -3278,14 +3281,22 @@ class LibraryPage(Page):
             self.cards.set_width(w)
             self.grid.setGridSize(QSize(w + gap, self.cards.poster_h + CARD_H - POSTER_H + 20))
 
-    def refresh(self, quick=False):
+    def refresh(self, quick=False, list_only=False):
         """quick (switching sides): a scan of that library from the last 10 minutes is shown as it is; scanning
-        again parses every file name, ~3 s of Python next to the window, which stuttered while it ran."""
+        again parses every file name, ~3 s of Python next to the window, which stuttered while it ran.
+        list_only (the AniList sync finished): scan again only if the list differs from the one the last scan
+        matched folders with; otherwise just its badges (the rescan after every start slowed the first pages)."""
         lib = self.settings.get("library")
         if not lib or not Path(lib).is_dir():
             self.subtitle.setText("No library folder set" if not lib else f"Folder not found: {lib}")
             self.stack.setCurrentIndex(0)
             return
+        if list_only and self.scanned and getattr(self, "shown_root", None) == lib and self.scan_sig is not None:
+            mine = {mid: e.get("media") or {} for mid, e in self.account.entries.items()} if (
+                self.account and self.account.connected) else {}
+            if self.list_sig(lib, mine) == self.scan_sig:
+                self.apply_account()
+                return
         for s in list(self.scanners):
             s.requestInterruption()
         self.scan_id += 1
@@ -3312,6 +3323,7 @@ class LibraryPage(Page):
                 for t in ((m.get("title") or {}).get("english"), (m.get("title") or {}).get("romaji")):
                     if t:
                         title_ids.setdefault(org.safe_name(t).lower(), mid)
+        self.scan_sig = self.list_sig(lib, list_media)
         scanner = LibraryScanner(self.scan_id, lib, list_media, title_ids)
         scanner.listed.connect(self.on_listed)
         scanner.cover.connect(self.on_cover)
@@ -3322,6 +3334,13 @@ class LibraryPage(Page):
             self.stack.setCurrentIndex(1)
             self.skeleton.start()
         scanner.start()
+
+    @staticmethod
+    def list_sig(lib, list_media):
+        try:
+            return lib, hash(json.dumps(list_media, sort_keys=True, default=str))
+        except Exception:
+            return None
 
     def learn_adult(self, shows):
         """Shows matched before Kura knew about 18+: ask AniList once (50 per request), then scan again if any are."""
@@ -5757,7 +5776,7 @@ class SeasonPick(QPushButton):
         col.setSpacing(2)
         t = QLabel(title)
         t.setStyleSheet(f"color: {C['text']}; font-weight: 600; background: transparent;")
-        s = QLabel(sub)
+        s = self.sub = QLabel(sub)
         s.setStyleSheet(f"color: {sub_color}; font-size: 8.5pt; background: transparent;")
         for w in (t, s):
             w.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -5767,6 +5786,10 @@ class SeasonPick(QPushButton):
 
     def set_image(self, img):
         self.art.set_image(img)
+
+    def set_sub(self, text, color):
+        self.sub.setText(text)
+        self.sub.setStyleSheet(f"color: {color}; font-size: 8.5pt; background: transparent;")
 
     def sizeHint(self):
         return self.layout().sizeHint()
@@ -7143,10 +7166,36 @@ class DetailPage(QWidget):
                         got.update({c[0]: frac for c in grid.chips if c[1] == MISSING and c[0] not in got})
             grid.set_downloading(got)
 
+    def refresh_stats(self):
+        """Your progress / status tiles and the season cards' lines, after you watched or changed the entry."""
+        r = self.result
+        box = getattr(self, "stats_box", None)
+        if r and box is not None:
+            try:
+                lay = box.layout()
+                while lay.count():
+                    it = lay.takeAt(0)
+                    sub = it.layout()
+                    if sub is not None:
+                        while sub.count():
+                            w = sub.takeAt(0).widget()
+                            if w:
+                                w.deleteLater()
+                lay.addLayout(self.stats_row(r, r.get("hero") or {}))
+            except RuntimeError:   # the page was made again meanwhile
+                pass
+        for b in getattr(self, "tab_btns", []):
+            if getattr(b, "sec", None) is not None:
+                try:
+                    b.set_sub(*self.section_state(b.sec))
+                except RuntimeError:
+                    pass
+
     def update_progress(self):
         """Dim watched episodes, ring the next one, and update the Play next button."""
         if not self.result or not self.tracking():
             return
+        self.refresh_stats()
         nxt = next_episode(self.result["sections"], self.account)
         for s in self.result["sections"]:
             grid = self.grids.get(id(s))
@@ -7325,8 +7374,13 @@ class DetailPage(QWidget):
             el.addWidget(label(r["error"], "muted", wrap=True))
             bv.addWidget(err)
 
-        if hero_d:
-            bv.addLayout(self.stats_row(r, hero_d))
+        self.stats_box = None
+        if hero_d:   # kept: your progress / status follow your list as you watch (refresh_stats)
+            self.stats_box = QWidget()
+            sl = QVBoxLayout(self.stats_box)
+            sl.setContentsMargins(0, 0, 0, 0)
+            sl.addLayout(self.stats_row(r, hero_d))
+            bv.addWidget(self.stats_box)
 
         desc = clean_description(hero_d.get("description"))
         self.trailer = TrailerCard(r["trailer"]) if r.get("trailer") else None
@@ -7383,6 +7437,7 @@ class DetailPage(QWidget):
                 for k, sec in enumerate(r["sections"]):
                     sub_text, sub_color = self.section_state(sec)
                     b = SeasonPick(sec["title"], sub_text, sub_color)
+                    b.sec = sec
                     if sec.get("id"):
                         self.slots.setdefault(f"thumb:{sec['id']}", []).append(b)
                     b.clicked.connect(lambda _=False, n=k: self.pick_section(n))
@@ -8052,10 +8107,21 @@ class AccountPage(Page):
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)   # rows fit the width
         self.outer.addWidget(self.scroll, 1)
+        self.dirty, self.built_at = True, 0.0
+
+    STALE_AFTER = 1800   # s: "aired 2 h ago" moves on, so a page this old is made again when shown (Schedule's
+    # countdowns tick on their own while it shows; the loading screen builds both at start)
+
+    def mark_dirty(self, *_):
+        """Your list, the library or the settings changed: made again the next time it's shown."""
+        self.dirty = True
 
     def showEvent(self, e):
         super().showEvent(e)
-        self.rebuild()
+        # only when something changed (it rebuilt every visit: ~0.5 s each time on To download / Schedule)
+        if self.dirty or time.time() - self.built_at > self.STALE_AFTER:
+            self.dirty, self.built_at = False, time.time()
+            self.rebuild()
 
     def rebuild(self):
         raise NotImplementedError
@@ -8676,8 +8742,8 @@ class SchedTile(ArtCard):
         self.sub = QLabel(ep.get("sub") or "")
         self.sub.setStyleSheet("color: #c8ccd6; font-size: 11px; background: transparent;")
         self.sub.setWordWrap(True)
+        v.addWidget(self.sub)   # in the tile first: shown without a parent it flashed up as its own window
         self.sub.setVisible(bool(ep.get("sub") and ep.get("big")))
-        v.addWidget(self.sub)
         row = QHBoxLayout()
         row.setContentsMargins(0, 2, 0, 0)
         row.addWidget(pill_label(ep["st"], ep["st_color"]))
@@ -8690,7 +8756,7 @@ class SchedTile(ArtCard):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        room = self.height() - 8 - 8 - 14 - 22 - (self.sub.sizeHint().height() if self.sub.isVisible() else 0)
+        room = self.height() - 8 - 8 - 14 - 22 - (self.sub.sizeHint().height() if not self.sub.isHidden() else 0)
         lines = max(1, min(7, room // max(1, self.title.base_line)))
         self.title.fit(self.width() - 18, lines)
 
@@ -18656,10 +18722,16 @@ class KickoffPage(Page):
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.outer.addWidget(self.scroll, 1)
-        self.timer = QTimer(self, singleShot=True, interval=400, timeout=self.rebuild)
+        self.timer = QTimer(self, singleShot=True, interval=400, timeout=self.fresh_rebuild)
 
     def showEvent(self, e):
         super().showEvent(e)
+        # only when your list changed while it showed, or it's old (it rebuilt on every visit: ~0.7 s)
+        if getattr(self, "dirty", True) or time.time() - getattr(self, "built_at", 0) > 1800:
+            self.fresh_rebuild()
+
+    def fresh_rebuild(self):
+        self.dirty, self.built_at = False, time.time()
         self.rebuild()
 
     def schedule(self, *_):
@@ -18667,6 +18739,7 @@ class KickoffPage(Page):
         updates); it's fresh the next time you open it."""
         if self.isVisible():
             self.count_changed.emit(self.count())
+            self.dirty = True
             return
         self.timer.start()
 
@@ -26767,6 +26840,10 @@ class MainWindow(QMainWindow):
         if app is not None:   # Windows signing out / shutting down: close for real, don't ask
             app.commitDataRequest.connect(lambda *_: setattr(self, "quitting", True))
         self.account.changed.connect(self.on_account_changed)
+        for page in (self.todo, self.schedule):   # made again only when shown after one of these
+            self.account.changed.connect(page.mark_dirty)
+            self.account.entry_changed.connect(page.mark_dirty)
+            self.library.updated.connect(page.mark_dirty)
         self.account.entry_changed.connect(self.on_entry_changed)
         self.setup_tray()
         self.account.message.connect(self.notify)
@@ -27016,7 +27093,7 @@ class MainWindow(QMainWindow):
 
     def on_account_changed(self):
         QTimer.singleShot(5000, self.check_sequels)
-        self.library.refresh()   # rescan so folders can be matched through your list
+        self.library.refresh(list_only=True)   # rescan so folders can be matched through your list
         self.detail.on_account_changed()
         self.settings_page.build_account_card()
         self.seasonal.grid.viewport().update()
@@ -29344,6 +29421,7 @@ def warm_up(win, splash, finish):
         ("Making today's Live TV line-up", lambda: win.livetv.job is None, 5),
         ("This season on AniList", None, 0),
         ("Settings and statistics", None, 0),
+        ("To download, Schedule and Kickoff", None, 0),
     ]
     state = {"i": -1, "since": 0.0}
 
@@ -29360,6 +29438,11 @@ def warm_up(win, splash, finish):
             elif i == 4:
                 win.settings_page.build_embedded()
                 win.stats.render()
+            elif i == 5:   # they keep what they made until something changes (mark_dirty / dirty)
+                for page in (win.todo, win.schedule):
+                    page.dirty, page.built_at = False, time.time()
+                    page.rebuild()
+                win.kickoff.fresh_rebuild()
         except Exception:
             klog.exception(f"Warm-up step '{text}'")
 

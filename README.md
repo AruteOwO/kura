@@ -1,8 +1,45 @@
-# Kura (蔵)
+<p align="center">
+  <img src="docs/images/banner.png" alt="Kura: your anime library, found, downloaded, sorted and played" width="100%">
+</p>
 
-A Windows desktop app for a self-hosted anime library: it finds new episodes, has qBittorrent download them, sorts
-them into a tidy library (show and season folders, AniList names, folder icons), keeps your AniList list in sync, and
-plays everything in its own player. Jellyfin can stream the same library.
+<p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/AruteOwO/kura?color=7c6cff&label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078d4" alt="Windows 10 / 11">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-3d8b40" alt="GPL-3.0"></a>
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><b>Download</b></a> ·
+  <a href="#features"><b>Features</b></a> ·
+  <a href="#run-from-source"><b>Run from source</b></a>
+</p>
+
+Kura is a Windows desktop app for a self-hosted anime library. It finds new episodes, has qBittorrent download them,
+sorts them into a tidy library (show and season folders, AniList names, folder icons), keeps your AniList list in sync,
+and plays everything in its own player. Jellyfin can stream the same library.
+
+## Features
+
+<p align="center"><img src="docs/images/home.png" alt="Home: up next, new in your library, airing today" width="100%"></p>
+<p align="center"><img src="docs/images/library.png" alt="Library: a show page with progress, seasons and trailer" width="100%"></p>
+<p align="center"><img src="docs/images/schedule.png" alt="Schedule: the week's episodes and what's downloaded" width="100%"></p>
+<p align="center">
+  <img src="docs/images/kickoff.png" alt="Kickoff: Planning shows that started, and sequels" width="49%">
+  <img src="docs/images/seasonal.png" alt="Seasonal: this season's anime" width="49%">
+</p>
+
+### Also in Kura
+
+- **Downloads on their own**: new episodes of the shows you're watching are picked from release feeds by your own
+  filters and sent to qBittorrent; search several sites at once for anything missing.
+- **The organizer**: finished downloads are renamed after AniList and filed into show and season folders, with
+  folder icons. It also runs on its own from qBittorrent (`pyw anime_organizer.py "%F"`).
+- **A player made for anime**: mpv inside, skip openings, endings and recaps, subtitles from several sources,
+  optional picture enhancement (Anime4K, FSRCNNX, ArtCNN), screenshots and clips, Discord status.
+- **Live TV**: channels made from your own library, with a guide, so there's always something on.
+- **Statistics and Wrapped**: what you watched, when, and a year in review.
+- **Looks after itself**: backups of your data, a library health check, controller support and updates from inside
+  the app.
 
 ## Install
 
@@ -40,3 +77,5 @@ share and change it; if you share a changed version, it has to stay under the GP
 
 The release bundles other projects under their own licenses: mpv / libmpv and FFmpeg (GPL / LGPL), Qt for Python
 (PySide6, LGPL v3, kept as separate replaceable libraries in `kura_runtime`) and yt-dlp (Unlicense).
+
+Screenshots show a demo AniList list. Anime titles and artwork belong to their respective owners.

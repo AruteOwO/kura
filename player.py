@@ -23,11 +23,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QLinearGradient, QOpenGLContext, QPainter,
                            QPainterPath, QPen, QPixmap)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
+from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget)
 
 ACCENT, TEXT, MUTED, MARK = "#7c6cff", "#f2f3f7", "#a3aabb", "#f5b642"
@@ -1842,6 +1842,705 @@ def run_background(works):
     job.start()
 
 
+PAD_GLYPH = None        # Kura sets this: (button "A" / "LB"..., height) -> a button hint widget (its layout setting)
+
+
+class TvSeekBar(SeekBar):
+    """TV mode's seek bar: thick, white, the opening / ending in amber (same clicks and drags as SeekBar)."""
+
+    def __init__(self, parent, view, s):
+        super().__init__(parent, view)
+        self.s = s
+        self.setFixedHeight(int(28 * s))
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w = self.width() - 12
+        h = 8 * self.s
+        y = self.height() / 2 - h / 2
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 58))
+        p.drawRoundedRect(QRectF(6, y, w, h), h / 2, h / 2)
+        if self.duration:
+            for start, end, _ in self.marks:
+                x1, x2 = 6 + w * start / self.duration, 6 + w * min(end, self.duration) / self.duration
+                p.setBrush(QColor(245, 182, 66, 170))
+                p.drawRect(QRectF(x1, y, max(2, x2 - x1), h))
+            done = w * min(1, self.position / self.duration)
+            p.setBrush(QColor("white"))
+            p.drawRoundedRect(QRectF(6, y, done, h), h / 2, h / 2)
+            p.drawEllipse(QPointF(6 + done, self.height() / 2), 10 * self.s, 10 * self.s)
+
+
+class TvEpCard(QWidget):
+    """An episode in TV mode's row: its still or frame, Playing + progress, watched check, dimmed when missing."""
+    clicked = Signal()
+
+    def __init__(self, row, s):
+        super().__init__()
+        self.row, self.s, self.pic, self.focused = row, s, None, False
+        self.setFixedSize(int(236 * s), int(133 * s + 52 * s))
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+
+    def paintEvent(self, _):
+        s, r = self.s, self.row
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if r.get("state") == "missing":
+            p.setOpacity(0.55)
+        art = QRectF(4 * s, 4 * s, self.width() - 8 * s, 133 * s - 8 * s)
+        path = QPainterPath()
+        path.addRoundedRect(art, 11 * s, 11 * s)
+        p.save()
+        p.setClipPath(path)
+        p.fillRect(art, QColor("#262b36"))
+        if self.pic is not None and not self.pic.isNull():
+            img = self.pic
+            k = max(art.width() / img.width(), art.height() / img.height())
+            sw, sh = art.width() / k, art.height() / k
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawImage(art, img, QRectF((img.width() - sw) / 2, (img.height() - sh) / 2, sw, sh))
+        else:
+            f = QFont("Segoe UI Variable Display")
+            f.setPixelSize(int(34 * s))
+            f.setWeight(QFont.DemiBold)
+            p.setFont(f)
+            p.setPen(QColor("#5b6274"))
+            ep = r.get("ep")
+            p.drawText(art, Qt.AlignCenter, (f"{ep:g}" if isinstance(ep, float) else str(ep)) if ep is not None else "")
+        if r.get("state") == "seen":
+            p.fillRect(art, QColor(8, 9, 12, 90))
+        p.restore()
+        if r.get("state") == "now":
+            f = QFont()
+            f.setPixelSize(int(12 * s))
+            f.setWeight(QFont.Bold)
+            p.setFont(f)
+            tag = QRectF(art.left() + 8 * s, art.top() + 8 * s, 64 * s, 22 * s)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(8, 9, 12, 200))
+            p.drawRoundedRect(tag, 6 * s, 6 * s)
+            p.setPen(QColor("white"))
+            p.drawText(tag, Qt.AlignCenter, "Playing")
+        if r.get("prog"):
+            track = QRectF(art.left() + 10 * s, art.bottom() - 12 * s, art.width() - 20 * s, 4 * s)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 80))
+            p.drawRoundedRect(track, 2 * s, 2 * s)
+            p.setBrush(QColor("white"))
+            p.drawRoundedRect(QRectF(track.left(), track.top(), track.width() * min(1, r["prog"]), track.height()),
+                              2 * s, 2 * s)
+        if r.get("state") == "seen":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("white"))
+            c = QPointF(art.right() - 18 * s, art.top() + 18 * s)
+            p.drawEllipse(c, 10 * s, 10 * s)
+            p.setPen(QPen(QColor("#0b0d12"), 2.2 * s))
+            p.drawPolyline([QPointF(c.x() - 5 * s, c.y()), QPointF(c.x() - 1.5 * s, c.y() + 3.5 * s),
+                            QPointF(c.x() + 5 * s, c.y() - 4 * s)])
+        if self.focused:
+            p.setOpacity(1.0)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(8, 9, 12, 230), 3 * s))
+            p.drawRoundedRect(art.adjusted(-1.5 * s, -1.5 * s, 1.5 * s, 1.5 * s), 12.5 * s, 12.5 * s)
+            p.setPen(QPen(QColor("white"), 3 * s))
+            p.drawRoundedRect(art.adjusted(-3.5 * s, -3.5 * s, 3.5 * s, 3.5 * s), 14.5 * s, 14.5 * s)
+        f = QFont()
+        f.setPixelSize(int(15 * s))
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        y = 133 * s + 4 * s
+        p.setPen(QColor(TEXT))
+        p.drawText(QRectF(4 * s, y, self.width() - 8 * s, fm.height()), Qt.AlignLeft,
+                   fm.elidedText(r.get("title") or "", Qt.ElideRight, int(self.width() - 8 * s)))
+        f.setPixelSize(int(13 * s))
+        f.setWeight(QFont.Normal)
+        p.setFont(f)
+        fm2 = QFontMetrics(f)
+        p.setPen(QColor(r.get("note_color") or MUTED))
+        p.drawText(QRectF(4 * s, y + fm.height() + 2 * s, self.width() - 8 * s, fm2.height()), Qt.AlignLeft,
+                   fm2.elidedText((r.get("note") or "").replace("  ·  ", " · "), Qt.ElideRight,
+                                  int(self.width() - 8 * s)))
+
+
+class TvOption(QWidget):
+    """A row in TV mode's Subtitles & audio / More cards: big text, a value or check, white when focused."""
+    clicked = Signal()
+
+    def __init__(self, text, value, s, glyph=None, checked=False):
+        super().__init__()
+        self.text, self.value, self.s, self.glyph, self.checked, self.focused = text, value, s, glyph, checked, False
+        self.setFixedHeight(int(54 * s))
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+
+    def paintEvent(self, _):
+        s = self.s
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        fg = QColor("#0b0d12" if self.focused else TEXT)
+        if self.focused:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#e7e9ef"))
+            p.drawRoundedRect(QRectF(self.rect()), 12 * s, 12 * s)
+        x = 16 * s
+        if self.glyph:
+            icon(self.glyph, fg.name(), px=int(24 * s)).paint(
+                p, QRect(int(x), int((self.height() - 24 * s) / 2), int(24 * s), int(24 * s)))
+            x += 38 * s
+        f = QFont()
+        f.setPixelSize(int(16 * s))
+        f.setWeight(QFont.Medium)
+        p.setFont(f)
+        p.setPen(fg)
+        p.drawText(QRectF(x, 0, self.width() - x - 16 * s, self.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text)
+        right = self.value or ("✓" if self.checked else "")
+        if right:
+            f.setPixelSize(int((18 if self.checked and not self.value else 14) * s))
+            p.setFont(f)
+            c = QColor(fg)
+            c.setAlpha(255 if self.checked else 190)
+            p.setPen(c)
+            p.drawText(QRectF(x, 0, self.width() - x - 16 * s, self.height()), Qt.AlignVCenter | Qt.AlignRight, right)
+
+
+class TvLayer(QWidget):
+    """The player's controls in Kura's TV mode (user's pick, Oct 30 2026: Player A, no top, soft fade at the
+    bottom, Episodes as a row): the show above a thick seek bar, big round buttons, button hints; the Episodes
+    row (down), Subtitles & audio (X) and More (Menu) cards. It fades in and out instead of popping."""
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.view, self.menu, self.s = view, None, 1.0
+        self.rows, self.cards, self.focus, self.opts = [], [], 0, []
+        self.menu_widgets, self.paused_shown, self.built_for = [], None, None
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.fx = QGraphicsOpacityEffect(self)
+        self.fx.setOpacity(0.0)
+        self.setGraphicsEffect(self.fx)
+        self.anim = QPropertyAnimation(self.fx, b"opacity", self)
+        self.anim.setDuration(180)
+        self.anim.finished.connect(lambda: self.fx.opacity() < 0.01 and self.hide())
+        self.timer = QTimer(self, interval=250, timeout=self.sync)
+        self.hide()
+
+    def px(self, n):
+        return int(n * self.s)
+
+    def build(self):
+        """(Re)made for the player's size: everything is sized for 720 px of height, scaled up."""
+        v = self.view
+        s = max(1.0, min(v.width() / 1280, v.height() / 720))
+        if self.built_for == round(s, 2):
+            return
+        self.built_for = round(s, 2)
+        for w in self.findChildren(QWidget, options=Qt.FindDirectChildrenOnly):
+            w.hide()
+            w.deleteLater()
+        self.cards, self.rows, self.opts, self.menu = [], [], [], None
+        self.s = s
+        self.title = QLabel(self)
+        self.title.setStyleSheet(f"color: white; background: transparent; font-family: 'Segoe UI Variable Display';"
+                                 f" font-size: {self.px(28)}px; font-weight: 700;")
+        self.sub = QLabel(self)
+        self.sub.setStyleSheet(f"color: #c2c8d6; background: transparent; font-size: {self.px(16)}px;")
+        self.seek = TvSeekBar(self, v, s)
+        self.seek.seek.connect(v.on_seek)
+        self.t_pos, self.t_dur = QLabel(self), QLabel(self)
+        for l in (self.t_pos, self.t_dur):
+            l.setStyleSheet(f"color: #c2c8d6; background: transparent; font-size: {self.px(15)}px;")
+        self.btns, self.btns_live = [], None
+        self.make_buttons()
+        self.live_pill = QPushButton(self)   # Live TV: ● LIVE, or how far behind (click: jump to live)
+        self.live_pill.setCursor(Qt.PointingHandCursor)
+        self.live_pill.setFocusPolicy(Qt.NoFocus)
+        self.live_pill.clicked.connect(v.jump_live)
+        self.live_pill.hide()
+        self.legend = QWidget(self)
+        self.legend.setAttribute(Qt.WA_TranslucentBackground)
+        ll = QHBoxLayout(self.legend)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(self.px(22))
+        self.ep_label = QLabel(self)
+        self.ep_label.setStyleSheet(f"color: white; background: transparent; font-size: {self.px(18)}px;"
+                                    " font-weight: 600;")
+        self.card = QFrame(self)   # Subtitles & audio / More
+        self.card.setObjectName("tvcard")
+        self.card.setStyleSheet(f"QFrame#tvcard {{ background: rgba(22,25,32,0.97); border: 1px solid #363c4b;"
+                                f" border-radius: {self.px(20)}px; }}")
+        self.card.hide()
+        self.paused_shown = None
+        self.sync()
+
+    def make_buttons(self):
+        """The round buttons: an episode's, or a Live TV channel's (Guide, channel down / up)."""
+        v = self.view
+        for b in self.btns:
+            b.hide()
+            b.deleteLater()
+        self.btns, self.btns_live = [], bool(v.live)
+        short = int(v.settings.get("player_skip_short", 10))
+        if v.live:
+            spec = (("calendar_view_week", "Guide", self.open_guide),
+                    ("skip_previous", "Channel down", lambda: v.channel_step(-1)),
+                    ("replay_10", f"Back {short} seconds", lambda: v.skip(-short)),
+                    ("play", "Play / pause", v.toggle_pause),
+                    ("forward_10", f"Forward {short} seconds", lambda: v.skip(short)),
+                    ("skip_next", "Channel up", lambda: v.channel_step(1)),
+                    ("subtitles", "Subtitles & audio", lambda: self.open_menu("subs")))
+        else:
+            spec = (("format_list_numbered", "Episodes", lambda: self.open_menu("eps")),
+                    ("skip_previous", "Previous episode", lambda: v.step_episode(-1)),
+                    ("replay_10", f"Back {short} seconds", lambda: v.skip(-short)),
+                    ("play", "Play / pause", v.toggle_pause),
+                    ("forward_10", f"Forward {short} seconds", lambda: v.skip(short)),
+                    ("skip_next", "Next episode", lambda: v.step_episode(1)),
+                    ("subtitles", "Subtitles & audio", lambda: self.open_menu("subs")))
+        for glyph, tip, fn in spec:
+            b = QPushButton(self)
+            big = glyph == "play"
+            d = self.px(84 if big else 60)
+            b.setFixedSize(d, d)
+            b.setIconSize(QSize(self.px(44 if big else 30), self.px(44 if big else 30)))
+            b.setToolTip(tip)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setStyleSheet(f"QPushButton {{ background: {'white' if big else 'rgba(255,255,255,0.13)'}; border: none;"
+                            f" border-radius: {d // 2 - 1}px; }} QPushButton:hover {{ background: "
+                            f"{'#e7e9ef' if big else 'rgba(255,255,255,0.22)'}; }}")
+            if not big:
+                b.setIcon(icon(glyph, TEXT, px=self.px(30)))
+            b.clicked.connect(fn)
+            b.show()
+            self.btns.append(b)
+        self.play_b = self.btns[3]
+        self.paused_shown = None   # the play icon is set again by sync
+
+    # ---- showing
+    def fade(self, on):
+        self.anim.stop()
+        if on and self.view.live_guide.isVisible():
+            return   # Live TV's guide fills the screen: the controls come back when it closes
+        if on:
+            self.build()
+            self.place()
+            self.show()
+            self.raise_()
+            self.timer.start()
+            self.sync()
+        else:
+            self.timer.stop()
+        self.anim.setStartValue(self.fx.opacity())
+        self.anim.setEndValue(1.0 if on else 0.0)
+        self.anim.start()
+
+    def height_for(self):
+        return self.px({"eps": 500, "subs": 600, "more": 600}.get(self.menu, 390))
+
+    def place(self):
+        v = self.view
+        if not hasattr(self, "title"):
+            return
+        h = min(v.height(), self.height_for())
+        self.setGeometry(0, v.height() - h, v.width(), h)
+        W, H, m = self.width(), self.height(), self.px(48)
+        eps = self.menu == "eps"
+        legend_h = self.px(52)
+        seek_y = H - self.px(330 if eps else 176)
+        self.seek.setGeometry(m - 6, seek_y, W - 2 * m + 12, self.seek.height())
+        self.sub.adjustSize()
+        self.title.adjustSize()
+        self.sub.move(m, seek_y - self.sub.height() - self.px(4))
+        self.title.move(m, self.sub.y() - self.title.height())
+        self.t_pos.adjustSize()
+        self.t_dur.adjustSize()
+        self.t_pos.move(m, seek_y + self.seek.height())
+        self.t_dur.move(W - m - self.t_dur.width(), seek_y + self.seek.height())
+        if self.view.live:
+            self.live_pill.adjustSize()
+            self.live_pill.move(W - m - self.live_pill.width(), seek_y - self.live_pill.height() - self.px(8))
+        total = sum(b.width() for b in self.btns) + self.px(16) * (len(self.btns) - 1)
+        x = (W - total) // 2
+        cy = H - legend_h - self.px(52)
+        for b in self.btns:
+            b.move(x, cy - b.height() // 2)
+            b.setVisible(not eps)
+            x += b.width() + self.px(16)
+        self.legend.adjustSize()
+        self.legend.move(W - m - self.legend.width(), H - legend_h + (legend_h - self.legend.height()) // 2)
+        self.ep_label.setVisible(eps)
+        if eps:
+            self.ep_label.adjustSize()
+            self.ep_label.move(m, seek_y + self.seek.height() + self.px(30))
+            self.place_cards()
+        if self.menu in ("subs", "more"):
+            self.card.adjustSize()
+            cx = (W - m - self.card.width()) if self.menu == "subs" else (W - self.card.width()) // 2
+            self.card.move(cx, self.title.y() - self.px(20) - self.card.height())
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        g = QLinearGradient(0, 0, 0, self.height())
+        g.setColorAt(0, QColor(8, 9, 12, 0))
+        g.setColorAt(0.35, QColor(8, 9, 12, 140))
+        g.setColorAt(1, QColor(8, 9, 12, 215))
+        p.fillRect(self.rect(), g)
+
+    def sync(self):
+        """Mirror the player: title, times, the seek bar, play / pause."""
+        v = self.view
+        if not hasattr(self, "title"):
+            return
+        if bool(v.live) != self.btns_live:   # an episode ↔ a channel: other buttons, hints
+            self.make_buttons()
+            self.set_legend()
+        if self.title.text() != v.title.text() or self.sub.text() != v.subtitle.text():
+            self.title.setText(v.title.text())
+            self.sub.setText(v.subtitle.text().replace("  ·  ", " · "))
+            self.place()
+        prog = (v.live or {}).get("prog")
+        self.seek.setAttribute(Qt.WA_TransparentForMouseEvents, bool(v.live))   # a channel isn't seeked
+        self.live_pill.setVisible(bool(v.live) and prog is not None)
+        if v.live and prog:
+            delay = (v.live or {}).get("delay") or 0.0
+            self.seek.duration = max(1.0, prog["end"] - prog["start"])
+            self.seek.position = max(0.0, min(self.seek.duration, time.time() - delay - prog["start"]))
+            self.seek.marks = []
+            clock = lambda t: time.strftime("%I:%M %p", time.localtime(t)).lstrip("0")
+            self.t_pos.setText(clock(prog["start"]))
+            self.t_dur.setText(clock(prog["end"]))
+            behind = delay > 3
+            text = f"−{int(delay) // 60}:{int(delay) % 60:02d}  ·  Jump to live" if behind else "●  LIVE"
+            if self.live_pill.text() != text:
+                self.live_pill.setText(text)
+                self.live_pill.setStyleSheet(
+                    f"QPushButton {{ background: {'rgba(255,255,255,0.16)' if behind else '#e5484d'}; color: white;"
+                    f" border: none; border-radius: {self.px(12)}px; padding: {self.px(4)}px {self.px(12)}px;"
+                    f" font-size: {self.px(14)}px; font-weight: 700; }}")
+                self.place()
+        else:
+            self.seek.duration, self.seek.position = v.seekbar.duration, v.seekbar.position
+            self.seek.marks = v.seekbar.marks
+            self.t_pos.setText(fmt_time(v.seekbar.position))
+            self.t_dur.setText(fmt_time(v.seekbar.duration))
+        self.seek.update()
+        self.t_pos.adjustSize()
+        self.t_dur.adjustSize()
+        if v.live_banner.isVisible():
+            v.live_banner.hide()   # the layer shows the programme already
+        try:
+            paused = bool(v.mpv.pause) if v.current else True
+        except Exception:
+            paused = True
+        if paused != self.paused_shown:
+            self.paused_shown = paused
+            self.play_b.setIcon(icon("play_arrow" if paused else "pause", "#0b0d12", px=self.px(44)))
+            self.set_legend()
+
+    def set_legend(self):
+        lay = self.legend.layout()
+        while lay.count():
+            w = lay.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        if self.menu == "eps":
+            items = [(["A"], "Play"), (["LB", "RB"], "Season"), (["B"], "Close")]
+        elif self.menu in ("subs", "more"):
+            items = [(["A"], "Choose"), (["B"], "Close")]
+        elif self.view.live:
+            items = [(["A"], "Play" if self.paused_shown else "Pause"), (["LB", "RB"], "Channel"),
+                     (["DOWN"], "Guide"), (["X"], "Subtitles"), (["START"], "More"), (["B"], "Back to TV mode")]
+        else:
+            items = [(["A"], "Play" if self.paused_shown else "Pause"), (["LEFTRIGHT"], "Skip"),
+                     (["DOWN"], "Episodes"), (["X"], "Subtitles"), (["START"], "More"), (["B"], "Back to TV mode")]
+        for buttons, text in items:
+            cell = QWidget()
+            h = QHBoxLayout(cell)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(self.px(7))
+            for b in buttons:
+                if b in ("DOWN", "LEFTRIGHT"):
+                    l = QLabel("▼" if b == "DOWN" else "◀ ▶")
+                    l.setStyleSheet(f"color: #c2c8d6; background: transparent; font-size: {self.px(13)}px;")
+                    h.addWidget(l)
+                elif PAD_GLYPH is not None:
+                    h.addWidget(PAD_GLYPH(b, self.px(24)))
+            t = QLabel(text)
+            t.setStyleSheet(f"color: #c2c8d6; background: transparent; font-size: {self.px(14)}px;")
+            h.addWidget(t)
+            lay.addWidget(cell)
+            cell.show()   # (added while the layer shows: not shown by itself)
+        self.place()
+
+    # ---- menus
+    def open_menu(self, which):
+        self.close_menu(quiet=True)
+        self.menu = which
+        self.view.show_controls()
+        {"eps": self.open_eps, "subs": self.open_subs, "more": self.open_more}[which]()
+        self.set_legend()
+        self.place()
+
+    def close_menu(self, quiet=False):
+        for c in self.cards:
+            c.hide()
+            c.deleteLater()
+        self.cards, self.rows, self.opts = [], [], []
+        self.card.hide()
+        was, self.menu = self.menu, None
+        if was and not quiet:
+            self.set_legend()
+            self.place()
+            self.view.hide_timer.start()
+
+    # Episodes: the playlist + missing episodes as one row (seasons on LB / RB)
+    def open_eps(self):
+        v = self.view
+        self.rows = [{**r, "season_name": sec["name"]} for sec in v.episode_sections() for r in sec["rows"]]
+        self.focus = next((i for i, r in enumerate(self.rows) if r["state"] == "now"), 0)
+        nxt = v.next_index()
+        up = next((i for i, r in enumerate(self.rows) if r.get("index") == nxt and r["state"] != "now"), None)
+        if up is not None:
+            self.focus = up   # the one you'd want next
+        for r in self.rows:
+            c = TvEpCard(r, self.s)
+            c.setParent(self)
+            c.clicked.connect(lambda r=r: self.pick_row(r))
+            self.cards.append(c)
+
+    def place_cards(self):
+        if not self.cards:
+            return
+        W, m, gap = self.width(), self.px(48), self.px(18)
+        cw = self.cards[0].width()
+        per = max(1, (W - 2 * m + gap) // (cw + gap))
+        first = max(0, min(self.focus - 1, len(self.cards) - per))
+        y = self.ep_label.y() + self.ep_label.height() + self.px(12)
+        for i, c in enumerate(self.cards):
+            c.focused = i == self.focus
+            on = first <= i < first + per
+            c.setVisible(on)
+            if on:
+                c.move(m + (i - first) * (cw + gap), y)
+                c.update()
+        self.ep_label.setText(f"Episodes  ·  {self.rows[self.focus]['season_name']}")
+        self.ep_label.adjustSize()
+        want = [(self.rows[i]["pic_key"], *self.rows[i]["pic"]) for i in range(first, min(len(self.rows), first + per))
+                if self.rows[i].get("pic") and self.rows[i].get("pic_key") and self.cards[i].pic is None]
+        if want and EPISODE_PICS is not None:
+            try:
+                EPISODE_PICS([w for w in want if w[1] == "url"] + [w for w in want if w[1] != "url"])
+            except Exception:
+                pass
+
+    def set_pic(self, key, img):
+        for c in self.cards:
+            if c.row.get("pic_key") == key:
+                c.pic = img
+                c.update()
+
+    def pick_row(self, r):
+        v = self.view
+        self.close_menu()
+        if r.get("find"):
+            v.find_episode.emit(*r["find"])
+        elif r.get("index") is not None and r["state"] != "now":
+            v.note_input()
+            v.play_index(r["index"])
+
+    def season_step(self, step):
+        names = list(dict.fromkeys(r["season_name"] for r in self.rows))
+        i = names.index(self.rows[self.focus]["season_name"]) + step
+        if 0 <= i < len(names):
+            self.focus = next(n for n, r in enumerate(self.rows) if r["season_name"] == names[i])
+            self.place_cards()
+
+    # Subtitles & audio / More: rows in a card
+    def card_layout(self):
+        lay = self.card.layout()
+        if lay is None:
+            lay = QHBoxLayout(self.card)
+        while lay.count():
+            it = lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+            elif it.layout():
+                QWidget().setLayout(it.layout())
+        lay.setContentsMargins(self.px(18), self.px(18), self.px(18), self.px(18))
+        lay.setSpacing(self.px(20))
+        return lay
+
+    def column(self, lay, head, options):
+        col = QVBoxLayout()
+        col.setSpacing(self.px(6))
+        if head:
+            h = QLabel(head)
+            h.setStyleSheet(f"color: #a3abbd; background: transparent; border: none; font-size: {self.px(13)}px;"
+                            " font-weight: 700; letter-spacing: 1.2px;")
+            col.addWidget(h)
+        out = []
+        for text, value, glyph, checked, fn in options:
+            o = TvOption(text, value, self.s, glyph, checked)
+            o.setMinimumWidth(self.px(260 if head else 460))
+            o.clicked.connect(lambda fn=fn: self.choose(fn))
+            col.addWidget(o)
+            out.append(o)
+        col.addStretch(1)
+        lay.addLayout(col)
+        return out
+
+    def open_subs(self):
+        v = self.view
+        lay = self.card_layout()
+        subs = [("Off", "", None, not any(t.get("selected") for t in v.tracks("sub")),
+                 lambda: v.choose_track("sub", None))]
+        subs += [(v.track_name(t), "", None, bool(t.get("selected")), lambda t=t: v.choose_track("sub", t))
+                 for t in v.tracks("sub")]
+        audio = [(v.track_name(t), "", None, bool(t.get("selected")), lambda t=t: v.choose_track("audio", t))
+                 for t in v.tracks("audio")] or [("No audio tracks", "", None, False, None)]
+        self.opts = [self.column(lay, "SUBTITLES", subs), self.column(lay, "AUDIO", audio)]
+        self.fcol, self.frow = 0, next((i for i, o in enumerate(self.opts[0]) if o.checked), 0)
+        self.card.show()
+        self.card.raise_()
+        self.mark_focus()
+
+    def open_more(self):
+        v = self.view
+        lay = self.card_layout()
+        items = []
+        try:
+            mark = v.current_mark(v.mpv.time_pos)
+        except Exception:
+            mark = None
+        if mark:
+            items.append((f"Skip {mark[2].lower()}", f"{fmt_time(mark[0])} – {fmt_time(mark[1])}", "fast_forward",
+                          False, v.skip_mark))
+        if v.live:
+            if ((v.live or {}).get("delay") or 0) > 3:
+                items.append(("Jump to live", "", "fast_forward", False, v.jump_live))
+            items.append(("Guide", "", "calendar_view_week", False, self.open_guide))
+        else:
+            speeds = [1.0, 1.25, 1.5, 2.0, 0.75]
+            try:
+                cur = float(v.mpv.speed or 1.0)
+            except Exception:
+                cur = 1.0
+            nxt = speeds[(speeds.index(cur) + 1) % len(speeds)] if cur in speeds else 1.0
+            items.append(("Speed", f"{cur:g}×", "speed", False, lambda: v.set_speed(nxt)))
+        items.append(("Picture", "", "auto_awesome", False, v.picture_menu))
+        items.append(("Screenshot", "", "photo_camera", False, lambda: v.screenshot(False)))
+        items.append(("Close the player", "", "close", False, v.close_requested.emit))
+        self.opts = [self.column(lay, None, items)]
+        self.fcol, self.frow = 0, 0
+        self.card.show()
+        self.card.raise_()
+        self.mark_focus()
+
+    def mark_focus(self):
+        for c, col in enumerate(self.opts):
+            for r, o in enumerate(col):
+                o.focused = (c, r) == (self.fcol, self.frow)
+                o.update()
+
+    def choose(self, fn):
+        menu = self.menu
+        row = getattr(self, "frow", 0)
+        speed = menu == "more" and self.opts and self.opts[0][min(row, len(self.opts[0]) - 1)].text == "Speed"
+        if fn is not None:
+            fn()
+        if menu == "subs" or speed:   # stays open: you see the check / the speed change
+            def again():
+                if self.menu == menu:
+                    keep = (self.fcol, self.frow)
+                    self.open_menu(menu)
+                    self.fcol, self.frow = keep
+                    self.mark_focus()
+            QTimer.singleShot(150, again)
+        elif menu == "more" and self.menu == "more":
+            self.close_menu()
+
+    def open_guide(self):
+        """Live TV's guide (the player's own, full screen); B, ▼ or Y comes back."""
+        self.close_menu(quiet=True)
+        self.set_legend()
+        self.fade(False)
+        if not self.view.live_guide.isVisible():
+            self.view.toggle_guide()
+
+    # ---- the controller (from PlayerView.pad): True when used
+    def pad(self, name):
+        v = self.view
+        if v.live and v.live_guide.isVisible():   # the guide: arrows, A tunes in / reminds, B back
+            from PySide6.QtGui import QKeyEvent
+            key = {"DPAD_UP": Qt.Key_Up, "DPAD_DOWN": Qt.Key_Down, "DPAD_LEFT": Qt.Key_Left,
+                   "DPAD_RIGHT": Qt.Key_Right, "A": Qt.Key_Return}.get(name)
+            if name in ("B", "Y", "BACK"):
+                v.toggle_guide()
+            elif key is not None:
+                v.live_guide.key(QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier))
+            elif name in ("LB", "RB"):
+                v.channel_step(-1 if name == "LB" else 1)
+            return True
+        if self.menu == "eps":
+            if name in ("DPAD_LEFT", "DPAD_RIGHT"):
+                self.focus = max(0, min(len(self.rows) - 1, self.focus + (1 if name == "DPAD_RIGHT" else -1)))
+                self.place_cards()
+            elif name in ("LB", "RB"):
+                self.season_step(1 if name == "RB" else -1)
+            elif name == "A" and self.rows:
+                self.pick_row(self.rows[self.focus])
+            elif name in ("B", "DPAD_UP"):
+                self.close_menu()
+            return True
+        if self.menu in ("subs", "more"):
+            col = self.opts[self.fcol] if self.opts else []
+            if name in ("DPAD_UP", "DPAD_DOWN") and col:
+                self.frow = max(0, min(len(col) - 1, self.frow + (1 if name == "DPAD_DOWN" else -1)))
+            elif name in ("DPAD_LEFT", "DPAD_RIGHT") and len(self.opts) > 1:
+                self.fcol = max(0, min(len(self.opts) - 1, self.fcol + (1 if name == "DPAD_RIGHT" else -1)))
+                self.frow = min(self.frow, len(self.opts[self.fcol]) - 1)
+            elif name == "A" and col:
+                col[self.frow].clicked.emit()
+                return True
+            elif name in ("B", "X", "START"):
+                self.close_menu()
+                return True
+            self.mark_focus()
+            return True
+        short = int(v.settings.get("player_skip_short", 10))
+        acts = {"A": v.toggle_pause, "DPAD_LEFT": lambda: v.skip(-short), "DPAD_RIGHT": lambda: v.skip(short),
+                "DPAD_DOWN": lambda: self.open_menu("eps"), "X": lambda: self.open_menu("subs"),
+                "START": lambda: self.open_menu("more"), "LB": lambda: v.step_episode(-1),
+                "RB": lambda: v.step_episode(1), "B": v.close_requested.emit, "DPAD_UP": lambda: None}
+        if v.live:   # a channel: LB / RB change it, ▼ / Y the guide
+            acts.update({"LB": lambda: v.channel_step(-1), "RB": lambda: v.channel_step(1),
+                         "DPAD_DOWN": self.open_guide, "Y": self.open_guide})
+        fn = acts.get(name)
+        if fn is None:
+            return False
+        v.show_controls()
+        fn()
+        return True
+
+    def back(self):
+        """Esc: a menu closes, else the player (back to TV mode)."""
+        if self.menu:
+            self.close_menu()
+        else:
+            self.view.close_requested.emit()
+
+
 class PlayerView(QWidget):
     """The player. It lives inside Kura's window (Kura turns into the player) or in a
     PopoutWindow, and can move between them while playing. open(playlist, index) plays
@@ -1870,6 +2569,7 @@ class PlayerView(QWidget):
         self.marks, self.chapters_done, self.skipped = [], False, set()
         self.resume_pending, self.last_save, self.last_emit, self.ended_at = False, 0, 0, None
         self.mode, self.on_top = "embedded", False
+        self.tv, self.tv_layer = False, None   # Kura's TV mode: TvLayer instead of the dock (set_tv)
         self.setMinimumSize(480, 270)
         self.setAttribute(Qt.WA_StyledBackground)
         self.setStyleSheet(STYLE + "PlayerView { background: black; }")
@@ -2175,6 +2875,17 @@ class PlayerView(QWidget):
         """Fill the episode list: the playlist (grouped by season) plus the aired episodes you don't have."""
         if not self.ep_panel.isVisible():
             return
+        out = self.episode_sections(scroll)
+        cur = (self.playlist[self.index].get("season") or 0) if 0 <= self.index < len(self.playlist) else None
+        # the season you picked stays, until another episode starts (it may be in the next season)
+        moved = getattr(self, "ep_last_index", None) != self.index
+        key = cur if scroll or moved or self.ep_panel.key is None else self.ep_panel.key
+        self.ep_last_index = self.index
+        self.ep_panel.set_sections(out, key)
+
+    def episode_sections(self, scroll=False):
+        """[{key, name, rows}] by season: the playlist plus the aired episodes you don't have (the episode list
+        and TV mode's row)."""
         first = self.playlist[0]["path"] if self.playlist else None
         if self.ep_info_for != (first, len(self.playlist)) or scroll:
             self.ep_info = None
@@ -2249,12 +2960,7 @@ class PlayerView(QWidget):
             sec = sections[key]
             sec["rows"].sort(key=lambda r: r["sort"])
             out.append(sec)
-        cur = (self.playlist[self.index].get("season") or 0) if 0 <= self.index < len(self.playlist) else None
-        # the season you picked stays, until another episode starts (it may be in the next season)
-        moved = getattr(self, "ep_last_index", None) != self.index
-        key = cur if scroll or moved or self.ep_panel.key is None else self.ep_panel.key
-        self.ep_last_index = self.index
-        self.ep_panel.set_sections(out, key)
+        return out
 
     def ask_episode_pics(self, keys):
         if EPISODE_PICS is None:
@@ -2277,6 +2983,8 @@ class PlayerView(QWidget):
         """A picture for the episode list arrived (from Kura's picture worker)."""
         if img is not None and not img.isNull():
             self.ep_panel.set_pic(key, img)
+            if self.tv_layer is not None:
+                self.tv_layer.set_pic(key, img)
 
     def hover_thumb(self, t, pos):
         """The frame at the time under the mouse, above the seek bar (asked from a hidden mpv)."""
@@ -2356,10 +3064,15 @@ class PlayerView(QWidget):
         bh = self.bottom.sizeHint().height()
         self.bottom.setGeometry((self.width() - dw) // 2, self.height() - bh - margin, dw, bh)
         self.fit_dock()
+        if self.tv and self.tv_layer is not None and self.tv_layer.isVisible():
+            self.tv_layer.build()
+            self.tv_layer.place()
         self.place_floating()
 
     def above_controls(self):
         """How far above the window's bottom floating cards sit: over the dock while it shows."""
+        if self.tv and self.tv_layer is not None:
+            return (self.tv_layer.height() - self.tv_layer.px(120) if self.controls_visible else 60)
         return (self.height() - self.bottom.geometry().top() + 14) if self.controls_visible else 40
 
     def right_edge(self):
@@ -2407,7 +3120,32 @@ class PlayerView(QWidget):
             sc.move((self.width() - sc.width()) // 2, (self.height() - sc.height()) // 2)
 
     # ---- controls showing/hiding
+    def set_tv(self, on):
+        """TV mode's controls (TvLayer: big, controller first) instead of the dock and the corner buttons."""
+        self.tv = bool(on)
+        if self.tv and self.tv_layer is None:
+            self.tv_layer = TvLayer(self)
+        if self.tv:
+            self.top.hide()
+            self.bottom.hide()
+            self.show_controls()
+        elif self.tv_layer is not None:
+            self.tv_layer.close_menu(quiet=True)
+            self.tv_layer.fade(False)
+            self.show_controls()
+
     def show_controls(self):
+        if self.tv and self.tv_layer is not None:
+            self.controls_visible = True
+            self.unsetCursor()
+            self.video.unsetCursor()
+            if self.live_guide.isVisible():
+                return
+            if not (self.tv_layer.isVisible() and self.tv_layer.anim.endValue() == 1.0):
+                self.tv_layer.fade(True)
+            self.place_floating()
+            self.hide_timer.start()
+            return
         self.controls_visible = True
         self.top.show()
         self.bottom.show()
@@ -2419,6 +3157,17 @@ class PlayerView(QWidget):
 
     def hide_controls(self):
         if not self.current:
+            return
+        if self.tv and self.tv_layer is not None:
+            if self.mpv.pause or self.tv_layer.menu or self.menu is not None:
+                self.hide_timer.start()
+                return
+            self.controls_visible = False
+            self.tv_layer.fade(False)
+            self.hover.hide()
+            self.thumb.hide()
+            self.video.setCursor(Qt.BlankCursor)
+            self.place_floating()
             return
         over_bar = self.bottom.geometry().contains(self.mapFromGlobal(self.cursor().pos()))
         if self.mpv.pause or over_bar or self.menu is not None or QApplication.activePopupWidget() or \
@@ -3189,6 +3938,9 @@ class PlayerView(QWidget):
         if self.ep_panel.isVisible() and e.key() == Qt.Key_Escape:
             self.close_episodes()
             return
+        if self.tv and self.tv_layer is not None and e.key() == Qt.Key_Escape:
+            self.tv_layer.back()
+            return
         if e.key() == Qt.Key_E and not e.modifiers() and not self.live:
             self.toggle_episodes()
             return
@@ -3443,6 +4195,7 @@ class PlayerView(QWidget):
         if g.isVisible():
             g.hide()
             self.resizeEvent(None)
+            self.video.lower()   # it was raised over the guide: back under the controls (they showed under it)
             self.show_controls()
             return
         if not self.live or LIVE is None:
@@ -3746,6 +4499,8 @@ class PlayerView(QWidget):
             return True
         if self.next_card.isVisible() and name in ("A", "B"):
             (self.next_card.finish if name == "A" else self.next_card.cancel)()
+            return True
+        if self.tv and self.tv_layer is not None and self.tv_layer.pad(name):
             return True
         short = int(self.settings.get("player_skip_short", 10))
         long = int(self.settings.get("player_skip_long", 85))

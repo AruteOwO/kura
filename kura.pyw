@@ -41,7 +41,7 @@ from pathlib import Path
 from PySide6.QtCore import (QByteArray, QEasingCurve, QElapsedTimer, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRect,
                             QRectF, QSize,
                             QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal, Property)
-from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence,
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence, QPolygonF,
                            QConicalGradient, QLinearGradient, QPainter, QPainterPath, QRadialGradient, QPalette, QPen, QPixmap, QRegion, QShortcut,
                            QStandardItem, QStandardItemModel, QWheelEvent, QKeyEvent, QContextMenuEvent,
                            QMouseEvent, QSyntaxHighlighter, QTextCharFormat)
@@ -54,6 +54,8 @@ from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QAbstractSpin
                                QToolTip, QGraphicsBlurEffect, QGraphicsOpacityEffect, QGraphicsPixmapItem,
                                QGraphicsScene, QSlider, QColorDialog, QFontComboBox, QTextBrowser,
                                QVBoxLayout, QWidget)
+from PySide6.QtQml import QQmlComponent, QQmlEngine, QQmlImageProviderBase
+from PySide6.QtQuick import QQuickImageProvider, QQuickWindow
 import shiboken6
 
 FROZEN = getattr(sys, "frozen", False)   # running as Kura.exe
@@ -170,7 +172,7 @@ STATUS_COLORS = {"CURRENT": "#3db4f2", "REPEATING": "#3db4f2", "PLANNING": "#c08
 QSS = """
 QWidget { color: @text; }
 QMainWindow, #root { background: @bg; }
-QToolTip { background: @surface2; color: @text; border: 1px solid @border_hi; padding: 6px 10px; border-radius: 8px; }
+QToolTip { background: @surface2; color: @text; border: 1px solid @border_hi; padding: 1px 6px; border-radius: 6px; }
 
 #sidebar { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #12151d, stop:1 #0e1117);
            border-right: 1px solid @border; }
@@ -886,6 +888,9 @@ def default_settings():
         "track_prefs": {},                    # show folder -> the audio / subtitle track you picked
         "player_autonext": True,
         "controller_enabled": True,           # Xbox-style controllers move around Kura and drive the player
+        "pad_layout": "xbox",                 # button names in hints: xbox / playstation / nintendo (labels only)
+        "pad_select": "right",                # Nintendo layout: A (right) selects like a Switch, or "bottom" (as Xbox)
+        "tv_mode_open": "ask",                # TV mode when a controller connects: ask / always / manual
         "player_resume": True,
         "player_hwdec": True,
         "player_audio_lang": "jpn,ja,eng",
@@ -4263,7 +4268,8 @@ class SettingsPage(Page):
                 ("folders", ("folder", "Library & folders", "Where your shows live and where downloads land.")),
                 ("sorting", ("sort", "Sorting", "How new episodes are moved and named.")),
                 ("icons", ("photo_library", "Icons & links", "Folder icons in Explorer, and spin-offs inside their parent show.")),
-                ("app", ("tune", "App", "Closing, starting with Windows, a controller, and Kura's files.")),
+                ("app", ("tune", "App", "Closing, starting with Windows, and Kura's files.")),
+                ("controller", ("sports_esports", "Controller", "Your controller's buttons, and what each one does around Kura and in the player.")),
                 ("adult", ("18_up_rating", "Hentai", "Kura's hentai side: its own library, pages and statistics.")),
                 ("PLAYBACK", None), ("player", ("play_circle", "Player", "Kura's player or another app, skipping, autoplay.")),
                 ("subtitles", ("subtitles", "Subtitles", "Your subtitle colors, outline and size in Kura's player.")),
@@ -4497,37 +4503,6 @@ class SettingsPage(Page):
                                                       "faint", wrap=True), chars)
         col.addWidget(abox)
 
-        col.addSpacing(8)
-        pbox = card()
-        pl = QVBoxLayout(pbox)
-        pl.setContentsMargins(20, 8, 20, 14)
-        pl.setSpacing(0)
-        pad_sw = Toggle(settings.get("controller_enabled", True))
-        pad_sw.toggled.connect(lambda on: self.set("controller_enabled", on))
-        self.row(pl, "Use a controller", label("Xbox controllers, and PlayStation pads through Steam or DS4Windows. "
-                                               "Only while Kura is the window in front.", "faint", wrap=True), pad_sw)
-        self.divider(pl)
-        keys = QGridLayout()
-        keys.setContentsMargins(0, 10, 0, 0)
-        keys.setHorizontalSpacing(18)
-        keys.setVerticalSpacing(6)
-        for c, (head, rows) in enumerate([
-            ("Around Kura", [("D-pad / left stick", "Move"), ("A", "Select"), ("B", "Back"),
-                             ("LB / RB", "Previous / next page"), ("Right stick", "Scroll"),
-                             ("Menu", "Right-click menu"), ("View", "Search")]),
-            ("In the player", [("A", "Pause"), ("B", "Leave fullscreen / close"), ("D-pad ← →", "Skip"),
-                               ("LT / RT", "Screenshot / clip the last seconds"),
-                               ("D-pad ↑ ↓", "Volume"), ("LB / RB", "Previous / next episode"), ("X", "Subtitles"),
-                               ("Y", "Fullscreen"), ("Menu / View", "More / Picture"),
-                               ("Left / right stick click", "Skip opening / long skip")])]):
-            keys.addWidget(label(head, "h2"), 0, c * 2, 1, 2)
-            for r, (btn, what) in enumerate(rows, 1):
-                keys.addWidget(label(btn, "chip"), r, c * 2, Qt.AlignLeft)
-                keys.addWidget(label(what, "faint"), r, c * 2 + 1)
-        keys.setColumnStretch(1, 1)
-        keys.setColumnStretch(3, 1)
-        pl.addLayout(keys)
-        col.addWidget(pbox)
 
         col.addSpacing(8)
         files = card()
@@ -4546,9 +4521,107 @@ class SettingsPage(Page):
         fil.addWidget(show_script)
         col.addWidget(files)
         self.build_adult()
-        for key in ("account", "folders", "sorting", "icons", "app", "adult"):
+        self.build_controller()
+        for key in ("account", "folders", "sorting", "icons", "app", "controller", "adult"):
             self.sec_cols[key].addStretch(1)
         self.show_section(settings.get("settings_section", "account"))
+
+    def build_controller(self):
+        """Settings → Controller: on / off, the button layout (names only), Switch's select button, the guide."""
+        col, settings = self.sec_cols["controller"], self.settings
+        box = card()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(20, 8, 20, 14)
+        bl.setSpacing(0)
+        pad_sw = Toggle(settings.get("controller_enabled", True))
+        pad_sw.toggled.connect(lambda on: self.set("controller_enabled", on))
+        self.row(bl, "Use a controller", label("Xbox controllers work as they are; PlayStation and Switch "
+                                               "controllers through Steam Input or DS4Windows. Only while Kura is "
+                                               "the window in front.", "faint", wrap=True), pad_sw)
+        self.divider(bl)
+        head = QVBoxLayout()
+        head.setContentsMargins(0, 12, 0, 10)
+        head.setSpacing(2)
+        head.addWidget(label("Button layout", "h2"))
+        head.addWidget(label("The button names Kura shows. What each button does stays the same.", "faint", wrap=True))
+        bl.addLayout(head)
+        cards = QHBoxLayout()
+        cards.setSpacing(12)
+        self.pad_cards = {}
+        for key in PAD_LAYOUTS:
+            c = PadLayoutCard(key)
+            c.clicked.connect(lambda k=key: self.set_pad_layout(k))
+            cards.addWidget(c)
+            self.pad_cards[key] = c
+        cards.addStretch(1)
+        bl.addLayout(cards)
+        self.pad_select_row = QWidget()
+        sv = QVBoxLayout(self.pad_select_row)
+        sv.setContentsMargins(0, 8, 0, 0)
+        sv.setSpacing(0)
+        self.divider(sv)
+        self.pad_select = Segmented([("right", "A (right)"), ("bottom", "B (bottom)")], settings.get("pad_select", "right"))
+        self.pad_select.changed.connect(lambda v: (self.set("pad_select", v), self.fill_pad_guide()))
+        self.row(sv, "Select with", label("On a Switch, A (on the right) selects. Pick the bottom button to match Xbox "
+                                          "and PlayStation; Back is the other one.", "faint", wrap=True), self.pad_select)
+        bl.addWidget(self.pad_select_row)
+        self.divider(bl)
+        tv_open = Segmented([("ask", "Ask when one connects"), ("always", "Always"), ("manual", "Only when I choose")],
+                            settings.get("tv_mode_open", "ask"))
+        tv_open.changed.connect(lambda v: self.set("tv_mode_open", v))
+        self.row(bl, "Open TV mode", label("Full screen, made for the couch: your shows over their banner art, big "
+                                           "tabs (bumpers), the library as a big grid. Also in the Kura logo's menu. "
+                                           "Leave with the View button or Esc.", "faint", wrap=True), tv_open)
+        col.addWidget(box)
+        col.addSpacing(8)
+        gbox = card()
+        self.pad_guide = QGridLayout(gbox)
+        self.pad_guide.setContentsMargins(20, 14, 20, 16)
+        self.pad_guide.setHorizontalSpacing(18)
+        self.pad_guide.setVerticalSpacing(6)
+        col.addWidget(gbox)
+        self.set_pad_layout(settings.get("pad_layout", "xbox"), save=False)
+
+    def set_pad_layout(self, key, save=True):
+        if key not in PAD_LAYOUTS:
+            key = "xbox"
+        if save:
+            self.set("pad_layout", key)
+        for k, c in self.pad_cards.items():
+            c.set_selected(k == key)
+        self.pad_select_row.setVisible(key == "nintendo")
+        self.fill_pad_guide()
+
+    def fill_pad_guide(self):
+        """What each button does, with the user's button names (D-pad / sticks as words)."""
+        g = self.pad_guide
+        while g.count():
+            w = g.takeAt(0).widget()
+            if w:
+                w.hide()   # else it shows under the new guide until it's deleted
+                w.deleteLater()
+        sections = [
+            ("Around Kura", [(["D-pad / left stick"], "Move"), (["A"], "Select"), (["B"], "Back"),
+                             (["LB", "RB"], "Previous / next page"), (["Right stick"], "Scroll"),
+                             (["START"], "Right-click menu"), (["BACK"], "Search")]),
+            ("In the player", [(["A"], "Pause"), (["B"], "Leave fullscreen / close"), (["D-pad ← →"], "Skip"),
+                               (["LT", "RT"], "Screenshot / clip the last seconds"), (["D-pad ↑ ↓"], "Volume"),
+                               (["LB", "RB"], "Previous / next episode"), (["X"], "Subtitles"), (["Y"], "Fullscreen"),
+                               (["START", "BACK"], "More / Picture"), (["LS", "RS"], "Skip opening / long skip")])]
+        for c, (title, rows) in enumerate(sections):
+            g.addWidget(label(title, "h2"), 0, c * 2, 1, 2)
+            for r, (buttons, what) in enumerate(rows, 1):
+                cell = QWidget()
+                h = QHBoxLayout(cell)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.setSpacing(5)
+                for b in buttons:
+                    h.addWidget(PadGlyph(self.settings, b) if b in PAD_LAYOUTS["xbox"] else label(b, "chip"))
+                h.addStretch(1)
+                g.addWidget(cell, r, c * 2)
+                g.addWidget(label(what, "faint"), r, c * 2 + 1)
+        g.setColumnStretch(1, 1)
+        g.setColumnStretch(3, 1)
 
     def build_adult(self):
         col = self.sec_cols["adult"]
@@ -4584,7 +4657,9 @@ class SettingsPage(Page):
             if d.exec() != QDialog.Accepted:
                 return False
             salt = os.urandom(8).hex()
-            s["adult_pin"] = {"salt": salt, "hash": pin_hash(d.pin.text(), salt)}
+            # digits: the lock screen opens on its keypad (letters: on the keyboard)
+            s["adult_pin"] = {"salt": salt, "hash": pin_hash(d.pin.text(), salt), "digits": d.pin.text().isdigit()}
+            s.pop("lock_input", None)
             save_settings(s)
             return True
 
@@ -10517,6 +10592,8 @@ def frame_dialog(dlg):
     """Kura's look for a pop-up, as it's polished (before its window exists): frameless and see-through, the shadow +
     panel behind, the title bar on top; its own contents keep their layout, moved in by the frame's margins."""
     dlg.setProperty("kuraframe", True)
+    if dlg.testAttribute(Qt.WA_WState_Created):   # see-through only takes on a new native window (else: black margin)
+        dlg.destroy()
     dlg.setWindowFlags(dlg.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)   # (setWindowFlag(f): no-op)
     dlg.setAttribute(Qt.WA_TranslucentBackground)
     dlg.style().unpolish(dlg)
@@ -11121,6 +11198,8 @@ class ModeMenu(QFrame):
         line.setFixedHeight(1)
         line.setStyleSheet(f"background: {C['border']}; margin: 4px 4px;")
         v.addWidget(line)
+        if getattr(win, "tv", None) is not None:
+            v.addWidget(self.row("tv", "TV mode", win.tv.open_tv))
         if s.get("adult_enabled") and s.get("adult_lock") and getattr(win, "adult_unlocked", False):
             v.addWidget(self.row("lock", "Lock the hentai side now", win.lock_adult))
         if s.get("adult_enabled"):
@@ -11209,6 +11288,371 @@ class PinDialog(KuraDialog):
             ok, hint = True, "Looks good."
         self.ok.setEnabled(ok)
         self.hint.setText(hint)
+
+
+class PinKey(QAbstractButton):
+    """A round key on the lock screen's keypad: a digit, or a glyph (delete / unlock) with no ring."""
+
+    def __init__(self, text="", glyph=None, tip=""):
+        super().__init__()
+        self.setText(text)
+        self.glyph, self.lit = glyph, False
+        self.setFixedSize(68, 68)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAccessibleName(tip or text)
+        if tip:
+            self.setToolTip(tip)
+
+    def flash(self):
+        """Typed on the keyboard: light up like a click."""
+        self.lit = True
+        self.update()
+        QTimer.singleShot(120, lambda: (setattr(self, "lit", False), self.update()))
+
+    def enterEvent(self, e):
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        down, hov = self.isDown() or self.lit, self.underMouse()
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        if self.glyph is None:
+            p.setPen(QPen(QColor(C["border_hi"] if hov or down else C["border"]), 1))
+            p.setBrush(QColor("#2c3241" if down else C["hover"] if hov else C["surface2"]))
+            p.drawEllipse(r)
+            f = QFont("Segoe UI Variable Display")
+            f.setPixelSize(24)
+            f.setWeight(QFont.Medium)
+            p.setFont(f)
+            p.setPen(QColor(C["text"]))
+            p.drawText(self.rect(), Qt.AlignCenter, self.text())
+        else:
+            if hov or down:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor("#2c3241" if down else C["surface2"]))
+                p.drawEllipse(r)
+            pm = glyph_icon(self.glyph, C["text"] if hov or down else "#a3abbd", px=24).pixmap(24, 24)
+            p.drawPixmap((self.width() - 24) // 2, (self.height() - 24) // 2, pm)
+
+
+class PinDots(QWidget):
+    """The lock screen's PIN dots: one per character typed (at least 4); red rings when it was wrong."""
+
+    def __init__(self):
+        super().__init__()
+        self.n, self.status = 0, ""
+        self.setFixedHeight(22)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+    def set(self, n, status):
+        self.n, self.status = n, status
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        count, d, gap = max(4, self.n), 13, 14
+        x = (self.width() - (count * d + (count - 1) * gap)) / 2
+        col = QColor(C["bad"] if self.status == "wrong" else C["ok"] if self.status == "ok" else ADULT_ACCENT)
+        for i in range(count):
+            on = i < self.n or self.status == "wrong"
+            p.setPen(QPen(col if on else QColor("#4a5163"), 2))
+            p.setBrush(col if on and self.status != "wrong" else Qt.NoBrush)
+            p.drawEllipse(QRectF(x + i * (d + gap) + 1, (self.height() - d) / 2 + 1, d - 2, d - 2))
+
+
+class LockScreen(QWidget):
+    """The hentai side's lock (when it's on): Kura blurred behind, Keypad / Keyboard, Windows Hello, Back to Anime
+    (mockup D). Unlocks the moment the right PIN is typed. unlocked() / cancelled()."""
+    unlocked = Signal()
+    cancelled = Signal()
+    MSG = "Locked. Enter your PIN to continue."
+
+    def __init__(self, host, settings):
+        super().__init__(host)
+        self.settings = settings
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.backdrop, self.fade, self.pin, self.status, self.mode = None, None, "", "", "pad"
+        self.col = QWidget(self)
+        self.col.setFixedWidth(300)
+        self.col.setAttribute(Qt.WA_TranslucentBackground)
+        v = QVBoxLayout(self.col)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(16)
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
+        brand.addStretch(1)
+        name = QLabel("Kura")
+        name.setStyleSheet("font-family: 'Segoe UI Variable Display'; font-size: 19pt; font-weight: 600;"
+                           " background: transparent;")
+        tag = QLabel("HENTAI")
+        tag.setStyleSheet(f"color: white; background: {ADULT_ACCENT}; font-size: 7.5pt; font-weight: 700;"
+                          " letter-spacing: 1.4px; padding: 3px 8px; border-radius: 6px;")
+        brand.addWidget(name, 0, Qt.AlignVCenter)
+        brand.addWidget(tag, 0, Qt.AlignVCenter)
+        brand.addStretch(1)
+        v.addLayout(brand)
+        self.msg = QLabel(self.MSG)
+        self.msg.setAlignment(Qt.AlignCenter)
+        self.msg.setWordWrap(True)
+        v.addWidget(self.msg)
+        # Keypad / Keyboard
+        seg = QFrame()
+        seg.setObjectName("lockseg")
+        seg.setStyleSheet(f"QFrame#lockseg {{ background: rgba(29, 33, 42, 0.9); border: 1px solid {C['border']};"
+                          " border-radius: 11px; }"
+                          " QFrame#lockseg QPushButton { background: transparent; border: none; border-radius: 8px;"
+                          " padding: 0 14px; color: #a3abbd; }"
+                          f" QFrame#lockseg QPushButton:hover {{ color: {C['text']}; }}"
+                          " QFrame#lockseg QPushButton:checked { background: #2c3241; color: white; }")
+        sh = QHBoxLayout(seg)
+        sh.setContentsMargins(3, 3, 3, 3)
+        sh.setSpacing(2)
+        self.seg = {}
+        for key, glyph, text in (("pad", "dialpad", " Keypad"), ("keys", "keyboard", " Keyboard")):
+            b = QPushButton(text)
+            b.setIcon(glyph_icon(glyph, "#a3abbd", px=17))
+            b.setIconSize(QSize(17, 17))
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setFixedHeight(32)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _c=False, k=key: self.set_input(k, remember=True))
+            sh.addWidget(b)
+            self.seg[key] = b
+        v.addWidget(seg, 0, Qt.AlignHCenter)
+        # the keypad or the keyboard field: only one shown, so the column is as tall as what's in it
+        self.padw, self.keyw = QWidget(), QWidget()
+        for w in (self.padw, self.keyw):
+            w.setAttribute(Qt.WA_TranslucentBackground)
+            w.setStyleSheet("background: transparent;")
+        pv = QVBoxLayout(self.padw)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(16)
+        self.dots = PinDots()
+        pv.addWidget(self.dots)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(22)
+        grid.setVerticalSpacing(12)
+        self.keys = {k: PinKey(k) for k in "0123456789"}
+        self.keys["back"] = PinKey(glyph="backspace", tip="Delete")
+        self.keys["go"] = PinKey(glyph="arrow_forward", tip="Unlock")
+        for i, k in enumerate(list("123456789") + ["back", "0", "go"]):
+            grid.addWidget(self.keys[k], i // 3, i % 3, Qt.AlignCenter)
+            self.keys[k].clicked.connect(lambda _c=False, k=k: self.press(k))
+        pv.addLayout(grid)
+        kv = QVBoxLayout(self.keyw)
+        kv.setContentsMargins(0, 6, 0, 0)
+        kv.setSpacing(10)
+        hint = QLabel("Type your PIN, then Enter")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet(f"color: {C['muted']}; font-size: 9pt; background: transparent;")
+        kv.addWidget(hint)
+        self.field = QLineEdit()
+        self.field.setEchoMode(QLineEdit.Password)
+        self.field.setMaxLength(12)
+        self.field.setAlignment(Qt.AlignCenter)
+        self.field.setFixedHeight(48)
+        self.field.setAccessibleName("PIN")
+        self.field.setStyleSheet(f"QLineEdit {{ background: rgba(15, 17, 21, 0.9); border: 1px solid {C['border_hi']};"
+                                 " border-radius: 10px; font-size: 13pt; letter-spacing: 4px; }"
+                                 f" QLineEdit:focus {{ border-color: {ADULT_ACCENT}; }}")
+        self.field.textChanged.connect(self.typed)
+        self.field.returnPressed.connect(self.submit)
+        kv.addWidget(self.field)
+        go = QPushButton("Unlock")
+        go.setFixedHeight(42)
+        go.setCursor(Qt.PointingHandCursor)
+        go.setStyleSheet(f"QPushButton {{ background: {ADULT_ACCENT}; color: white; border: none; border-radius: 10px;"
+                         f" font-weight: 600; }} QPushButton:hover {{ background: {ADULT_ACCENT_HI}; }}")
+        go.clicked.connect(self.submit)
+        kv.addWidget(go)
+        v.addWidget(self.padw)
+        v.addWidget(self.keyw)
+        hello = QPushButton(" Use Windows Hello")
+        hello.setIcon(glyph_icon("fingerprint", C["text"]))
+        hello.setFixedHeight(42)
+        hello.setCursor(Qt.PointingHandCursor)
+        hello.setFocusPolicy(Qt.NoFocus)
+        hello.setStyleSheet(f"QPushButton {{ background: rgba(29, 33, 42, 0.85); border: 1px solid {C['border_hi']};"
+                            f" border-radius: 10px; }} QPushButton:hover {{ background: {C['hover']}; }}")
+        hello.clicked.connect(self.hello)
+        v.addWidget(hello)
+        back = QPushButton(" Back to Anime")
+        back.setIcon(glyph_icon("arrow_back", "#a3abbd", px=18))
+        back.setCursor(Qt.PointingHandCursor)
+        back.setFocusPolicy(Qt.NoFocus)
+        back.setStyleSheet("QPushButton { background: transparent; border: none; color: #a3abbd; padding: 8px 12px;"
+                           f" border-radius: 8px; }} QPushButton:hover {{ background: rgba(255, 255, 255, 0.05);"
+                           f" color: {C['text']}; }}")
+        back.clicked.connect(self.cancel)
+        v.addWidget(back, 0, Qt.AlignHCenter)
+        host.installEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.Resize and self.isVisible():
+            self.setGeometry(obj.rect())
+        return False
+
+    def secret(self):
+        return self.settings.get("adult_pin") or {}
+
+    def matches(self, text):
+        pin = self.secret()
+        return bool(text) and pin_hash(text, pin.get("salt", "")) == pin.get("hash")
+
+    def open(self):
+        host = self.parentWidget()
+        pm = host.grab()   # Kura behind, blurred: shrunk hard, drawn back up smoothly
+        self.backdrop = pm.scaled(max(1, pm.width() // 14), max(1, pm.height() // 14),
+                                  Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self.pin, self.status = "", ""
+        self.field.clear()
+        self.set_input(self.settings.get("lock_input") or ("pad" if self.secret().get("digits", True) else "keys"))
+        self.refresh()
+        self.setGeometry(host.rect())
+        self.place()
+        self.show()
+        self.raise_()
+        (self.field if self.mode == "keys" else self).setFocus()
+        eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(eff)
+        self.fade = QPropertyAnimation(eff, b"opacity", self)
+        self.fade.setDuration(150)
+        self.fade.setStartValue(0.0)
+        self.fade.setEndValue(1.0)
+        self.fade.finished.connect(lambda: self.setGraphicsEffect(None))
+        self.fade.start()
+
+    def pad_start(self):
+        """A controller's ring starts on the 1 key (Keyboard: the Keypad switch, a pad can't type letters)."""
+        w = self.keys["1"] if self.mode == "pad" else self.seg["pad"]
+        return w, w.rect()
+
+    def set_input(self, key, remember=False):
+        self.mode = key
+        self.seg[key].setChecked(True)
+        self.padw.setVisible(key == "pad")
+        self.keyw.setVisible(key == "keys")
+        if self.isVisible():
+            self.place()
+        if remember and self.settings.get("lock_input") != key:
+            self.settings["lock_input"] = key
+            save_settings(self.settings)
+        if key == "keys":
+            self.field.setText(self.pin)
+            self.field.setFocus()
+        else:
+            self.pin = self.field.text() if self.field.text().isdigit() else ""
+            self.setFocus()
+        self.refresh()
+
+    def press(self, k):
+        if self.status == "ok":
+            return
+        if k == "go":
+            return self.submit()
+        if k == "back":
+            self.pin = self.pin[:-1]
+        elif len(self.pin) < 12:
+            self.pin += k
+        self.status = ""
+        if self.matches(self.pin):
+            return self.success()
+        self.refresh()
+
+    def typed(self, text):
+        if self.status == "ok":
+            return
+        self.pin, self.status = text, ""
+        if self.matches(text):
+            return self.success()
+        self.refresh()
+
+    def submit(self):
+        text = self.field.text() if self.mode == "keys" else self.pin
+        if not text or self.status == "ok":
+            return
+        if self.matches(text):
+            return self.success()
+        self.pin, self.status = "", "wrong"
+        self.field.blockSignals(True)
+        self.field.clear()
+        self.field.blockSignals(False)
+        self.refresh()
+
+    def hello(self):
+        ok = windows_hello("Switch Kura to Hentai")
+        if ok:
+            self.success()
+        elif ok is None:
+            self.status = "nohello"
+            self.refresh()
+
+    def success(self):
+        self.status = "ok"
+        self.refresh()
+        QTimer.singleShot(180, lambda: (self.hide(), self.unlocked.emit()))
+
+    def cancel(self):
+        self.hide()
+        self.cancelled.emit()
+
+    def refresh(self):
+        self.dots.set(len(self.pin), self.status)
+        text, color = {"wrong": ("That PIN isn't right. Try again.", C["bad"]),
+                       "ok": ("Unlocked. Switching…", C["ok"]),
+                       "nohello": ("Windows Hello isn't set up on this PC. Use your PIN.", C["warn"])
+                       }.get(self.status, (self.MSG, "#a3abbd"))
+        self.msg.setText(text)
+        self.msg.setStyleSheet(f"color: {color}; font-size: 10pt; background: transparent;")
+
+    def keyPressEvent(self, e):
+        k, t = e.key(), e.text()
+        if k == Qt.Key_Escape:
+            return self.cancel()
+        if self.mode == "pad":
+            if t.isdigit() and len(t) == 1:
+                self.keys[t].flash()
+                return self.press(t)
+            if k == Qt.Key_Backspace:
+                self.keys["back"].flash()
+                return self.press("back")
+            if k in (Qt.Key_Return, Qt.Key_Enter):
+                self.keys["go"].flash()
+                return self.submit()
+            if len(t) == 1 and t.isprintable() and not t.isspace():   # a letter: this PIN needs the keyboard
+                self.set_input("keys", remember=True)
+                self.field.setText(self.pin + t)
+                return
+        super().keyPressEvent(e)
+
+    def place(self):
+        self.col.adjustSize()
+        self.col.move((self.width() - self.col.width()) // 2, max(0, (self.height() - self.col.height()) // 2))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.place()
+
+    def mousePressEvent(self, e):
+        e.accept()   # nothing behind it gets clicks
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if self.backdrop is not None:
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(self.rect(), self.backdrop)
+        p.fillRect(self.rect(), QColor(8, 9, 12, 184))
 
 
 def pin_hash(pin, salt):
@@ -16092,11 +16536,15 @@ class WheelDebounce(QObject):
         t = e.type()
         if t == QEvent.ToolTip:   # Settings → App → Hover hints off: no hover text (charts draw their own readouts)
             return not HOVER_HINTS["on"]
-        if t == QEvent.Polish and obj.isWidgetType() and obj.metaObject().className() == "QTipLabel":
-            # Qt's hover text is a small window of its own: see-through so the rounded style shows (a solid one
-            # has square corners) and without Windows' square drop shadow
+        if t == QEvent.Polish and (isinstance(obj, QMenu) or
+                                   obj.isWidgetType() and obj.metaObject().className() == "QTipLabel"):
+            # Qt's hover text and menus are small windows of their own: see-through so the rounded style shows (a solid one
+            # has square corners) and without Windows' square drop shadow; only a new native window takes it
+            if obj.testAttribute(Qt.WA_WState_Created):
+                obj.destroy()
             obj.setAttribute(Qt.WA_TranslucentBackground)
-            obj.setWindowFlags(obj.windowFlags() | Qt.NoDropShadowWindowHint)   # (setWindowFlag(f) alone: no-op)
+            # (setWindowFlag(f) alone: no-op; Windows makes it see-through only when it's marked frameless)
+            obj.setWindowFlags(obj.windowFlags() | Qt.NoDropShadowWindowHint | Qt.FramelessWindowHint)
             return False
         if t in (QEvent.Polish, QEvent.Resize, QEvent.WindowTitleChange) and obj.isWidgetType() and obj.isWindow():
             frame_event(obj, t)
@@ -19681,22 +20129,1521 @@ class KickoffPage(Page):
 
 # ---------------------------------------------------------------- controller
 
+# Controller button names per layout, by the XInput button at that spot (A = bottom, B = right, X = left, Y = top).
+# Only the names change; PlayStation's face buttons are shapes, drawn by paint_pad_glyph.
+PAD_LAYOUTS = {
+    "xbox": {"name": "Xbox", "A": "A", "B": "B", "X": "X", "Y": "Y", "LB": "LB", "RB": "RB", "LT": "LT", "RT": "RT",
+             "START": "Menu", "BACK": "View", "LS": "LS", "RS": "RS"},
+    "playstation": {"name": "PlayStation", "A": "cross", "B": "circle", "X": "square", "Y": "triangle", "LB": "L1",
+                    "RB": "R1", "LT": "L2", "RT": "R2", "START": "Options", "BACK": "Create", "LS": "L3", "RS": "R3"},
+    "nintendo": {"name": "Nintendo Switch", "A": "B", "B": "A", "X": "Y", "Y": "X", "LB": "L", "RB": "R", "LT": "ZL",
+                 "RT": "ZR", "START": "+", "BACK": "−", "LS": "LS", "RS": "RS"},
+}
+PAD_FACE = ("A", "B", "X", "Y")
+PAD_SHAPES = {"cross": "✕", "circle": "○", "square": "□", "triangle": "△"}
+
+
+def pad_swapped(settings):
+    """Switch layout with "A (right) selects": the right button selects and the bottom one goes back."""
+    return settings.get("pad_layout") == "nintendo" and settings.get("pad_select", "right") == "right"
+
+
+def pad_label(settings, button):
+    """The name of `button` (what it does: "A" = select, "B" = back, ...) on the user's controller."""
+    layout = PAD_LAYOUTS.get(settings.get("pad_layout"), PAD_LAYOUTS["xbox"])
+    if button in ("A", "B") and pad_swapped(settings):
+        button = "B" if button == "A" else "A"
+    return layout.get(button, button)
+
+
+def pad_text(settings, button):
+    """pad_label for plain text (notifications): shapes as ✕ ○ □ △."""
+    name = pad_label(settings, button)
+    return PAD_SHAPES.get(name, name)
+
+
+def pad_glyph_width(name, h, face):
+    if face:
+        return h
+    f = QFont()
+    f.setPixelSize(max(9, int(h * 0.48)))
+    f.setWeight(QFont.Bold)
+    return max(h, QFontMetrics(f).horizontalAdvance(name) + int(h * 0.7))
+
+
+def paint_pad_glyph(p, x, y, h, name, face, color=None):
+    """A button hint, never colored: a gray outline circle (face buttons; PlayStation's as shapes) or a rounded
+    box (shoulders, Menu...) with its name. Returns the width used."""
+    col = QColor(color or "#a3abbd")
+    w = pad_glyph_width(name, h, face)
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(col, 1.5))
+    p.setBrush(Qt.NoBrush)
+    r = QRectF(x + 0.75, y + 0.75, w - 1.5, h - 1.5)
+    if face:
+        p.drawEllipse(r)
+    else:
+        p.drawRoundedRect(r, h * 0.3, h * 0.3)
+    p.setPen(QPen(QColor(C["text"]), max(1.3, h / 15)))
+    c, s = r.center(), h * 0.2
+    if name == "cross":
+        p.drawLine(QPointF(c.x() - s, c.y() - s), QPointF(c.x() + s, c.y() + s))
+        p.drawLine(QPointF(c.x() + s, c.y() - s), QPointF(c.x() - s, c.y() + s))
+    elif name == "circle":
+        p.drawEllipse(c, s * 1.05, s * 1.05)
+    elif name == "square":
+        p.drawRect(QRectF(c.x() - s, c.y() - s, 2 * s, 2 * s))
+    elif name == "triangle":
+        p.drawPolygon(QPolygonF([QPointF(c.x(), c.y() - s * 1.15), QPointF(c.x() + s * 1.15, c.y() + s * 0.85),
+                                 QPointF(c.x() - s * 1.15, c.y() + s * 0.85)]))
+    else:
+        f = QFont()
+        f.setPixelSize(max(9, int(h * (0.5 if face else 0.48))))
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(QColor(C["text"]))
+        p.drawText(r, Qt.AlignCenter, name)
+    p.restore()
+    return w
+
+
+class PadGlyph(QWidget):
+    """One button hint (paint_pad_glyph) as a widget: `button` is what it does ("A" = select ...)."""
+
+    def __init__(self, settings, button, h=22):
+        super().__init__()
+        self.settings, self.button, self.h = settings, button, h
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.refresh()
+
+    def refresh(self):
+        name = pad_label(self.settings, self.button)
+        self.setFixedSize(pad_glyph_width(name, self.h, self.button in PAD_FACE), self.h)
+        self.setToolTip(pad_text(self.settings, self.button))
+        self.update()
+
+    def paintEvent(self, _):
+        paint_pad_glyph(QPainter(self), 0, 0, self.h, pad_label(self.settings, self.button), self.button in PAD_FACE)
+
+
+class PadLayoutCard(QWidget):
+    """Settings → Controller: one layout (Xbox / PlayStation / Switch) with its bumpers and face buttons where
+    they sit on the controller; the chosen one has an accent border."""
+    clicked = Signal()
+
+    def __init__(self, key):
+        super().__init__()
+        self.key, self.selected = key, False
+        self.setFixedSize(196, 172)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover)
+        self.setAccessibleName(PAD_LAYOUTS[key]["name"])
+
+    def set_selected(self, on):
+        self.selected = on
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+
+    def paintEvent(self, _):
+        lay = PAD_LAYOUTS[self.key]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        hov = self.underMouse()
+        p.setPen(QPen(QColor(C["accent"] if self.selected else C["border_hi"] if hov else C["border"]),
+                      2 if self.selected else 1))
+        p.setBrush(QColor(C["surface2"]))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 14, 14)
+        if self.selected:
+            pm = glyph_pixmap("check_circle", C["accent_hi"], 20, fill=True)
+            p.drawPixmap(self.width() - 30, 10, pm)
+        h = 22
+        widths = [pad_glyph_width(lay[b], h, False) for b in ("LB", "RB")]
+        x = (self.width() - sum(widths) - 8) / 2
+        for b, w in zip(("LB", "RB"), widths):
+            paint_pad_glyph(p, x, 16, h, lay[b], False)
+            x += w + 8
+        d, cx, cy = 32, self.width() / 2, 92
+        for b, (dx, dy) in {"Y": (0, -1), "X": (-1, 0), "B": (1, 0), "A": (0, 1)}.items():
+            paint_pad_glyph(p, cx + dx * 34 - d / 2, cy + dy * 30 - d / 2, d, lay[b], True)
+        f = QFont()
+        f.setPixelSize(13)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(C["text"]))
+        p.drawText(QRectF(0, self.height() - 34, self.width(), 24), Qt.AlignCenter, lay["name"])
+
+
+PAD_PANEL_QSS = (f"QFrame#padpanel {{ background: {C['surface']}; border: 1px solid {C['border_hi']}; border-radius: 20px; }}"
+                 f" QPushButton#padkey {{ background: {C['surface2']}; border: none; border-radius: 12px; color: {C['text']};"
+                 f" font-size: 14pt; min-height: 48px; padding: 0 10px; }}"
+                 f" QPushButton#padkey:hover {{ background: {C['hover']}; }} QPushButton#padkey:pressed {{ background: #2c3241; }}"
+                 f" QPushButton#padkey[accent=\"true\"] {{ background: {C['accent']}; color: white; font-size: 11pt;"
+                 " font-weight: 600; }")
+
+
+class PadKeyboard(QFrame):
+    """The on-screen keyboard for a controller (A on a text box): keys type into that box with real key presses, so
+    it reacts as if typed. X deletes, Y is a space, Menu = Enter (search), B closes. Docked at the bottom (the top
+    when the box is down there) of the window the box is in; the box keeps the focus, so a real keyboard works too."""
+    ROWS = ("1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm-.?")
+
+    def __init__(self, settings, on_close):
+        super().__init__()
+        self.settings, self.on_close, self.edit = settings, on_close, None
+        self.setObjectName("padpanel")
+        self.setStyleSheet(PAD_PANEL_QSS)
+        g = QGridLayout(self)
+        g.setContentsMargins(16, 16, 16, 16)
+        g.setSpacing(8)
+        for r, row in enumerate(self.ROWS):
+            for c, ch in enumerate(row):
+                g.addWidget(self.key(ch, lambda _=False, ch=ch: self.type(ch)), r, c)
+        r = len(self.ROWS)
+        g.addWidget(self.key("", self.delete, "backspace", "X", "Delete"), r, 0, 1, 2)
+        g.addWidget(self.key("Space", self.space, None, "Y"), r, 2, 1, 4)
+        g.addWidget(self.key("Clear", self.clear), r, 6, 1, 2)
+        go = self.key("Search", self.submit, None, "START")
+        go.setProperty("accent", True)
+        g.addWidget(go, r, 8, 1, 2)
+        self.glyphs = [w for w in self.findChildren(PadGlyph)]
+        self.hide()
+
+    def key(self, text, fn, glyph=None, button=None, tip=""):
+        b = QPushButton(text)
+        b.setObjectName("padkey")
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setAccessibleName(tip or text)
+        if glyph:
+            b.setIcon(glyph_icon(glyph, C["text"], C["text"], px=20))
+            b.setIconSize(QSize(20, 20))
+        if button:   # the controller button that does the same, at the right edge
+            h = QHBoxLayout(b)
+            h.setContentsMargins(0, 0, 10, 0)
+            h.addStretch(1)
+            pg = PadGlyph(self.settings, button, 20)
+            pg.setAttribute(Qt.WA_TransparentForMouseEvents)
+            h.addWidget(pg, 0, Qt.AlignVCenter)
+        b.clicked.connect(fn)
+        return b
+
+    def open_for(self, edit, host):
+        self.edit = edit
+        for pg in self.glyphs:
+            pg.refresh()   # the button layout may have changed
+        if self.parentWidget() is not host:
+            self.setParent(host)
+        host.removeEventFilter(self)
+        host.installEventFilter(self)
+        self.place()
+        self.show()
+        self.raise_()
+        edit.setFocus()
+        edit.end(False)
+
+    def place(self):
+        host = self.parentWidget()
+        w = min(820, host.width() - 32)
+        self.setFixedWidth(w)
+        self.adjustSize()
+        x, y = (host.width() - w) // 2, host.height() - self.height() - 16
+        try:
+            box = QRect(self.edit.mapTo(host, QPoint(0, 0)), self.edit.size())
+            if box.bottom() > y - 8:   # the box is down there: keyboard at the top instead
+                y = 16
+        except RuntimeError:
+            pass
+        self.move(x, max(0, y))
+
+    def eventFilter(self, obj, e):
+        if obj is self.parentWidget() and e.type() == QEvent.Resize and self.isVisible():
+            self.place()
+        return False
+
+    def alive(self):
+        try:
+            return self.edit is not None and self.edit.isVisible()
+        except RuntimeError:
+            return False
+
+    def send(self, key, text=""):
+        try:
+            for kind in (QEvent.KeyPress, QEvent.KeyRelease):
+                QApplication.sendEvent(self.edit, QKeyEvent(kind, key, Qt.NoModifier, text))
+        except RuntimeError:   # the box is gone (its page / dialog closed)
+            self.close_kb()
+
+    def type(self, ch):
+        self.send(ord(ch.upper()), ch)
+
+    def space(self):
+        self.send(Qt.Key_Space, " ")
+
+    def delete(self):
+        self.send(Qt.Key_Backspace)
+
+    def clear(self):
+        try:
+            self.edit.selectAll()
+        except RuntimeError:
+            return self.close_kb()
+        self.send(Qt.Key_Backspace)
+
+    def submit(self):
+        edit = self.edit
+        self.close_kb()
+        if edit is not None:
+            self.edit = edit
+            self.send(Qt.Key_Return)
+            self.edit = None
+
+    def close_kb(self):
+        edit, self.edit = self.edit, None
+        self.hide()
+        self.on_close(edit)
+
+
+class PadMenuPanel(QWidget):
+    """A right-click menu, opened with the controller's Menu button, as big rows in a panel on the right (approved
+    "controller menu"): the same QMenu and its actions, so every menu in Kura works without a copy. A picks, B goes
+    back (out of a submenu, then closes)."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack, self.title = [], ""
+        self.panel = QFrame(self)
+        self.panel.setObjectName("padmenu")
+        self.panel.setStyleSheet(
+            f"QFrame#padmenu {{ background: {C['surface']}; border-left: 1px solid {C['border_hi']}; }}"
+            f" QPushButton#padrow {{ text-align: left; background: transparent; border: none; border-radius: 14px;"
+            f" padding: 0 18px; min-height: 58px; color: {C['text']}; font-size: 12.5pt; }}"
+            f" QPushButton#padrow:hover {{ background: {C['hover']}; }}"
+            f" QPushButton#padrow:disabled {{ color: {C['faint']}; }}")
+        self.panel.setFixedWidth(440)
+        v = QVBoxLayout(self.panel)
+        v.setContentsMargins(24, 28, 24, 22)
+        v.setSpacing(4)
+        self.head = QLabel()
+        self.head.setWordWrap(True)
+        self.head.setStyleSheet("font-family: 'Segoe UI Variable Display'; font-size: 15pt; font-weight: 700;"
+                                " background: transparent;")
+        v.addWidget(self.head)
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background: {C['border']}; margin: 10px 0;")
+        v.addWidget(line)
+        self.rows = QVBoxLayout()
+        self.rows.setSpacing(2)
+        v.addLayout(self.rows)
+        v.addStretch(1)
+        self.foot = QHBoxLayout()
+        self.foot.setSpacing(18)
+        self.foot.addStretch(1)
+        v.addLayout(self.foot)
+        self.hide()
+
+    def open_menu(self, menu, title, host, settings):
+        self.settings = settings
+        self.stack = [menu]   # holding the QMenu keeps its actions alive until one is picked
+        self.title = (title or menu.title() or "Options").strip().splitlines()[0][:80]
+        if self.parentWidget() is not host:
+            self.setParent(host)
+        host.removeEventFilter(self)
+        host.installEventFilter(self)
+        while self.foot.count() > 1:
+            w = self.foot.takeAt(1).widget()
+            if w:
+                w.hide()
+                w.deleteLater()
+        for button, text in (("A", "Select"), ("B", "Back")):
+            cell = QWidget()
+            h = QHBoxLayout(cell)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(8)
+            h.addWidget(PadGlyph(settings, button))
+            h.addWidget(label(text, "muted"))
+            self.foot.addWidget(cell)
+        self.fill()
+        self.setGeometry(host.rect())
+        self.place()
+        self.show()
+        self.raise_()
+        self.setFocus()
+
+    def fill(self):
+        while self.rows.count():
+            w = self.rows.takeAt(0).widget()
+            if w:
+                w.hide()
+                w.deleteLater()
+        menu = self.stack[-1]
+        self.head.setText(self.title if len(self.stack) == 1 else f"{self.title}  ›  {menu.title().replace('&', '')}")
+        for act in menu.actions():
+            if act.isSeparator() or not act.isVisible() or not act.text():
+                continue
+            text = act.text().replace("&&", "\0").replace("&", "").replace("\0", "&")
+            b = QPushButton("  " + text.replace("&", "&&"))
+            b.setObjectName("padrow")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setEnabled(act.isEnabled())
+            if not act.icon().isNull():
+                b.setIcon(act.icon())
+                b.setIconSize(QSize(22, 22))
+            mark = "chevron_right" if act.menu() else ("check" if act.isCheckable() and act.isChecked() else None)
+            if mark:
+                h = QHBoxLayout(b)
+                h.setContentsMargins(0, 0, 14, 0)
+                h.addStretch(1)
+                h.addWidget(glyph_label(mark, C["muted"], 20))
+            b.clicked.connect(lambda _=False, a=act: self.choose(a))
+            self.rows.addWidget(b)
+
+    def choose(self, act):
+        if act.menu() is not None:
+            self.stack.append(act.menu())
+            return self.fill()
+        self.close_panel()
+        QTimer.singleShot(0, act.trigger)   # after the panel is gone (the action may open a dialog)
+
+    def back(self):
+        if len(self.stack) > 1:
+            self.stack.pop()
+            return self.fill()
+        self.close_panel()
+
+    def close_panel(self):
+        self.hide()
+        QTimer.singleShot(0, lambda: setattr(self, "stack", []))
+
+    def pad_start(self):
+        rows = [self.rows.itemAt(i).widget() for i in range(self.rows.count())]
+        rows = [b for b in rows if b is not None and b.isEnabled()]
+        return (rows[0], rows[0].rect()) if rows else None
+
+    def place(self):
+        self.panel.setGeometry(self.width() - self.panel.width(), 0, self.panel.width(), self.height())
+
+    def eventFilter(self, obj, e):
+        if obj is self.parentWidget() and e.type() == QEvent.Resize and self.isVisible():
+            self.setGeometry(obj.rect())
+            self.place()
+        return False
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.place()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            return self.back()
+        super().keyPressEvent(e)
+
+    def mousePressEvent(self, e):
+        if not self.panel.geometry().contains(e.position().toPoint()):
+            self.close_panel()
+
+    def paintEvent(self, _):
+        QPainter(self).fillRect(self.rect(), QColor(5, 6, 10, 150))
+
+
+# ---------------------------------------------------------------- TV mode (controller, full screen)
+# User's pick (Oct 30 2026, canvas Xx8WEUVoCgbQW7rDgrNwkk): the shelf + full backdrop (C) with A's LB / RB tab bar,
+# the Library tab as B's big grid with LT / RT filters, plain (never colored) button hints.
+TV_TABS = [("home", "Home"), ("library", "Library"), ("schedule", "Schedule"), ("live", "Live TV"), ("search", "Search")]
+TV_VIEWS = [("ALL", "All"), ("NEW", "New episodes"), ("WATCHING", "Watching"), ("NOTSTARTED", "Not started"),
+            ("FINISHED", "Finished")]
+
+
+def draw_cover_image(p, rect, img, radius):
+    """`img` (QImage / QPixmap) filling `rect`, cropped to keep its shape, with rounded corners."""
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(rect), radius, radius)
+    p.save()
+    p.setClipPath(path)
+    if img is None or img.isNull():
+        p.fillRect(rect, QColor(C["surface2"]))
+    else:
+        iw, ih = img.width(), img.height()
+        scale = max(rect.width() / iw, rect.height() / ih)
+        sw, sh = rect.width() / scale, rect.height() / scale
+        src = QRectF((iw - sw) / 2, (ih - sh) / 3, sw, sh)   # a little above center: faces are up there
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        if isinstance(img, QPixmap):
+            p.drawPixmap(QRectF(rect), img, src)
+        else:
+            p.drawImage(QRectF(rect), img, src)
+    p.restore()
+
+
+class TvCard(QAbstractButton):
+    """A TV mode card: "tile" (square, the shelf), "poster" (library / search), "episode" (16:9 frame), "wide"
+    (schedule, channels). Draws its own focus (a white ring), so the controller's ring stays hidden on it."""
+    pad_draws_focus = True
+
+    def __init__(self, tv, kind, title, sub="", key=None, img=None, badge="", done=False):
+        super().__init__()
+        self.tv, self.kind, self.title, self.sub, self.key, self.img = tv, kind, title, sub, key, img
+        self.pad_title = title   # the controller menu's heading
+        self.badge, self.done, self.focused, self.selected = badge, done, False, False
+        self.data = {}
+        s = tv.s
+        self.art = {"tile": QSize(int(96 * s), int(96 * s)), "poster": QSize(int(160 * s), int(228 * s)),
+                    "episode": QSize(int(212 * s), int(119 * s)), "wide": QSize(int(268 * s), int(151 * s))}[kind]
+        text_h = {"tile": 22, "poster": 44, "episode": 26, "wide": 46}[kind] * s
+        self.setFixedSize(self.art.width() + int(12 * s), self.art.height() + int(text_h + 14 * s))
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAccessibleName(title)
+
+    def pad_focused(self):
+        self.tv.card_focused(self)
+
+    def enterEvent(self, e):
+        self.tv.card_focused(self)
+        super().enterEvent(e)
+
+    def set_image(self, img):
+        self.img = img
+        self.update()
+
+    def paintEvent(self, _):
+        s = self.tv.s
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        m = int(6 * s)
+        r = QRect(m, m, self.art.width(), self.art.height())
+        rad = 16 * s if self.kind == "tile" else 11 * s
+        img = self.img if self.img is not None else self.tv.images.get(self.key)
+        draw_cover_image(p, r, img, rad)
+        if img is None or img.isNull():   # no art yet: the title's first letter
+            f = QFont("Segoe UI Variable Display")
+            f.setPixelSize(int(r.height() * 0.3))
+            f.setWeight(QFont.DemiBold)
+            p.setFont(f)
+            p.setPen(QColor(C["faint"]))
+            mark = self.title.split()[-1] if self.kind == "episode" else (self.title or "?")[:1].upper()
+            p.drawText(r, Qt.AlignCenter, mark)
+        if self.done and not self.focused:   # watched: dimmed, a check
+            p.fillRect(r, QColor(8, 9, 12, 110))
+        if self.done:
+            pm = glyph_pixmap("check_circle", "#ffffff", int(22 * s), fill=True)
+            p.drawPixmap(r.right() - pm.width() // pm.devicePixelRatio() - int(8 * s), r.top() + int(8 * s), pm)
+        if self.badge:
+            f = QFont()
+            f.setPixelSize(int(12 * s))
+            f.setWeight(QFont.Bold)
+            p.setFont(f)
+            w = QFontMetrics(f).horizontalAdvance(self.badge) + int(16 * s)
+            br = QRectF(r.right() - w - 8 * s, r.top() + 8 * s, w, 22 * s)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(10, 12, 16, 200))
+            p.drawRoundedRect(br, 7 * s, 7 * s)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(br, Qt.AlignCenter, self.badge)
+        if self.focused or (self.selected and self.kind == "tile"):
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(8, 9, 12, 230), 3 * s))
+            p.drawRoundedRect(QRectF(r).adjusted(-1.5 * s, -1.5 * s, 1.5 * s, 1.5 * s), rad + 1.5 * s, rad + 1.5 * s)
+            p.setPen(QPen(QColor("#ffffff" if self.focused else "#c2c8d6"), 3 * s))
+            p.drawRoundedRect(QRectF(r).adjusted(-4.5 * s, -4.5 * s, 4.5 * s, 4.5 * s), rad + 4.5 * s, rad + 4.5 * s)
+        if self.kind == "tile" and not (self.focused or self.selected):
+            return   # the shelf names only the chosen one
+        f = QFont()
+        f.setPixelSize(int((13 if self.kind == "tile" else 15) * s))
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        y = r.bottom() + int(10 * s)
+        p.setPen(QColor(C["text"] if (self.focused or self.kind != "poster") else "#c2c8d6"))
+        tr = QRect(0 if self.kind == "tile" else m, y, self.width() - (0 if self.kind == "tile" else m), fm.height())
+        p.drawText(tr, (Qt.AlignHCenter if self.kind == "tile" else Qt.AlignLeft) | Qt.AlignTop,
+                   fm.elidedText(self.title, Qt.ElideRight, tr.width()))
+        if self.sub and self.kind != "tile":
+            f.setPixelSize(int(13 * s))
+            f.setWeight(QFont.Normal)
+            p.setFont(f)
+            fm2 = QFontMetrics(f)
+            p.setPen(QColor("#a3abbd"))
+            p.drawText(QRect(m, y + fm.height() + int(2 * s), tr.width(), fm2.height()), Qt.AlignLeft | Qt.AlignTop,
+                       fm2.elidedText(self.sub, Qt.ElideRight, tr.width()))
+
+
+class TvMode(QWidget):
+    """Kura's TV mode: full screen over the window, made for a controller. Tabs (LB / RB): Home (the shelf of
+    what you're watching over its banner art), Library (big grid, LT / RT filters, X plays the next episode),
+    Schedule, Live TV and Search; a show's own view lists its episodes. View or Esc leaves."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win, self.settings = win, win.settings
+        self.s, self.images, self.tab, self.prev_tab = 1.0, {}, "home", "home"
+        self.view = "ALL"
+        self.home_items, self.home_index, self.focus_card = [], 0, None
+        self.show_ctx, self.backdrop, self.was_state = None, None, None
+        self.worker = None
+        self.trailer_box = self.trailer = None   # a trailer playing full screen (the Trailer button)
+        self.for_player = False   # hidden for Kura's player: back when it closes (close_player)
+        self.player_watch = QTimer(self, interval=700, timeout=self.check_player)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.hide()
+
+    # ---- size: built for 720 px of height, scaled to the screen
+    def px(self, n):
+        return int(n * self.s)
+
+    def font_css(self, size, weight=400, display=False):
+        fam = "'Segoe UI Variable Display'" if display else "'Segoe UI Variable Text'"
+        return f"font-family: {fam}; font-size: {self.px(size)}px; font-weight: {weight};"
+
+    # ---- in and out
+    def open_tv(self):
+        win = self.win
+        if self.isVisible():
+            return
+        self.was_state = win.windowState()
+        if getattr(win, "previews", None):
+            win.previews.close()
+        win.home.hero.stop_trailer()
+        win.showFullScreen()
+        self.setGeometry(win.rect())
+        win.installEventFilter(self)
+        self.build()
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self.go_tab("home")
+
+    def close_tv(self):
+        self.stop_trailer()
+        self.player_watch.stop()
+        self.hide()
+        self.win.removeEventFilter(self)
+        if self.was_state is not None and not (self.was_state & Qt.WindowFullScreen):
+            self.win.setWindowState(self.was_state)
+        pad = getattr(self.win, "pad", None)
+        if pad is not None:
+            pad.target = None
+
+    def eventFilter(self, obj, e):
+        if obj is self.win and e.type() == QEvent.Resize and self.isVisible():
+            self.setGeometry(self.win.rect())
+            if abs(self.scale_for() - self.s) > 0.05:
+                self.build()
+                self.go_tab(self.tab)
+        return False
+
+    def scale_for(self):
+        return max(1.0, min(self.win.width() / 1280, self.win.height() / 720))
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            return self.back() if (self.tab == "show" or self.trailer_playing()) else self.close_tv()
+        super().keyPressEvent(e)
+
+    # ---- the frame: tab bar, pages, button hints
+    def build(self):
+        old = self.layout()
+        if old is not None:   # a rebuild (another screen size): clear it all
+            QWidget().setLayout(old)
+            for w in self.findChildren(QWidget, options=Qt.FindDirectChildrenOnly):
+                w.hide()
+                w.deleteLater()
+        self.s = self.scale_for()
+        if self.worker is None:
+            self.worker = ThumbWorker()
+            self.worker.image.connect(self.on_image)
+            self.worker.start()
+            hero = getattr(self.win.home, "hero", None)
+            self.images.update(getattr(hero, "images", {}) or {})   # what Home already has
+        v = QVBoxLayout(self)
+        v.setContentsMargins(self.px(48), self.px(20), self.px(48), 0)
+        v.setSpacing(0)
+        bar = QHBoxLayout()
+        bar.setSpacing(self.px(8))
+        logo = QLabel("蔵")
+        logo.setFixedSize(self.px(36), self.px(36))
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setStyleSheet(f"background: {C['accent']}; color: white; border-radius: {self.px(10)}px;"
+                           f" {self.font_css(17, 700)}")
+        bar.addWidget(logo)
+        name = QLabel("Kura")
+        name.setStyleSheet(f"background: transparent; {self.font_css(21, 600, True)}")
+        bar.addWidget(name)
+        bar.addStretch(1)
+        self.lb = PadGlyph(self.settings, "LB", self.px(26))
+        bar.addWidget(self.lb)
+        self.tab_btns = {}
+        for key, text in TV_TABS:
+            b = QPushButton(text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, k=key: self.go_tab(k))
+            bar.addWidget(b)
+            self.tab_btns[key] = b
+        self.rb = PadGlyph(self.settings, "RB", self.px(26))
+        bar.addWidget(self.rb)
+        bar.addStretch(1)
+        leave = QPushButton(" Leave TV mode")
+        leave.setIcon(glyph_icon("close_fullscreen", "#c2c8d6", "#ffffff", px=self.px(18)))
+        leave.setIconSize(QSize(self.px(18), self.px(18)))
+        leave.setCursor(Qt.PointingHandCursor)
+        leave.setFocusPolicy(Qt.NoFocus)
+        leave.setFixedHeight(self.px(34))
+        leave.setStyleSheet(f"QPushButton {{ background: rgba(255,255,255,0.08); color: #c2c8d6; border: none;"
+                            f" border-radius: {self.px(16)}px; padding: 0 {self.px(14)}px; {self.font_css(13)} }}"
+                            " QPushButton:hover { background: rgba(255,255,255,0.16); color: white; }")
+        leave.clicked.connect(self.close_tv)
+        bar.addWidget(leave)
+        v.addLayout(bar)
+        self.stack = QStackedWidget()
+        self.stack.setStyleSheet("QStackedWidget, QStackedWidget > QWidget { background: transparent; }")
+        v.addWidget(self.stack, 1)
+        self.pages = {}
+        for key in ("home", "library", "schedule", "live", "search", "show"):
+            page = QWidget()
+            page.setAttribute(Qt.WA_TranslucentBackground)
+            self.pages[key] = page
+            self.stack.addWidget(page)
+        self.legend = QHBoxLayout()
+        self.legend.setContentsMargins(0, self.px(8), 0, self.px(14))
+        self.legend.setSpacing(self.px(24))
+        v.addLayout(self.legend)
+        self.style_tabs()
+
+    def style_tabs(self):
+        cur = self.prev_tab if self.tab == "show" else self.tab
+        for key, b in self.tab_btns.items():
+            on = key == cur
+            b.setFixedHeight(self.px(40))   # (a QSS radius over half the height draws square corners)
+            b.pad_radius = self.px(19)
+            b.setStyleSheet(f"QPushButton {{ background: {'#e7e9ef' if on else 'transparent'};"
+                            f" color: {'#0b0d12' if on else '#c2c8d6'}; border: none; border-radius: {self.px(19)}px;"
+                            f" padding: 0 {self.px(16)}px; {self.font_css(17, 600, True)} }}"
+                            + ("" if on else " QPushButton:hover { color: white; }"))
+
+    def set_legend(self, items):
+        lay = self.legend
+        while lay.count():
+            it = lay.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        lay.addStretch(1)
+        for buttons, text in items:
+            cell = QWidget()
+            h = QHBoxLayout(cell)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(self.px(7))
+            for b in buttons:
+                h.addWidget(PadGlyph(self.settings, b, self.px(24)))
+            t = QLabel(text)
+            t.setStyleSheet(f"background: transparent; color: #c2c8d6; {self.font_css(14)}")
+            h.addWidget(t)
+            lay.addWidget(cell)
+
+    def clear(self, page):
+        old = page.layout()
+        if old is not None:
+            QWidget().setLayout(old)   # the old layout and its widgets go with a throwaway parent
+        for w in page.findChildren(QWidget, options=Qt.FindDirectChildrenOnly):
+            w.hide()
+            w.deleteLater()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        return v
+
+    def scroller(self, inner, horizontal=False):
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sc.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff if horizontal else Qt.ScrollBarAsNeeded)
+        inner.setAttribute(Qt.WA_TranslucentBackground)
+        sc.setWidget(inner)
+        sc.viewport().setAutoFillBackground(False)
+        return sc
+
+    def text(self, s, size, weight=400, color=None, display=False):
+        l = QLabel(s)
+        l.setStyleSheet(f"background: transparent; color: {color or C['text']}; {self.font_css(size, weight, display)}")
+        return l
+
+    def pill(self, text, glyph, primary, fn):
+        b = QPushButton(f" {text}")
+        b.setIcon(glyph_icon(glyph, "#0b0d12" if primary else C["text"], "#0b0d12" if primary else C["text"],
+                             px=self.px(22)))
+        b.setIconSize(QSize(self.px(22), self.px(22)))
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setFixedHeight(self.px(50))
+        b.pad_radius = self.px(24)
+        b.setStyleSheet(f"QPushButton {{ background: {'#ffffff' if primary else 'rgba(255,255,255,0.13)'};"
+                        f" color: {'#0b0d12' if primary else C['text']}; border: none; border-radius: {self.px(24)}px;"
+                        f" padding: 0 {self.px(24)}px; {self.font_css(16, 600)} }}"
+                        f" QPushButton:hover {{ background: {'#e7e9ef' if primary else 'rgba(255,255,255,0.2)'}; }}")
+        b.clicked.connect(fn)
+        return b
+
+    def chip(self, text):
+        l = QLabel(text)
+        l.setFixedHeight(self.px(30))
+        l.setStyleSheet(f"background: rgba(255,255,255,0.12); color: #d6dae3; border-radius: {self.px(8)}px;"
+                        f" padding: 0 {self.px(10)}px; {self.font_css(14)}")
+        return l
+
+    # ---- tabs
+    def go_tab(self, key):
+        if key != "show":
+            self.prev_tab = key
+        self.tab = key
+        self.focus_card = None
+        getattr(self, f"fill_{key}")()
+        self.stack.setCurrentWidget(self.pages[key])
+        self.style_tabs()
+        if key not in ("home", "show"):
+            self.backdrop = None
+            self.update()
+        pad = getattr(self.win, "pad", None)
+        if pad is not None:
+            pad.target = None
+            QTimer.singleShot(60, lambda: pad.move("DPAD_DOWN") if self.isVisible() else None)
+        if key == "search" and pad is not None and pad.pads.available and not self.search.text():
+            QTimer.singleShot(120, lambda: pad.keyboard(self.search) if self.isVisible() else None)
+
+    def step_tab(self, step):
+        if self.trailer_playing():
+            return
+        keys = [k for k, _ in TV_TABS]
+        cur = self.prev_tab if self.tab == "show" else self.tab
+        self.go_tab(keys[(keys.index(cur) + step) % len(keys)])
+
+    def back(self):
+        if self.trailer_playing():
+            return self.stop_trailer()
+        if self.tab == "show":
+            self.go_tab(self.prev_tab)
+        elif self.tab != "home":
+            self.go_tab("home")
+
+    def pad_start(self):
+        """Controller: start on the chosen shelf tile (Home), else the first card, else the search box."""
+        if self.tab == "search":
+            return (self.search, self.search.rect())
+        if self.tab == "show" and getattr(self, "play_btn", None) is not None:
+            try:
+                return (self.play_btn, self.play_btn.rect())
+            except RuntimeError:
+                pass
+        cards = [c for c in self.pages[self.tab].findChildren(TvCard) if c.isVisible()]
+        sel = next((c for c in cards if c.selected), None) or (cards[0] if cards else None)
+        return (sel, sel.rect()) if sel else None
+
+    def card_focused(self, card):
+        """The controller (or the mouse) is on `card`: its ring; a shelf tile also becomes the chosen show."""
+        if self.focus_card is not None and self.focus_card is not card:
+            try:
+                self.focus_card.focused = False
+                self.focus_card.update()
+            except RuntimeError:
+                pass
+        self.focus_card = card
+        if card is None:
+            return
+        card.focused = True
+        card.update()
+        if card.kind == "tile" and self.tab == "home":
+            i = card.data.get("i", 0)
+            if i != self.home_index:
+                self.select_home(i)
+
+    def on_image(self, key, img):
+        self.images[key] = img
+        for c in self.findChildren(TvCard):
+            if c.key == key:
+                c.update()
+        if key == self.backdrop:
+            self.update()
+
+    def queue(self, jobs):
+        self.worker.queue([j for j in jobs if j[0] not in self.images])
+
+    def media(self, mid):
+        return self.win.home.media(mid) if mid else {}
+
+    def details(self, mid):
+        return self.win.home.details.get(mid) or (details_by_id().get(mid) or {})
+
+    def cover_job(self, mid, jobs, m=None):
+        m = m or self.media(mid)
+        url = ((self.details(mid).get("coverImage") or {}).get("extraLarge") or (m.get("coverImage") or {}).get("extraLarge"))
+        if not url:
+            return None
+        jobs.append((f"cover:{mid}", "url", (url, str(mid))))
+        return f"cover:{mid}"
+
+    def banner_job(self, mid, jobs, show=None):
+        own = self.win.home.custom_banner_for(show) if show else None
+        url = own or self.details(mid).get("bannerImage")
+        if not url:
+            return None
+        key = f"banner:{mid}" + (":own" if own else "")
+        jobs.insert(0, (key, "url", (url, f"banner_{mid}")))
+        return key
+
+    # ---- Home: the shelf over the chosen show's banner
+    def fill_home(self):
+        v = self.clear(self.pages["home"])
+        try:
+            model = self.win.home.collect()
+        except Exception:
+            model = {"continue": [], "spotlight": []}
+        self.home_items = [c for c in model["continue"][:12] + model.get("spotlight", []) if c.get("kind") != "discover"]
+        jobs = []
+        shelf = QHBoxLayout()
+        shelf.setContentsMargins(0, self.px(22), 0, 0)
+        shelf.setSpacing(self.px(10))
+        self.tiles = []
+        for i, c in enumerate(self.home_items):
+            m = self.media(c["mid"])
+            lit = self.win.library.items.get(c["show"])
+            cover = lit.data(COVER_ROLE) if lit is not None else None   # already loaded by the Library
+            t = TvCard(self, "tile", media_title(m) if m.get("title") else c["name"], img=cover,
+                       key=None if cover is not None else self.cover_job(c["mid"], jobs, m))
+            t.data = {"i": i}
+            t.clicked.connect(lambda _=False, c=c: self.play(c["path"]))
+            t.setContextMenuPolicy(Qt.CustomContextMenu)
+            t.customContextMenuRequested.connect(lambda pos, c=c, t=t: self.show_menu(c["show"], t.mapToGlobal(pos)))
+            shelf.addWidget(t, 0, Qt.AlignTop)
+            self.tiles.append(t)
+        shelf.addStretch(1)
+        v.addLayout(shelf)
+        if not self.home_items:
+            v.addSpacing(self.px(60))
+            v.addWidget(self.text("Nothing to continue yet", 34, 700, display=True))
+            v.addWidget(self.text("Shows you start watching show up here. The Library tab has everything you have.",
+                                  16, color="#c2c8d6"))
+            v.addStretch(1)
+            self.backdrop = None
+            self.queue(jobs)
+            self.set_legend([(["A"], "Select"), (["LB", "RB"], "Tabs"), (["BACK"], "Leave TV mode")])
+            return
+        self.home_info = QVBoxLayout()
+        self.home_info.setContentsMargins(0, self.px(26), 0, 0)
+        self.home_info.setSpacing(self.px(12))
+        v.addLayout(self.home_info)
+        v.addStretch(1)
+        self.home_eps = QHBoxLayout()
+        self.home_eps.setSpacing(self.px(14))
+        v.addWidget(self.text("Episodes", 17, 600))
+        v.addSpacing(self.px(8))
+        v.addLayout(self.home_eps)
+        self.queue(jobs)
+        self.home_index = -1
+        self.select_home(0)
+        self.set_legend([(["A"], "Play"), (["Y"], "Show"), (["START"], "More"), (["LB", "RB"], "Tabs"),
+                         (["BACK"], "Leave TV mode")])
+
+    def select_home(self, i):
+        """Shelf tile `i` is the chosen show: its banner behind everything, title, Play and its episodes."""
+        if not self.home_items:
+            return
+        i = max(0, min(i, len(self.home_items) - 1))
+        self.home_index = i
+        for n, t in enumerate(self.tiles):
+            t.selected = n == i
+            t.update()
+        c = self.home_items[i]
+        jobs = []
+        self.backdrop = self.banner_job(c["mid"], jobs, c["show"]) or self.cover_job(c["mid"], jobs)
+        self.fill_info(self.home_info, c, jobs, home=True)
+        self.fill_episodes(self.home_eps, c, jobs, limit=5)
+        self.queue(jobs)
+        self.update()
+
+    def fill_info(self, lay, c, jobs, home=False):
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+            elif it.layout() is not None:
+                QWidget().setLayout(it.layout())
+        m = self.media(c["mid"])
+        d = self.details(c["mid"])
+        name = media_title(m) if m.get("title") else c["name"]
+        title = self.text(name, 46, 700, display=True)
+        title.setWordWrap(True)
+        f = QFont("Segoe UI Variable Display")
+        f.setPixelSize(self.px(46))
+        f.setWeight(QFont.Bold)
+        box = QFontMetrics(f).boundingRect(QRect(0, 0, self.px(1000), 100000), Qt.TextWordWrap, name)
+        title.setFixedSize(box.width() + self.px(8), box.height() + self.px(6))   # long names: every line shows
+        lay.addWidget(title)
+        chips = QHBoxLayout()
+        chips.setSpacing(self.px(10))
+        try:
+            line = self.win.home.episode_line(c)
+        except Exception:
+            line = f"Episode {c.get('ep')}"
+        for t in [line, f"{d['averageScore']}%" if d.get("averageScore") else "", ", ".join((d.get("genres") or [])[:2])]:
+            if t:
+                chips.addWidget(self.chip(t))
+        chips.addStretch(1)
+        lay.addLayout(chips)
+        row = QHBoxLayout()
+        row.setSpacing(self.px(12))
+        verb = "Resume" if c.get("kind") == "resume" else f"Play episode {c['ep']}"
+        self.play_btn = self.pill(verb, "play_arrow", True, lambda: self.play(c["path"]))
+        row.addWidget(self.play_btn)
+        if home:
+            row.addWidget(self.pill("Episodes", "format_list_numbered", False, lambda: self.open_show(c["show"])))
+        tr = d.get("trailer") or m.get("trailer") or {}
+        if tr.get("site") in ("youtube", "dailymotion"):
+            row.addWidget(self.pill("Trailer", "movie", False, lambda: self.play_trailer(tr)))
+        if self.win.home.tracking() and self.win.account.entry(c["mid"]):
+            row.addWidget(self.pill(f"Mark episode {c['ep']} watched", "done_all", False,
+                                    lambda: self.mark_watched(c["mid"], c["ep"])))
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def fill_episodes(self, lay, c, jobs, limit=None):
+        """Episode cards of the show's season around the one you'd play (all of them on the show view)."""
+        while lay.count():
+            w = lay.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        it = self.win.library.items.get(c["show"])
+        idx = it.data(INDEX_ROLE) if it is not None else None
+        if not idx:
+            return
+        sid = idx["seasons"][c["season"] - 1] if c.get("season") and len(idx["seasons"]) >= c["season"] else c["mid"]
+        eps = idx["local"].get(sid) or {}
+        e = self.win.account.entry(sid) if self.win.home.tracking() else None
+        progress = (e or {}).get("progress") or 0
+        order = sorted(eps)
+        if limit:
+            at = order.index(c["ep"]) if c.get("ep") in order else 0
+            start = max(0, min(at - 1, len(order) - limit))
+            order = order[start:start + limit]
+        for n in order:
+            ec = {**c, "ep": n, "path": eps[n], "mid": sid, "kind": "next"}
+            key, ep_title = self.win.home.thumb_for(ec, jobs)
+            card = TvCard(self, "episode", f"Episode {n}", ep_title or "", key=key, done=n <= progress)
+            card.clicked.connect(lambda _=False, p=eps[n]: self.play(p))
+            card.setContextMenuPolicy(Qt.CustomContextMenu)
+            card.customContextMenuRequested.connect(
+                lambda pos, n=n, p=eps[n], card=card: self.episode_menu(sid, n, p, e is not None, card.mapToGlobal(pos)))
+            lay.addWidget(card, 0, Qt.AlignTop)
+        lay.addStretch(1)
+
+    # ---- a show's own view (from the Library, Search, Schedule)
+    def open_show(self, path):
+        it = self.win.library.items.get(path)
+        idx = it.data(INDEX_ROLE) if it is not None else None
+        if not idx:
+            return
+        _, _, _, nxt = show_state(idx, self.win.account)
+        seasons = [(n, sid) for n, sid in enumerate(idx["seasons"], 1) if sid and idx["local"].get(sid)]
+        if not seasons:
+            return
+        if nxt:
+            n, ep = nxt["season"], nxt["ep"]
+            sid = idx["seasons"][n - 1]
+            path_ep = nxt["path"]
+        else:
+            n, sid = seasons[0]
+            ep = min(idx["local"][sid])
+            path_ep = idx["local"][sid][ep]
+        self.show_ctx = {"show": path, "name": it.text(), "mid": sid, "season": n, "ep": ep, "path": path_ep,
+                         "kind": "next", "seasons": seasons}
+        self.go_tab("show")
+
+    def fill_show(self):
+        v = self.clear(self.pages["show"])
+        c = self.show_ctx
+        if not c:
+            return
+        jobs = []
+        self.backdrop = self.banner_job(c["mid"], jobs, c["show"]) or self.cover_job(c["mid"], jobs)
+        info = QVBoxLayout()
+        info.setContentsMargins(0, self.px(60), 0, 0)
+        info.setSpacing(self.px(12))
+        v.addLayout(info)
+        self.fill_info(info, c, jobs)
+        v.addStretch(1)
+        if len(c["seasons"]) > 1:
+            srow = QHBoxLayout()
+            srow.setSpacing(self.px(8))
+            for n, sid in c["seasons"]:
+                on = sid == c["mid"]
+                b = QPushButton(f"Season {n}")
+                b.setCursor(Qt.PointingHandCursor)
+                b.setFocusPolicy(Qt.NoFocus)
+                b.setFixedHeight(self.px(36))
+                b.pad_radius = self.px(17)
+                b.setStyleSheet(f"QPushButton {{ background: {'#e7e9ef' if on else 'rgba(255,255,255,0.1)'};"
+                                f" color: {'#0b0d12' if on else '#c2c8d6'}; border: none; border-radius: {self.px(17)}px;"
+                                f" padding: 0 {self.px(16)}px; {self.font_css(15, 600)} }}")
+                b.clicked.connect(lambda _=False, n=n, sid=sid: self.pick_season(n, sid))
+                srow.addWidget(b)
+            srow.addStretch(1)
+            v.addLayout(srow)
+            v.addSpacing(self.px(12))
+        strip = QWidget()
+        h = QHBoxLayout(strip)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(self.px(14))
+        self.fill_episodes(h, c, jobs)
+        v.addWidget(self.scroller(strip, horizontal=True))
+        self.queue(jobs)
+        self.update()
+        self.set_legend([(["A"], "Play"), (["B"], "Back"), (["START"], "More"), (["LB", "RB"], "Tabs"),
+                         (["BACK"], "Leave TV mode")])
+
+    def pick_season(self, n, sid):
+        eps = self.win.library.items[self.show_ctx["show"]].data(INDEX_ROLE)["local"].get(sid) or {}
+        if not eps:
+            return
+        e = self.win.account.entry(sid) if self.win.home.tracking() else None
+        nxt = ((e or {}).get("progress") or 0) + 1
+        ep = nxt if nxt in eps else min(eps)
+        self.show_ctx.update({"mid": sid, "season": n, "ep": ep, "path": eps[ep]})
+        self.go_tab("show")
+
+    # ---- marking watched, trailers
+    def episode_menu(self, mid, n, path, on_list, pos):
+        menu = QMenu(self)
+        menu.setTitle(f"Episode {n}")
+        menu.addAction(glyph_icon("play_arrow", C["text"]), "Play", lambda: self.play(path))
+        if on_list:
+            menu.addAction(glyph_icon("done_all", C["text"]), f"Mark watched up to episode {n}",
+                           lambda: self.mark_watched(mid, n))
+        menu.exec(pos)
+
+    def mark_watched(self, mid, ep):
+        """Your AniList progress to `ep` (like Home's ✓ button); the page shows it once the list has it."""
+        self.win.account.set_progress(mid, ep)
+        self.win.toast.show_text(f"Marked episode {ep} watched")
+        keep = self.home_index
+        QTimer.singleShot(900, lambda: self.refresh(keep))
+
+    def refresh(self, home_index=0):
+        if not self.isVisible() or self.trailer_playing():
+            return
+        if self.tab == "show" and self.show_ctx:
+            return self.open_show(self.show_ctx["show"])
+        self.go_tab(self.tab)
+        if self.tab == "home" and self.home_items:
+            self.select_home(min(home_index, len(self.home_items) - 1))
+
+    def trailer_playing(self):
+        return self.trailer_box is not None and self.trailer_box.isVisible()
+
+    def play_trailer(self, trailer):
+        """The show's trailer over the whole screen, with sound; B / Esc (or its end) comes back."""
+        if self.trailer_box is None:
+            self.trailer_box = QWidget(self)
+            self.trailer_box.setAttribute(Qt.WA_StyledBackground)
+            self.trailer_box.setStyleSheet("background: black;")
+            v = QVBoxLayout(self.trailer_box)
+            v.setContentsMargins(0, 0, 0, 0)
+            self.trailer = TrailerVideo(self.settings, self.trailer_box, loop=False)
+            self.trailer.ended.connect(self.stop_trailer)
+            self.trailer.failed.connect(self.trailer_failed)
+            v.addWidget(self.trailer, 1)
+            hint = QWidget(self.trailer_box)
+            h = QHBoxLayout(hint)
+            h.setContentsMargins(self.px(14), self.px(8), self.px(14), self.px(8))
+            h.setSpacing(self.px(8))
+            h.addWidget(PadGlyph(self.settings, "B", self.px(24)))
+            h.addWidget(self.text("Back", 14, color="#c2c8d6"))
+            hint.setStyleSheet(f"background: rgba(8,9,12,0.7); border-radius: {self.px(12)}px;")
+            self.trailer_hint = hint
+        self.trailer_box.setGeometry(self.rect())
+        self.trailer_hint.adjustSize()
+        self.trailer_hint.move(self.width() - self.trailer_hint.width() - self.px(32),
+                               self.height() - self.trailer_hint.height() - self.px(28))
+        self.trailer_box.show()
+        self.trailer_box.raise_()
+        self.trailer_hint.raise_()
+        pad = getattr(self.win, "pad", None)
+        if pad is not None and pad.ring is not None:
+            pad.ring.hide()
+        self.trailer_now = trailer
+        self.start_trailer("mpv" if trl.installed() else "web")
+
+    def start_trailer(self, engine):
+        """TV mode plays trailers with Kura's engine (yt-dlp finds the stream, mpv plays it: no YouTube buttons or
+        logo on the TV, whatever Settings → Trailers says); YouTube's own player only if that fails."""
+        self.trailer_engine = engine
+        APP["settings"]["_trailer_engine_once"] = engine
+        try:
+            self.trailer.play_trailer(self.trailer_now, False, self.settings.get("preview_volume", 60))
+        finally:
+            APP["settings"].pop("_trailer_engine_once", None)
+
+    def trailer_failed(self, *_):
+        if self.trailer_engine == "mpv" and self.trailer_playing():
+            return self.start_trailer("web")
+        self.stop_trailer()
+        self.win.toast.show_text("The trailer couldn't play")
+
+    def stop_trailer(self):
+        if self.trailer_box is None:
+            return
+        self.trailer.stop()
+        self.trailer_box.hide()
+        pad = getattr(self.win, "pad", None)
+        if pad is not None and self.isVisible():
+            pad.target = None
+            QTimer.singleShot(30, lambda: pad.move("DPAD_DOWN"))
+
+    # ---- Library: the big grid, LT / RT filters, X plays the next episode
+    def fill_library(self):
+        v = self.clear(self.pages["library"])
+        v.setContentsMargins(0, self.px(22), 0, 0)
+        head = QHBoxLayout()
+        head.setSpacing(self.px(10))
+        head.addWidget(PadGlyph(self.settings, "LT", self.px(26)))
+        self.view_btns = {}
+        lib = self.win.library
+        for key, text in TV_VIEWS:
+            n = sum(1 for it in lib.items.values() if self.view_match(key, it))
+            b = QPushButton(f"{text} · {n}" if key != "ALL" else text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, k=key: self.set_view(k))
+            head.addWidget(b)
+            self.view_btns[key] = b
+        head.addWidget(PadGlyph(self.settings, "RT", self.px(26)))
+        head.addStretch(1)
+        v.addLayout(head)
+        v.addSpacing(self.px(18))
+        inner = QWidget()
+        self.lib_grid = QGridLayout(inner)
+        self.lib_grid.setContentsMargins(0, self.px(8), 0, self.px(20))
+        self.lib_grid.setHorizontalSpacing(self.px(18))
+        self.lib_grid.setVerticalSpacing(self.px(18))
+        v.addWidget(self.scroller(inner), 1)
+        self.fill_grid()
+        self.set_legend([(["A"], "Open"), (["X"], "Play next"), (["START"], "More"), (["LT", "RT"], "Filter"),
+                         (["LB", "RB"], "Tabs"), (["BACK"], "Leave TV mode")])
+
+    def view_match(self, view, it):
+        if view == "WATCHING":
+            return it.data(STATUS_ROLE) in ("CURRENT", "REPEATING")
+        return lib_view_match(view, it.data)
+
+    def set_view(self, key):
+        self.view = key
+        self.fill_grid()
+        pad = getattr(self.win, "pad", None)
+        if pad is not None:
+            pad.target = None
+            QTimer.singleShot(30, lambda: pad.move("DPAD_DOWN"))
+
+    def step_filter(self, step):
+        if self.tab != "library" or self.trailer_playing():
+            return
+        keys = [k for k, _ in TV_VIEWS]
+        self.set_view(keys[(keys.index(self.view) + step) % len(keys)])
+
+    def fill_grid(self):
+        for key, b in self.view_btns.items():
+            on = key == self.view
+            b.setFixedHeight(self.px(40))
+            b.pad_radius = self.px(19)
+            b.setStyleSheet(f"QPushButton {{ background: {'#e7e9ef' if on else 'rgba(255,255,255,0.08)'};"
+                            f" color: {'#0b0d12' if on else '#c2c8d6'}; border: none; border-radius: {self.px(19)}px;"
+                            f" padding: 0 {self.px(18)}px; {self.font_css(15, 600)} }}")
+        g = self.lib_grid
+        while g.count():
+            w = g.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        lib = self.win.library
+        shows = [(p, it) for p, it in lib.items.items() if self.view_match(self.view, it)]
+        shows.sort(key=lambda x: -(x[1].data(ADDED_ROLE) or 0))   # recently added first, like the Library
+        cols = max(3, (self.width() - self.px(96)) // self.px(190))
+        for i, (path, it) in enumerate(shows):
+            g.addWidget(self.poster(path, it), i // cols, i % cols, Qt.AlignTop | Qt.AlignLeft)
+        if not shows:
+            g.addWidget(self.text("Nothing here", 18, color="#a3abbd"), 0, 0)
+        g.setRowStretch(len(shows) // cols + 1, 1)
+
+    def poster(self, path, it):
+        new = it.data(NEW_ROLE) or 0
+        card = TvCard(self, "poster", it.text(), str(it.data(SUB_ROLE) or ""), img=it.data(COVER_ROLE),
+                      badge=f"{new} new" if new else "")
+        card.data = {"show": path}
+        card.clicked.connect(lambda _=False, p=path: self.open_show(p))
+        card.setContextMenuPolicy(Qt.CustomContextMenu)
+        card.customContextMenuRequested.connect(lambda pos, p=path, c=card: self.show_menu(p, c.mapToGlobal(pos)))
+        return card
+
+    def play_next_of(self, path):
+        it = self.win.library.items.get(path)
+        idx = it.data(INDEX_ROLE) if it is not None else None
+        if not idx:
+            return
+        _, _, _, nxt = show_state(idx, self.win.account)
+        if nxt:
+            return self.play(nxt["path"])
+        sid = next((s for s in idx["seasons"] if s and idx["local"].get(s)), None)
+        if sid:
+            eps = idx["local"][sid]
+            self.play(eps[min(eps)])
+
+    def pad_x(self):
+        """X: play the next episode of the show the controller is on (Library / Search)."""
+        card = self.focus_card
+        if card is not None and card.data.get("show"):
+            self.play_next_of(card.data["show"])
+
+    def show_menu(self, path, pos):
+        """Right-click (the controller's Menu button: the big panel) on a show."""
+        menu = QMenu(self)
+        menu.addAction(glyph_icon("play_arrow", C["text"]), "Play next episode", lambda: self.play_next_of(path))
+        menu.addAction(glyph_icon("format_list_numbered", C["text"]), "Episodes", lambda: self.open_show(path))
+        menu.addAction(glyph_icon("open_in_new", C["text"]), "Show page (leaves TV mode)",
+                       lambda: (self.close_tv(), self.win.show_details(path, None)))
+        menu.exec(pos)
+
+    # ---- Schedule: this week's next episodes of what you're watching
+    def fill_schedule(self):
+        v = self.clear(self.pages["schedule"])
+        v.setContentsMargins(0, self.px(30), 0, 0)
+        v.addWidget(self.text("Airing this week", 26, 700, display=True))
+        v.addSpacing(self.px(16))
+        try:
+            airing = self.win.home.collect()["airing"]
+        except Exception:
+            airing = []
+        inner = QWidget()
+        g = QGridLayout(inner)
+        g.setContentsMargins(0, 0, 0, self.px(20))
+        g.setHorizontalSpacing(self.px(18))
+        g.setVerticalSpacing(self.px(18))
+        jobs = []
+        cols = max(2, (self.width() - self.px(96)) // self.px(300))
+        for i, (at, mid, m, ep) in enumerate(airing):
+            when = datetime.fromtimestamp(at)
+            sub = f"Episode {ep} · {when.strftime('%A')} {when.strftime('%I:%M %p').lstrip('0')}"
+            path = self.win.library.path_for_media(mid)
+            card = TvCard(self, "wide", media_title(m), sub, key=self.banner_job(mid, jobs) or self.cover_job(mid, jobs, m))
+            card.data = {"show": path} if path else {}
+            if path:
+                card.clicked.connect(lambda _=False, p=path: self.open_show(p))
+            g.addWidget(card, i // cols, i % cols, Qt.AlignTop | Qt.AlignLeft)
+        if not airing:
+            g.addWidget(self.text("Nothing you're watching airs this week.", 18, color="#a3abbd"), 0, 0)
+        g.setRowStretch(len(airing) // cols + 1, 1)
+        v.addWidget(self.scroller(inner), 1)
+        self.queue(jobs)
+        self.set_legend([(["A"], "Episodes"), (["B"], "Home"), (["LB", "RB"], "Tabs"), (["BACK"], "Leave TV mode")])
+
+    # ---- Live TV: the channels and what's on now
+    def fill_live(self):
+        v = self.clear(self.pages["live"])
+        v.setContentsMargins(0, self.px(30), 0, 0)
+        v.addWidget(self.text("Live TV", 26, 700, display=True))
+        v.addSpacing(self.px(16))
+        page = getattr(self.win, "livetv", None)
+        tv = getattr(page, "tv", None)
+        chans = tv.channels() if tv is not None else []
+        inner = QWidget()
+        g = QGridLayout(inner)
+        g.setContentsMargins(0, 0, 0, self.px(20))
+        g.setHorizontalSpacing(self.px(18))
+        g.setVerticalSpacing(self.px(18))
+        jobs = []
+        cols = max(2, (self.width() - self.px(96)) // self.px(300))
+        for i, ch in enumerate(chans):
+            prog, _ = tv.on_at(ch["id"])
+            mid = (prog or {}).get("mid")
+            now = (prog or {}).get("title") or "Nothing on"
+            if prog and prog.get("ep"):
+                now += f" · Episode {prog['ep']}"
+            card = TvCard(self, "wide", ch.get("name", "Channel"), now,
+                          key=(self.banner_job(mid, jobs) or self.cover_job(mid, jobs)) if mid else None)
+            card.clicked.connect(lambda _=False, cid=ch["id"]: self.watch(cid))
+            g.addWidget(card, i // cols, i % cols, Qt.AlignTop | Qt.AlignLeft)
+        if not chans:
+            g.addWidget(self.text("No channels today. Live TV makes them from your library (the Live TV page).", 18,
+                                  color="#a3abbd"), 0, 0)
+        g.setRowStretch(len(chans) // cols + 1, 1)
+        v.addWidget(self.scroller(inner), 1)
+        self.queue(jobs)
+        self.set_legend([(["A"], "Watch"), (["B"], "Home"), (["LB", "RB"], "Tabs"), (["BACK"], "Leave TV mode")])
+
+    # ---- Search: the box (A: the on-screen keyboard) and your shows that match
+    def fill_search(self):
+        v = self.clear(self.pages["search"])
+        v.setContentsMargins(0, self.px(28), 0, 0)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search your library")
+        self.search.setFixedHeight(self.px(60))
+        self.search.pad_radius = self.px(29)
+        self.search.setStyleSheet(f"QLineEdit {{ background: {C['surface']}; border: 2px solid {C['border_hi']};"
+                                  f" border-radius: {self.px(29)}px; padding: 0 {self.px(24)}px; color: {C['text']};"
+                                  f" {self.font_css(22, 500)} }} QLineEdit:focus {{ border-color: {C['accent']}; }}")
+        self.search.textChanged.connect(self.fill_results)
+        v.addWidget(self.search)
+        v.addSpacing(self.px(20))
+        inner = QWidget()
+        self.res_grid = QGridLayout(inner)
+        self.res_grid.setContentsMargins(0, self.px(8), 0, self.px(20))
+        self.res_grid.setHorizontalSpacing(self.px(18))
+        self.res_grid.setVerticalSpacing(self.px(18))
+        v.addWidget(self.scroller(inner), 1)
+        self.fill_results("")
+        self.set_legend([(["A"], "Type / open"), (["X"], "Play next"), (["B"], "Home"), (["LB", "RB"], "Tabs"),
+                         (["BACK"], "Leave TV mode")])
+
+    def fill_results(self, text):
+        g = self.res_grid
+        while g.count():
+            w = g.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        q = text.strip().lower()
+        if not q:
+            g.addWidget(self.text("Type a show's name.", 18, color="#a3abbd"), 0, 0)
+            return
+        lib = self.win.library
+        hits = [(p, it) for p, it in lib.items.items()
+                if q in it.text().lower() or q in str(it.data(Qt.ToolTipRole) or "").lower()][:24]
+        cols = max(3, (self.width() - self.px(96)) // self.px(190))
+        for i, (path, it) in enumerate(hits):
+            g.addWidget(self.poster(path, it), i // cols, i % cols, Qt.AlignTop | Qt.AlignLeft)
+        if not hits:
+            g.addWidget(self.text("Nothing in your library matches.", 18, color="#a3abbd"), 0, 0)
+        g.setRowStretch(len(hits) // cols + 1, 1)
+
+    # ---- playing: Kura's player in front, TV mode back when it closes
+    def play(self, path):
+        if not path:
+            return
+        self.hide()
+        self.win.play(path)
+        if self.win.player is None or not self.win.player.isVisible():
+            self.show()   # another app plays it (Settings → Player)
+            return
+        self.for_player = True
+        self.win.player.set_tv(True)   # its TV-sized controls (player.TvLayer)
+        self.player_watch.start()
+
+    def watch(self, cid):
+        self.hide()
+        self.win.watch_live(cid)
+        if self.win.player is None:
+            self.show()
+            return
+        self.for_player = True
+        self.win.player.set_tv(True)   # the TV-sized controls for a channel too
+        self.player_watch.start()
+
+    def check_player(self):
+        pl = self.win.player
+        if pl is not None and pl.isVisible():
+            return
+        self.back_from_player()
+
+    def back_from_player(self):
+        """The player closed: TV mode again at once, fading in over it (no window jump: close_player keeps the
+        window full screen for us), on the same tab and show, refreshed (the episode you finished is watched)."""
+        self.player_watch.stop()
+        if not getattr(self, "for_player", False):
+            return
+        self.for_player = False
+        if not self.win.isFullScreen():
+            self.win.showFullScreen()
+        self.setGeometry(self.win.rect())
+        keep = self.home_index
+        self.show()
+        self.raise_()
+        eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(eff)
+        self.fade_in = QPropertyAnimation(eff, b"opacity", self)
+        self.fade_in.setDuration(220)
+        self.fade_in.setStartValue(0.0)
+        self.fade_in.setEndValue(1.0)
+        self.fade_in.finished.connect(lambda: self.setGraphicsEffect(None))
+        self.fade_in.start()
+        QTimer.singleShot(400, lambda: self.refresh(keep))   # after the player saved where you stopped
+
+    # ---- the backdrop: the chosen show's banner across the whole screen, dimmed
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#0b0d12"))
+        img = self.images.get(self.backdrop) if self.backdrop else None
+        if img is not None and not img.isNull():
+            if self.backdrop.startswith("cover:"):   # a poster, not wide art: soft, so it doesn't look blocky
+                small = img.scaled(max(1, img.width() // 12), max(1, img.height() // 12), Qt.IgnoreAspectRatio,
+                                   Qt.SmoothTransformation)
+                draw_cover_image(p, self.rect(), small, 0)
+            else:
+                draw_cover_image(p, self.rect(), img, 0)
+            p.fillRect(self.rect(), QColor(8, 9, 12, 140))
+            g = QLinearGradient(0, self.height() * 0.45, 0, self.height())
+            g.setColorAt(0, QColor(8, 9, 12, 0))
+            g.setColorAt(1, QColor(8, 9, 12, 235))
+            p.fillRect(self.rect(), g)
+        g = QLinearGradient(0, 0, 0, self.px(90))   # the tab bar stays readable
+        g.setColorAt(0, QColor(8, 9, 12, 170))
+        g.setColorAt(1, QColor(8, 9, 12, 0))
+        p.fillRect(QRect(0, 0, self.width(), self.px(90)), g)
+
+
 class PadRing(QWidget):
     """The highlight around what the controller is on."""
+
+    MARGIN = 5   # how far it sits outside what it's on
 
     def __init__(self, parent):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_NoSystemBackground)
+        self.radius, self.tv = None, False
         self.hide()
+
+    def set_shape(self, radius, tv):
+        """`radius`: the corners of what it's on (`pad_radius`; a pill = half its height), None = 12 px.
+        `tv`: TV mode's look, white with a dark gap like its cards."""
+        if (radius, tv) != (self.radius, self.tv):
+            self.radius, self.tv = radius, tv
+            self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        m = self.MARGIN
+        if self.tv:
+            inner = self.radius if self.radius is not None else 10
+            p.setPen(QPen(QColor(8, 9, 12, 230), 3))
+            r = QRectF(self.rect()).adjusted(m - 1.5, m - 1.5, -(m - 1.5), -(m - 1.5))
+            p.drawRoundedRect(r, inner + 1.5, inner + 1.5)
+            p.setPen(QPen(QColor("#ffffff"), 3))
+            r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+            p.drawRoundedRect(r, inner + m - 1.5, inner + m - 1.5)
+            return
         r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
         p.setPen(QPen(QColor(C["accent"]).lighter(130), 3))
         p.setBrush(accent_color(28))
-        p.drawRoundedRect(r, 12, 12)
+        rad = 12 if self.radius is None else self.radius + m - 2
+        p.drawRoundedRect(r, rad, rad)
 
 
 class PadNavigator(QObject):
@@ -19715,6 +21662,8 @@ class PadNavigator(QObject):
         self.ring = None
         self.mouse_at = None
         self.greeted = False
+        self.kb = self.menu_panel = None   # the on-screen keyboard and the big menu, made when first needed
+        self.menu_armed = None             # the Menu button asked for a right-click menu: its title (see eventFilter)
         self.timer = QTimer(self, interval=16, timeout=self.tick)
         if self.pads.available:
             self.timer.start()
@@ -19733,9 +21682,23 @@ class PadNavigator(QObject):
         ev = self.pads.poll()
         if ev["pads"] and not self.greeted:
             self.greeted = True
-            self.win.notify("Controller connected: the d-pad moves, A selects, B goes back")
+            s = self.win.settings
+            how = s.get("tv_mode_open", "ask")
+            tv = getattr(self.win, "tv", None)
+            if how == "always" and tv is not None:
+                QTimer.singleShot(0, tv.open_tv)
+            elif how == "ask" and tv is not None and not tv.isVisible() and not tv.for_player:
+                self.win.toast.show_action(f"Controller connected. TV mode is made for it ({pad_text(s, 'A')} selects, "
+                                           f"{pad_text(s, 'B')} goes back).", "TV mode", tv.open_tv)
+            else:
+                self.win.notify(f"Controller connected: the d-pad moves, {pad_text(s, 'A')} selects, "
+                                f"{pad_text(s, 'B')} goes back")
         if not ev["any"]:
             return
+        if pad_swapped(self.win.settings):   # Switch, "A (right) selects": the right button selects, bottom = back
+            swap = {"A": "B", "B": "A"}
+            ev["pressed"] = [swap.get(n, n) for n in ev["pressed"]]
+            ev["repeat"] = [swap.get(n, n) for n in ev["repeat"]]
         pl = self.win.player
         if pl is not None and pl.isVisible() and active is pl.window():
             for name in ev["pressed"] + ev["repeat"]:
@@ -19748,6 +21711,18 @@ class PadNavigator(QObject):
             self.scroll(sx, sy)
 
     def eventFilter(self, obj, e):
+        if e.type() == QEvent.Show and self.menu_armed is not None and isinstance(obj, QMenu):
+            # the menu the Menu button asked for: shown as big rows in a panel instead (its actions, same menu)
+            title, self.menu_armed = self.menu_armed, None
+            obj.setWindowOpacity(0.0)
+            QTimer.singleShot(0, obj.close)
+            if self.menu_panel is None:
+                self.menu_panel = PadMenuPanel()
+            self.menu_panel.open_menu(obj, title, self.host_for(self.target[0] if self.target else self.win),
+                                      self.win.settings)
+            self.target = None
+            QTimer.singleShot(30, lambda: self.move("DPAD_DOWN"))
+            return False
         if e.type() == QEvent.MouseMove and self.ring is not None and self.ring.isVisible():
             pos = e.globalPosition().toPoint()
             if self.mouse_at is None:
@@ -19759,12 +21734,33 @@ class PadNavigator(QObject):
         return False
 
     # ---- what's on screen
+    @staticmethod
+    def key_popup():
+        """An open right-click menu / combo list: those take arrow keys. Kura's own popups (the logo menu) don't,
+        so the ring moves inside them like a page."""
+        pop = QApplication.activePopupWidget()
+        if pop is not None and (isinstance(pop, QMenu) or pop.inherits("QComboBoxPrivateContainer")):
+            return pop
+        return None
+
     def root(self):
         """Where the ring may go: an open dialog / menu / overlay, else Kura's window."""
+        pop = QApplication.activePopupWidget()
+        if pop is not None:
+            return pop
+        if self.kb is not None and self.kb.isVisible() and not self.kb.alive():
+            self.kb.close_kb()   # its box went away (search closed, the dialog was answered)
+        for w in (self.menu_panel, self.kb):
+            if w is not None and w.isVisible():
+                return w
         modal = QApplication.activeModalWidget()
         if modal is not None:
             return modal
-        for w in (getattr(self.win, "palette", None), getattr(self.win, "close_overlay", None)):
+        tv = getattr(self.win, "tv", None)
+        if tv is not None and tv.isVisible() and tv.trailer_playing():
+            return tv.trailer_box   # (nothing to move to: B comes back)
+        for w in (tv, getattr(self.win, "palette", None),
+                  getattr(self.win, "close_overlay", None), getattr(self.win, "lock_screen", None)):
             if w is not None and w.isVisible():
                 return w
         return self.win.centralWidget()
@@ -19790,7 +21786,36 @@ class PadNavigator(QObject):
                 out += [(w, r) for r in w.pad_rects()]
             elif isinstance(w, (QAbstractButton, QComboBox, QSlider)) or isinstance(getattr(type(w), "clicked", None), Signal):
                 out.append((w, w.rect()))
+            elif isinstance(w, QLineEdit) and not w.isReadOnly() and not isinstance(w.parentWidget(), QAbstractSpinBox):
+                out.append((w, w.rect()))   # A opens the on-screen keyboard
         return out
+
+    def host_for(self, w):
+        """Where an overlay goes for `w`: Kura's window (its content area) or the dialog it's in."""
+        try:
+            win = w.window()
+        except RuntimeError:
+            win = self.win
+        tv = getattr(self.win, "tv", None)
+        if win is self.win and tv is not None and tv.isVisible():
+            return tv
+        return self.win.centralWidget() if win is self.win else win
+
+    def keyboard(self, edit):
+        if self.kb is None:
+            self.kb = PadKeyboard(self.win.settings, self.keyboard_closed)
+        self.kb.open_for(edit, self.host_for(edit))
+        self.target = None
+        QTimer.singleShot(0, lambda: self.move("DPAD_DOWN"))
+
+    def keyboard_closed(self, edit):
+        self.target = None
+        try:
+            if edit is not None and edit.isVisible():
+                self.target = (edit, edit.rect())
+                QTimer.singleShot(0, self.show_ring)
+        except RuntimeError:
+            pass
 
     def global_rect(self, t):
         w, r = t
@@ -19817,9 +21842,27 @@ class PadNavigator(QObject):
 
     # ---- moving
     def press(self, name):
-        if QApplication.activePopupWidget() is not None:   # a right-click menu / combo list is open
-            self.key({"A": Qt.Key_Return, "B": Qt.Key_Escape, **self.KEYS}.get(name), QApplication.activePopupWidget())
+        if self.key_popup() is not None:   # a right-click menu / combo list is open
+            self.key({"A": Qt.Key_Return, "B": Qt.Key_Escape, **self.KEYS}.get(name), self.key_popup())
             return
+        kb = self.kb if self.kb is not None and self.kb.isVisible() else None
+        if kb is not None and name in ("X", "Y", "START"):
+            return {"X": kb.delete, "Y": kb.space, "START": kb.submit}[name]()
+        if self.menu_panel is not None and self.menu_panel.isVisible() and name == "START":
+            return self.menu_panel.close_panel()
+        tv = getattr(self.win, "tv", None)
+        if (tv is not None and tv.isVisible() and kb is None and QApplication.activeModalWidget() is None
+                and not (self.menu_panel is not None and self.menu_panel.isVisible())):
+            if name in ("LB", "RB"):
+                return tv.step_tab(-1 if name == "LB" else 1)
+            if name in ("LT", "RT"):
+                return tv.step_filter(-1 if name == "LT" else 1)
+            if name == "X":
+                return tv.pad_x()
+            if name == "Y" and tv.tab == "home" and tv.home_items:
+                return tv.open_show(tv.home_items[tv.home_index]["show"])
+            if name == "BACK":
+                return tv.close_tv()
         if name in self.VEC:
             self.move(name)
         elif name == "A":
@@ -19832,6 +21875,7 @@ class PadNavigator(QObject):
             self.context_menu()
         elif name == "BACK" and getattr(self.win, "palette", None) is not None:
             self.win.palette.open()
+            self.keyboard(self.win.palette.edit)   # search needs typing: the keyboard comes with it
 
     def move(self, name):
         root = self.root()
@@ -19895,10 +21939,29 @@ class PadNavigator(QObject):
                 self.ring.hide()
             return
         self.ensure_visible()
+        w = self.target[0]
+        tv = getattr(self.win, "tv", None)
+        if tv is not None and tv.isVisible() and tv.isAncestorOf(w) and not getattr(w, "pad_draws_focus", False):
+            tv.card_focused(None)   # off the cards (on a button): no card ring
+        if getattr(w, "pad_draws_focus", False):   # TV mode's cards draw their own ring
+            if self.ring is not None:
+                self.ring.hide()
+            w.pad_focused()
+            self.mouse_at = None
+            return
         host = self.root().window()
         if self.ring is None or self.ring.parentWidget() is not host:
+            if self.ring is not None:
+                self.ring.hide()   # the one in the window behind
             self.ring = PadRing(host)
-        g = self.global_rect(self.target).adjusted(-5, -5, 5, 5)
+            # a popup that deletes itself on close takes its ring along
+            host.destroyed.connect(lambda *_a, r=self.ring: self.ring is r and setattr(self, "ring", None))
+        m = PadRing.MARGIN
+        g = self.global_rect(self.target).adjusted(-m, -m, m, m)
+        rad = getattr(w, "pad_radius", None)
+        if callable(rad):
+            rad = rad()
+        self.ring.set_shape(rad, tv is not None and tv.isVisible() and tv.isAncestorOf(w))
         self.ring.setGeometry(QRect(host.mapFromGlobal(g.topLeft()), g.size()))
         self.ring.show()
         self.ring.raise_()
@@ -19922,6 +21985,8 @@ class PadNavigator(QObject):
         if not self.valid(self.target):
             return self.move("DPAD_DOWN")
         w, r = self.target
+        if isinstance(w, QLineEdit):
+            return self.keyboard(w)
         if isinstance(w, QAbstractButton):
             w.click()
         elif isinstance(w, QComboBox):
@@ -19947,13 +22012,40 @@ class PadNavigator(QObject):
         w, r = self.target
         target = w.viewport() if r is None else w
         pos = (w.visualRect(w.currentIndex()).center() if r is None else r.center())
-        QApplication.sendEvent(target, QContextMenuEvent(QContextMenuEvent.Keyboard, pos, target.mapToGlobal(pos)))
+        title = ""
+        if r is None:
+            title = str(w.currentIndex().data(Qt.DisplayRole) or "")
+        elif isinstance(w, QAbstractButton):
+            title = w.text()
+        self.menu_armed = title or getattr(w, "pad_title", "") or ""
+        try:   # (blocks while a menu's exec() runs: it's closed at once by eventFilter, the panel shows instead)
+            QApplication.sendEvent(target, QContextMenuEvent(QContextMenuEvent.Keyboard, pos, target.mapToGlobal(pos)))
+        finally:
+            self.menu_armed = None   # no menu came
 
     def back(self):
+        pop = QApplication.activePopupWidget()
+        if pop is not None:   # Kura's own popup (the logo menu)
+            pop.close()
+            self.target = None
+            return
+        if self.kb is not None and self.kb.isVisible():
+            return self.kb.close_kb()
+        if self.menu_panel is not None and self.menu_panel.isVisible():
+            self.menu_panel.back()
+            self.target = None
+            if self.menu_panel.isVisible():
+                QTimer.singleShot(0, lambda: self.move("DPAD_DOWN"))
+            return
         modal = QApplication.activeModalWidget()
         if modal is not None:
             return self.key(Qt.Key_Escape, modal)
-        for w in (getattr(self.win, "palette", None), getattr(self.win, "close_overlay", None)):
+        tv = getattr(self.win, "tv", None)
+        if tv is not None and tv.isVisible():
+            tv.back()
+            return
+        for w in (getattr(self.win, "palette", None), getattr(self.win, "close_overlay", None),
+                  getattr(self.win, "lock_screen", None)):
             if w is not None and w.isVisible():
                 return self.key(Qt.Key_Escape, w)
         if self.win.pages.currentIndex() == self.win.DETAIL:
@@ -27347,6 +29439,12 @@ class CommandPalette(QWidget):
     def paintEvent(self, _):
         QPainter(self).fillRect(self.rect(), QColor(5, 6, 10, 150))
 
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:   # Esc with the focus off the search box (a controller's B)
+            self.hide()
+            return
+        super().keyPressEvent(e)
+
     def mousePressEvent(self, e):
         if not self.panel.geometry().contains(e.position().toPoint()):
             self.hide()
@@ -27484,6 +29582,7 @@ class MainWindow(QMainWindow):
         player_mod.CAPTURE_SAVED = lambda path, kind: self.capture_saved.emit(path, kind)   # from a worker thread
         player_mod.EPISODE_INFO = self.player_episodes   # the player's episode list (titles, stills, watched, missing)
         player_mod.EPISODE_PICS = self.player_pics
+        player_mod.PAD_GLYPH = lambda button, h: PadGlyph(self.settings, button, h)   # TV mode's button hints
         player_mod.COVER = lambda item: (QImage(str(cover_file(item.get("mid")))) if item.get("mid")
                                          and cover_file(item.get("mid")) else None)
         self.player_thumbs = None   # pictures for the player's episode list (its own worker)
@@ -27618,6 +29717,9 @@ class MainWindow(QMainWindow):
         self.library.updated.connect(self.update_badges)
         self.close_overlay = CloseOverlay(self.centralWidget())   # close_action = ask
         self.close_overlay.chosen.connect(self.on_close_chosen)
+        self.lock_screen = LockScreen(self.centralWidget(), self.settings)   # the hentai side's lock
+        self.tv = TvMode(self)   # full screen, made for a controller
+        self.lock_screen.unlocked.connect(self.on_unlocked)
         self.tray_notice = TrayNotice()   # close_action = tray (+ notice): a notification at the screen's corner
         self.tray_notice.quit.connect(self.quit_app)
         self.tray_notice.reopen.connect(self.show_window)
@@ -28541,6 +30643,7 @@ class MainWindow(QMainWindow):
         self.set_mode(False)
 
     def unlock_adult(self):
+        """True when the hentai side is open to you now; else the lock screen opens (unlocking switches)."""
         if not self.settings.get("adult_lock") or self.adult_unlocked:
             return True
         pin = self.settings.get("adult_pin") or {}
@@ -28548,24 +30651,14 @@ class MainWindow(QMainWindow):
             self.settings["adult_lock"] = False
             save_settings(self.settings)
             return True
-        dlg = PinDialog(self, hello=True)
-        result = {}
-
-        def hello():
-            ok = windows_hello("Switch Kura to Hentai")
-            if ok:
-                result["ok"] = True
-                dlg.accept()
-            elif ok is None:
-                QMessageBox.information(dlg, APP_NAME, "Windows Hello isn't set up on this PC. Use your PIN.")
-        dlg.hello.clicked.connect(hello)
-        if dlg.exec() != QDialog.Accepted:
-            return False
-        if result.get("ok") or (pin and pin_hash(dlg.pin.text(), pin.get("salt", "")) == pin.get("hash")):
-            self.adult_unlocked = True
-            return True
-        QMessageBox.warning(self, APP_NAME, "That PIN isn't right.")
+        self.lock_screen.open()
+        if getattr(self, "pad", None) is not None:
+            self.pad.target = None   # a controller starts on the keypad, not where it was last time
         return False
+
+    def on_unlocked(self):
+        self.adult_unlocked = True
+        self.set_mode(True)
 
     def set_mode(self, adult):
         """Anime / 18+: every page shows only that side's shows."""
@@ -28762,6 +30855,19 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.update_torrent_badge() if hasattr(self, "update_torrent_badge") else None
+        QTimer.singleShot(1500, self.warm_settings)
+
+    def warm_settings(self):
+        """After a side switch, while you're on another page: Settings' player and torrent sections made again for
+        this side (its folders, filters), laid out and painted once; on its first open they were ~0.2-0.6 s."""
+        sp = self.settings_page
+        if self.pages.currentWidget() is sp:
+            return
+        try:
+            sp.build_embedded()
+            lay_out_hidden(sp, draw=True)
+        except Exception:
+            klog.exception("Settings for the new side")
 
     def refresh_stale(self, n):
         page = getattr(self, "mode_stale", {}).pop(n, None)
@@ -28983,7 +31089,11 @@ class MainWindow(QMainWindow):
         if self.player is None:
             return
         view, self.player = self.player, None
-        if self.isFullScreen() and self.player_overlay is not None:
+        tv = getattr(self, "tv", None)
+        to_tv = tv is not None and getattr(tv, "for_player", False)
+        if to_tv:
+            tv.back_from_player()   # TV mode covers the window first: no flash of the pages, no window jump
+        elif self.isFullScreen() and self.player_overlay is not None:
             self.showNormal()
         view.stop()
         self.unembed(view)
@@ -29776,6 +31886,202 @@ class PosterWall(QWidget):
         p.fillRect(r, g)
 
 
+WALL_QML = b"""
+import QtQuick
+Rectangle {
+    id: root
+    color: "#0b0d12"
+    property int cols: 0
+    property int stamp: 0
+    property real colW: 128
+    property real colH: 0
+    property real step: 142
+    property real textUp: 0
+    Item {   // the covers: columns drifting down and back up, 30 s each way, neighbours the other way
+        x: -30; y: -20
+        rotation: -8; transformOrigin: Item.TopLeft
+        opacity: 0.45
+        visible: root.cols > 0
+        Repeater {
+            model: root.cols
+            Image {
+                required property int index
+                readonly property real a: index % 2 ? -480 : 0
+                readonly property real b: index % 2 ? 0 : -480
+                x: index * root.step; y: a
+                width: root.colW; height: root.colH
+                smooth: true; cache: false
+                source: "image://wall/col" + index + "/" + root.stamp
+                SequentialAnimation on y {
+                    loops: Animation.Infinite
+                    YAnimator { from: a; to: b; duration: 30000 }
+                    YAnimator { from: b; to: a; duration: 30000 }
+                }
+            }
+        }
+    }
+    Item {   // nothing to show yet: soft glows and a faint pattern of the mark
+        anchors.fill: parent
+        visible: root.cols === 0
+        Repeater {
+            model: [[0.28, 0.35, 0.48, 0.07], [0.74, 0.62, 0.55, 0.05], [0.48, 1.05, 0.44, 0.09]]
+            Image {
+                required property var modelData
+                required property int index
+                readonly property real r: modelData[2] * root.width
+                readonly property real bx: modelData[0] * root.width - r
+                readonly property real by: modelData[1] * root.height - r
+                readonly property real ax: 0.08 * root.width
+                readonly property real ay: 0.06 * root.height
+                width: 2 * r; height: 2 * r
+                x: bx; y: by + ay
+                source: "image://wall/glow" + index + "/" + root.stamp
+                cache: false
+                SequentialAnimation on x {
+                    loops: Animation.Infinite
+                    XAnimator { from: bx - ax; to: bx + ax; duration: 500 * Math.PI / modelData[3]; easing.type: Easing.InOutSine }
+                    XAnimator { from: bx + ax; to: bx - ax; duration: 500 * Math.PI / modelData[3]; easing.type: Easing.InOutSine }
+                }
+                SequentialAnimation on y {
+                    loops: Animation.Infinite
+                    YAnimator { from: by + ay; to: by - ay; duration: 500 * Math.PI / (1.15 * modelData[3]); easing.type: Easing.InOutSine }
+                    YAnimator { from: by - ay; to: by + ay; duration: 500 * Math.PI / (1.15 * modelData[3]); easing.type: Easing.InOutSine }
+                }
+            }
+        }
+        Item {
+            rotation: -12; transformOrigin: Item.TopLeft
+            Image {
+                readonly property real x0: -252
+                readonly property real y0: -236 - root.textUp
+                x: x0; y: y0
+                source: "image://wall/marks/" + root.stamp
+                cache: false
+                XAnimator on x { from: x0; to: x0 - 126; duration: 42000; loops: Animation.Infinite }
+                YAnimator on y { from: y0; to: y0 - 63; duration: 42000; loops: Animation.Infinite }
+            }
+        }
+    }
+    Image { anchors.fill: parent; source: "image://wall/veil/" + root.stamp; cache: false }
+}
+"""
+
+
+class WallImages(QQuickImageProvider):
+    """The pictures QuickWall's scene shows (made in Python, handed over by name)."""
+
+    def __init__(self):
+        super().__init__(QQmlImageProviderBase.ImageType.Image)
+        self.images = {}
+
+    def requestImage(self, ident, size, _requested):
+        img = self.images.get(ident.split("/")[0])
+        if img is None:
+            img = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+            img.fill(Qt.transparent)
+        size.setWidth(img.width())
+        size.setHeight(img.height())
+        return img
+
+
+class QuickWall(QQuickWindow):
+    """PosterWall drawn by Qt Quick, in a window of its own under the loading screen: its drifting runs on the render
+    thread (Animators), so it keeps moving while Kura builds its pages (the painted wall stood still for about half
+    of the loading time, then jumped)."""
+    W, H, GAP = PosterWall.W, PosterWall.H, PosterWall.GAP
+    failed = Signal()
+
+    def __init__(self, size):
+        super().__init__()
+        self.setFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setTitle(APP_NAME)
+        self.setColor(QColor(11, 13, 18))
+        self.resize(size)
+        self.dpr = QApplication.primaryScreen().devicePixelRatio() or 1
+        self.provider = WallImages()
+        self.qml = QQmlEngine(self)
+        self.qml.addImageProvider("wall", self.provider)
+        self.comp = QQmlComponent(self.qml)
+        self.comp.setData(WALL_QML, QUrl())
+        f = QFont(QApplication.font())
+        f.setPixelSize(54)
+        f.setBold(True)
+        self.mark_font, self.text_up = f, QFontMetrics(f).ascent()
+        # its size from the start: Animators take their ends once, as they start (at 0 × 0 the glows drifted wrong)
+        self.root = self.comp.createWithInitialProperties({"width": size.width(), "height": size.height(),
+                                                           "textUp": self.text_up})
+        if self.root is None:
+            raise RuntimeError("; ".join(e.toString() for e in self.comp.errors()))
+        self.root.setParentItem(self.contentItem())
+        self.sceneGraphError.connect(lambda *_: self.failed.emit())   # (unhandled, Qt would quit)
+        self.tiles = []
+        self.set_images(wall_images())
+
+    def image(self, w, h):
+        img = QImage(round(w * self.dpr), round(h * self.dpr), QImage.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(self.dpr)
+        img.fill(Qt.transparent)
+        return img
+
+    def set_images(self, imgs):
+        pv = self.provider.images
+        w, h = self.width(), self.height()
+        self.tiles = []
+        for img in imgs:
+            tile = self.image(self.W, self.H)
+            p = QPainter(tile)
+            p.setRenderHint(QPainter.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, self.W, self.H), 10, 10)
+            p.setClipPath(path)
+            p.drawPixmap(0, 0, cover_pixmap(img, self.W, self.H, self.dpr))
+            p.end()
+            self.tiles.append(tile)
+        step = self.H + self.GAP
+        rows, cols = int(h / step) + 6, int(w / (self.W + self.GAP)) + 3
+        for c in range(cols if self.tiles else 0):   # each column as one picture (the same order as PosterWall)
+            col = self.image(self.W, rows * step)
+            p = QPainter(col)
+            for k in range(rows):
+                p.drawImage(QPointF(0, k * step), self.tiles[(c * 5 + k * 3) % len(self.tiles)])
+            p.end()
+            pv[f"col{c}"] = col
+        for i, (rad, col) in enumerate(((0.48, (124, 108, 255, 105)), (0.55, (232, 107, 147, 70)),
+                                        (0.44, (62, 207, 142, 52)))):
+            r = rad * w
+            glow = self.image(2 * r, 2 * r)
+            g = QRadialGradient(QPointF(r, r), r)
+            g.setColorAt(0, QColor(*col))
+            g.setColorAt(1, QColor(col[0], col[1], col[2], 0))
+            p = QPainter(glow)
+            p.fillRect(QRectF(0, 0, 2 * r, 2 * r), g)
+            p.end()
+            pv[f"glow{i}"] = glow
+        up = self.text_up
+        marks = self.image(126 * (int(w / 126) + 8), 118 * (int(h / 118) + 8))
+        p = QPainter(marks)
+        p.setFont(self.mark_font)
+        p.setPen(QColor(255, 255, 255, 9))
+        for row in range(int(h / 118) + 8):
+            for c in range(int(w / 126) + 8):
+                p.drawText(QPointF(c * 126, row * 118 + up), "蔵")
+        p.end()
+        pv["marks"] = marks
+        veil = self.image(w, h)
+        g = QRadialGradient(QPointF(w / 2, h / 2), max(w, h) * 0.62)
+        a = (204, 242, 255) if self.tiles else (40, 120, 200)   # the glows need a lighter veil than covers do
+        g.setColorAt(0, QColor(11, 13, 18, a[0]))
+        g.setColorAt(0.65, QColor(11, 13, 18, a[1]))
+        g.setColorAt(1, QColor(11, 13, 18, a[2]))
+        p = QPainter(veil)
+        p.fillRect(QRectF(0, 0, w, h), g)
+        p.end()
+        pv["veil"] = veil
+        self.root.setProperty("colH", rows * step)
+        self.root.setProperty("cols", cols if self.tiles else 0)
+        self.root.setProperty("stamp", self.root.property("stamp") + 1)
+
+
 def splash_logo(px):
     lg = QLabel("蔵")
     lg.setAlignment(Qt.AlignCenter)
@@ -30131,7 +32437,9 @@ class SetupFlow(QFrame):
 
 class KuraSplash(QWidget):
     """The loading screen (Loading 2): the poster wall with the logo, a progress bar and one line saying what's being
-    made ready; the first time, Setup B's card first. Closes itself when everything is warm (at most ~12 s)."""
+    made ready; the first time, Setup B's card first. Closes itself when everything is warm (at most ~12 s).
+    The wall is a QuickWall window under this one (see-through, owned by it so it stays on top); without Qt Quick
+    (no OpenGL), the painted PosterWall inside it as before."""
     done = Signal()
 
     def __init__(self):
@@ -30141,7 +32449,20 @@ class KuraSplash(QWidget):
         self.resize(980, 700)
         scr = QApplication.primaryScreen().availableGeometry()
         self.move(scr.center() - self.rect().center())
-        self.wall = PosterWall(self)
+        self.quick = None
+        try:
+            self.quick = QuickWall(self.size())
+        except Exception:
+            klog.exception("Loading screen: Qt Quick wall")
+        if self.quick is None:
+            self.wall = PosterWall(self)
+        else:
+            self.wall = self.quick
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)   # the wall has the taskbar button
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self.winId()
+            self.windowHandle().setTransientParent(self.quick)
+            self.quick.failed.connect(self.painted_wall)
         self.center = QWidget(self)
         cv = QVBoxLayout(self.center)
         cv.setContentsMargins(0, 0, 0, 0)
@@ -30174,8 +32495,36 @@ class KuraSplash(QWidget):
         self.setup = None
         self.popular = None
 
-    def resizeEvent(self, e):
+    def painted_wall(self):
+        klog.warning("Loading screen: Qt Quick couldn't draw, painted wall instead")
+        self.quick.hide()
+        self.wall = PosterWall(self)
         self.wall.setGeometry(self.rect())
+        self.wall.lower()
+        self.wall.show()
+
+    def showEvent(self, e):
+        if self.quick is not None and self.wall is self.quick:
+            self.quick.setGeometry(self.geometry())
+            self.quick.show()
+            # its owner was set after both were made: Windows only keeps it on top from the next change; and the
+            # keys go to setup's card, not the wall
+            QTimer.singleShot(0, lambda: (self.raise_(), self.activateWindow()))
+        super().showEvent(e)
+
+    def moveEvent(self, e):
+        if self.quick is not None:
+            self.quick.setPosition(self.pos())
+
+    def closeEvent(self, e):
+        if self.quick is not None:
+            self.quick.close()
+            self.quick.deleteLater()
+        super().closeEvent(e)
+
+    def resizeEvent(self, e):
+        if self.wall is not self.quick:
+            self.wall.setGeometry(self.rect())
         self.center.setGeometry(self.rect())
 
     def set_step(self, text, frac):
@@ -30262,7 +32611,9 @@ def warm_up(win, splash, finish):
                 win.seasonal.lib_ids = win.library.library_ids()
                 win.seasonal.load()
             elif i == 4:
+                lay_out_hidden(win.settings_page)
                 win.settings_page.build_embedded()
+                lay_out_hidden(win.settings_page, draw=True)   # its first open was ~1 s of layout and painting
                 win.stats.render()
             elif i == 5:   # they keep what they made until something changes (mark_dirty / dirty)
                 for page in (win.todo, win.schedule):
@@ -30295,6 +32646,9 @@ def warm_up(win, splash, finish):
 
 def main():
     global ICON_FONT
+    # A busy job thread (organizer, library scan) held the GIL for up to ~0.4 s at a time and the window couldn't be
+    # moved or clicked meanwhile; switching every 1 ms (default 5) keeps the UI's waits under ~0.1 s
+    sys.setswitchinterval(0.001)
     if os.name == "nt":
         try:   # own taskbar button + icon instead of Python's
             import ctypes
@@ -30462,6 +32816,12 @@ def main():
             except Exception as e:
                 report.append(f"backup FAILED: {e}")
             report.append(f"anitopy parse: {org.parse('[SubsPlease] Sousou no Frieren - 05 (1080p).mkv')[:2]}")
+            try:   # the loading screen's wall (Qt Quick; the exe ships no QML folder, its types are in Qt6Quick)
+                wall = QuickWall(QSize(320, 200))
+                report.append(f"loading screen wall: Qt Quick ({wall.root.property('cols')} columns)")
+                wall.deleteLater()
+            except Exception as e:
+                report.append(f"loading screen wall FAILED (painted instead): {e}")
             try:   # screenshots in every format (Pillow's plugins bundled) and the clip encoder on this card
                 from PIL import Image, features
                 tmp = Path(tempfile.gettempdir()) / "kura_selftest_shot.avif"

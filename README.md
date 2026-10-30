@@ -23,6 +23,7 @@ and plays everything in its own player. Jellyfin can stream the same library.
 <p align="center"><img src="docs/images/home.png" alt="Home: up next, new in your library, airing today" width="100%"></p>
 <p align="center"><img src="docs/images/library.png" alt="Library: a show page with progress, seasons and trailer" width="100%"></p>
 <p align="center"><img src="docs/images/schedule.png" alt="Schedule: the week's episodes and what's downloaded" width="100%"></p>
+<p align="center"><img src="docs/images/tvmode.png" alt="TV mode: full screen with a controller, a show's banner art, episodes and button hints" width="100%"></p>
 <p align="center">
   <img src="docs/images/kickoff.png" alt="Kickoff: Planning shows that started, and sequels" width="49%">
   <img src="docs/images/seasonal.png" alt="Seasonal: this season's anime" width="49%">
@@ -37,15 +38,16 @@ and plays everything in its own player. Jellyfin can stream the same library.
 - **A player made for anime**: mpv inside, skip openings, endings and recaps, subtitles from several sources,
   optional picture enhancement (Anime4K, FSRCNNX, ArtCNN), screenshots and clips, Discord status.
 - **Live TV**: channels made from your own library, with a guide, so there's always something on.
+- **Play with a controller**: Xbox, PlayStation or Switch (button hints match yours), everywhere in Kura: an
+  on-screen keyboard for typing, big menus, and TV mode with a player made for the couch.
 - **Statistics and Wrapped**: what you watched, when, and a year in review.
-- **Looks after itself**: backups of your data, a library health check, controller support and updates from inside
-  the app.
+- **Looks after itself**: backups of your data, a library health check and updates from inside the app.
 
 ## Install
 
 Download **`Kura-Setup-x.y.z.exe`** from the [latest release](../../releases/latest) and run it. It installs for your
 Windows user only (no admin needed) into `%LOCALAPPDATA%\Programs\Kura`, with a Start menu shortcut and an entry in
-Windows' Apps list for uninstalling. After that, Kura updates itself: Settings → App → Updates.
+Windows' Apps list for uninstalling. After that, Kura updates itself: Settings → About.
 
 Kura isn't code-signed yet, so Windows SmartScreen may say "Windows protected your PC": choose **More info → Run
 anyway**.

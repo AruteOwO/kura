@@ -20,6 +20,7 @@ import anime_organizer as org
 TOOLS_DIR = org.SCRIPT_DIR / "tools"
 YTDLP = TOOLS_DIR / "yt-dlp.exe"
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+LATEST_URL = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
 CACHE_FILE = org.SCRIPT_DIR / "trailer_streams.json"
 # 720p is plenty for a preview; AV1 decodes slowly on many PCs, so it's avoided
 FORMAT = "bestvideo[height<=720][vcodec!*=av01]+bestaudio/best[height<=720]/best"
@@ -94,10 +95,24 @@ def install():
     return version()
 
 
-def update():
-    """yt-dlp updates itself in place. Returns (version, its message)."""
-    r = subprocess.run([str(YTDLP), "-U"], capture_output=True, text=True, timeout=180, creationflags=_NO_WINDOW)
-    return version(), (r.stdout or r.stderr).strip().splitlines()[-1:] or [""]
+def latest_version():
+    """The newest yt-dlp on its official GitHub releases (its tag is the version, like 2025.10.22)."""
+    req = urllib.request.Request(LATEST_URL, headers={"User-Agent": org.USER_AGENT,
+                                                      "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        tag = (json.loads(resp.read().decode("utf-8")).get("tag_name") or "").strip()
+    if not tag:
+        raise OSError("GitHub didn't say which version is newest")
+    return tag
+
+
+def check_update():
+    """Compare the installed yt-dlp with the newest release and download it only when it's newer.
+    Returns (version now, updated?)."""
+    have, newest = version(), latest_version()
+    if have and have == newest:
+        return have, False
+    return install(), True
 
 
 # ---------------------------------------------------------------- streams

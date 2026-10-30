@@ -39,7 +39,7 @@ KINDS = [  # (kind, title, what to do)
     ("duplicate", "The same episode twice", "Two releases of one episode; keep the one you prefer"),
     ("unmatched", "Episodes not matched to a season", "Kura can't tell which AniList season these belong to"),
     ("resolution", "Mixed resolutions", "A season with some episodes in a lower resolution"),
-    ("picture_subs", "Picture subtitles only", "Can be recoloured, or turned into text, in Subtitle colours"),
+    ("picture_subs", "Picture subtitles only", "Can be recolored, or turned into text, in Tools → Subtitles"),
     ("no_english", "No English subtitles", "Subtitles, but none marked English"),
     ("no_subs", "No subtitles", "No subtitle track and no subtitle file next to it"),
 ]
@@ -229,7 +229,7 @@ def check_show(show, cache):
                 issue("picture_subs", [f], label)
             elif tracks and not external and not any((t[1] or "und").lower() in ENGLISH | {"und"} for t in tracks):
                 issue("no_english", [f], f"{label} · marked " + ", ".join(sorted({t[1] or '?' for t in tracks})) +
-                      " (sometimes just mislabelled)")
+                      " (sometimes just mislabeled)")
         # not matched to a season
         deep = nested and SEASON_FOLDER.match(name_only)   # "Season 1 / Season 1": one folder too deep
         if mapped is not None and (regular or deep):

@@ -4220,7 +4220,7 @@ class SeasonRenameDialog(SeasonFixDialog):
     """Preview of "Rename season folders": old → new name, grouped by show, each show tickable."""
     TITLE = "Rename season folders"
     INTRO = ("Season folders get the name style from Settings → Season folders (now: {style}). Folders named "
-             "after a season are recognised too; OVAs, specials and side stories keep their names. Untick any "
+             "after a season are recognized too; OVAs, specials and side stories keep their names. Untick any "
              "show to leave it as it is; nothing changes until you press Rename. Close Jellyfin and any Explorer "
              "windows on these folders first.")
     COLUMNS = ["Show / folder", "Now", "Becomes"]
@@ -4259,7 +4259,7 @@ class SettingsPage(Page):
                 ("app", ("tune", "App", "Closing, starting with Windows, a controller, and Kura's files.")),
                 ("adult", ("18_up_rating", "Hentai", "Kura's hentai side: its own library, pages and statistics.")),
                 ("PLAYBACK", None), ("player", ("play_circle", "Player", "Kura's player or another app, skipping, autoplay.")),
-                ("subtitles", ("subtitles", "Subtitles", "Your subtitle colours, outline and size in Kura's player.")),
+                ("subtitles", ("subtitles", "Subtitles", "Your subtitle colors, outline and size in Kura's player.")),
                 ("recognition", ("visibility", "Recognition", "Noticing what you watch and updating your list.")),
                 ("sources", ("sensors", "Sources", "Media players, browsers, Crunchyroll and Jellyfin.")),
                 ("discord", ("forum", "Discord", "Show what you're watching on your Discord profile.")),
@@ -4392,7 +4392,7 @@ class SettingsPage(Page):
         style.changed.connect(lambda v: self.set("season_style", v))
         self.row(sl, "Season folders", label("For seasons with their own name, like Queen's Blade 2: The Evil Eye. "
                                              "Jellyfin needs the number to know which season a folder is. Folders "
-                                             "you already have are recognised whatever they're called; Rename "
+                                             "you already have are recognized whatever they're called; Rename "
                                              "season folders switches them.", "faint", wrap=True), style)
         col.addWidget(sorting)
 
@@ -4465,7 +4465,7 @@ class SettingsPage(Page):
         self.divider(al)
         own = Toggle(settings.get("own_title_bar", True))
         own.toggled.connect(lambda on: self.set("own_title_bar", on))
-        self.row(al, "Kura's own title bar", label("Window buttons in Kura's colours, the search on top. Off: Windows' "
+        self.row(al, "Kura's own title bar", label("Window buttons in Kura's colors, the search on top. Off: Windows' "
                                                    "title bar. Takes effect when Kura starts again.", "faint",
                                                    wrap=True), own)
         self.divider(al)
@@ -4655,7 +4655,7 @@ class SettingsPage(Page):
         self.divider(bl)
         icons = Toggle(s.get("adult_icon", True))
         icons.toggled.connect(lambda v: (self.set("adult_icon", v), APP.get("mode_icons") and APP["mode_icons"]()))
-        self.row(bl, "Rose icon on the hentai side", label("The taskbar and tray icons match its colours. Off: they "
+        self.row(bl, "Rose icon on the hentai side", label("The taskbar and tray icons match its colors. Off: they "
                                                        "stay purple, so they don't show which side you're on.",
                                                        "faint", wrap=True), icons)
         self.divider(bl)
@@ -4685,7 +4685,15 @@ class SettingsPage(Page):
 
     def showEvent(self, e):
         super().showEvent(e)
+        self.sync_paths()
         QTimer.singleShot(0, lambda: self.isVisible() and self.build_embedded())   # after the page has painted
+
+    def sync_paths(self):
+        """The folder fields show what the settings say now: they were filled when the page was made, which is before
+        first-time setup picks the folders (they said "Not set" until Kura restarted)."""
+        for key, edit in getattr(self, "path_edits", {}).items():
+            if not edit.hasFocus():
+                edit.setText(self.settings.get(key) or "")
 
     def hideEvent(self, e):
         super().hideEvent(e)
@@ -4811,8 +4819,11 @@ class SettingsPage(Page):
             if a and a.token is None and a.user:
                 v.addWidget(self._note("Your login expired. Connect again to keep your list in sync."))
             self.text_row(v, "Client ID", "Create one at anilist.co/settings/developer → Create New Client. "
-                          f"Name it anything and set the redirect URL to  {acct.REDIRECT_URL}", "anilist_client_id",
+                          "Name it anything and paste the Redirect URL below into it.", "anilist_client_id",
                           "e.g. 12345", width=140)
+            self.divider(v)
+            self.row(v, "Redirect URL", label("AniList asks for this when you make the client.", "faint", wrap=True),
+                     copy_field(acct.REDIRECT_URL))
             self.divider(v)
             row = QWidget()
             h = QHBoxLayout(row)
@@ -5077,6 +5088,9 @@ class SettingsPage(Page):
 
     def path_row(self, layout, title, desc, key):
         edit = QLineEdit(self.settings.get(key) or "")
+        if not hasattr(self, "path_edits"):
+            self.path_edits = {}
+        self.path_edits[key] = edit
         edit.setPlaceholderText("Not set")
         edit.setMinimumWidth(320)
         edit.editingFinished.connect(lambda: self.set(key, edit.text().strip()))
@@ -5834,7 +5848,7 @@ def stat_tile(caption, value, color=None, bar=None):
 
 
 STATUS_TEXT = {"FINISHED": "Finished", "RELEASING": "Airing", "NOT_YET_RELEASED": "Not yet aired",
-               "CANCELLED": "Cancelled", "HIATUS": "On hiatus"}
+               "CANCELLED": "Canceled", "HIATUS": "On hiatus"}
 FORMAT_TEXT = {"TV": "TV", "TV_SHORT": "TV Short", "MOVIE": "Movie", "SPECIAL": "Special", "OVA": "OVA",
                "ONA": "ONA", "MUSIC": "Music"}
 
@@ -11308,7 +11322,7 @@ class PlanDialog(KuraDialog):
         self.body.addWidget(head)
         sub = "Untick anything you don't want, then Apply. Subtitle files go along with their episode."
         if skipped:
-            sub += f" {len(skipped)} already in the library (greyed out)."
+            sub += f" {len(skipped)} already in the library (grayed out)."
         self.body.addWidget(label(sub, "muted", wrap=True))
         self.tree = QTreeWidget()
         self.tree.setObjectName("torrents")
@@ -11537,6 +11551,34 @@ def folder_picker(text, placeholder="Not set"):
     h.addWidget(edit, 1)
     h.addWidget(browse)
     w.edit = edit
+    return w
+
+
+def copy_field(text, width=330):
+    """Text to paste somewhere else (AniList's Redirect URL): a read-only box and a Copy button."""
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(8)
+    edit = QLineEdit(text)
+    edit.setReadOnly(True)
+    edit.setMinimumWidth(width)
+    edit.setCursorPosition(0)
+    btn = QPushButton(" Copied")
+    btn.setIcon(glyph_icon("content_copy", C["text"]))
+    btn.setMinimumWidth(btn.sizeHint().width())   # the same width whichever it says (no jumping, no cut-off)
+    btn.setText(" Copy")
+
+    def copy():
+        QApplication.clipboard().setText(text)
+        edit.selectAll()
+        btn.setText(" Copied")
+        btn.setIcon(glyph_icon("check", C["ok"]))
+        QTimer.singleShot(1500, lambda: (btn.setText(" Copy"), btn.setIcon(glyph_icon("content_copy", C["text"]))))
+    btn.clicked.connect(copy)
+    h.addWidget(edit, 1)
+    h.addWidget(btn)
+    w.edit, w.button = edit, btn
     return w
 
 
@@ -11830,9 +11872,9 @@ class TorrentSettingsDialog(KuraDialog):
         option_row(col, "If there's no anime folder, save into " + ("this folder" if own else "your Downloads folder"),
                    "" if own else f"{self.s.get('downloads') or 'Not set yet'} · set in Settings → Library & folders.",
                    self.use_fallback)
-        self.fallback = folder_picker(own, f"Kura's Downloads folder ({self.s.get('downloads') or 'not set'})")
+        self.fallback_dir = folder_picker(own, f"Kura's Downloads folder ({self.s.get('downloads') or 'not set'})")
         if own:
-            option_row(col, "", "Empty = your Downloads folder.", self.fallback, stretch_control=True)
+            option_row(col, "", "Empty = your Downloads folder.", self.fallback_dir, stretch_control=True)
         self.subfolder = Toggle(self.s.get("torrent_subfolder", False))
         option_row(col, "Create a subfolder named after the anime", "", self.subfolder)
         col.addWidget(label("Download folders only work with qBittorrent (Web UI or custom application) "
@@ -12197,7 +12239,7 @@ class TorrentSettingsDialog(KuraDialog):
         s["torrent_sort_order"] = self.order.value()
         s["torrent_use_anime_folder"] = self.anime_folder.isChecked()
         s["torrent_use_fallback"] = self.use_fallback.isChecked()
-        s["torrent_fallback_folder"] = self.fallback.edit.text().strip()
+        s["torrent_fallback_folder"] = self.fallback_dir.edit.text().strip()
         s["torrent_subfolder"] = self.subfolder.isChecked()
         s["torrent_app"] = self.app.value()
         s["torrent_client"] = self.client.text().strip()
@@ -12631,7 +12673,7 @@ class TorrentPage(Page):
 
     # ---- missed episodes (the Schedule's Needs you)
     MISSED_KINDS = {"filtered": ("FILTERED OUT", C["warn"]), "stuck": ("STUCK", "#ff9aa7"),
-                    "unrecognised": ("NOT RECOGNISED", "#9ccbff"), "gap": ("GAP", "#c8ccd6"),
+                    "unrecognised": ("NOT RECOGNIZED", "#9ccbff"), "gap": ("GAP", "#c8ccd6"),
                     "unfinished": ("SEASON UNFINISHED", "#7fe0b0")}
 
     def missed_entries(self):
@@ -12787,7 +12829,7 @@ class TorrentPage(Page):
                 self.download(items)
         elif how == "learn" and e["names"]:
             self.remember_alias(mid, e["names"][0], "learned")
-            self.notify.emit(f"Kura will now recognise “{e['names'][0]}” as {title}")
+            self.notify.emit(f"Kura will now recognize “{e['names'][0]}” as {title}")
             self.queue_search(mid, e["eps"])
         elif how == "replace":
             self.queue_search(mid, e["eps"], replace=e.get("hash"))
@@ -13010,7 +13052,7 @@ class TorrentPage(Page):
         ctx = self.show_ctx
         title = self.titles.get(ctx["mid"]) or "this show"
         text, ok = QInputDialog.getText(self, "Another name", f"Another name to search for {title}\n"
-                                        "(it's also used to recognise its releases):")
+                                        "(it's also used to recognize its releases):")
         if ok and text.strip():
             self.remember_alias(ctx["mid"], text.strip(), "yours")
             ctx["names"] = self.show_names(ctx["mid"])
@@ -13112,7 +13154,7 @@ class TorrentPage(Page):
             learned.append(name)
         if learned:
             title = self.titles.get(ctx["mid"]) or "this show"
-            self.notify.emit(f"Kura will now recognise “{learned[0]}” as {title}")
+            self.notify.emit(f"Kura will now recognize “{learned[0]}” as {title}")
             ctx["names"] = self.show_names(ctx["mid"])
             self.fill_chips()
 
@@ -14459,7 +14501,7 @@ class SubPreviewEngine(QThread):
             return ""
         if self.mode == "player":
             return ("This episode's subtitles are pictures (Blu-ray):\nKura's player can't restyle them.\n"
-                    "Tools → Subtitle colours can recolour them, or turn them into text.")
+                    "Tools → Subtitles can recolor them, or turn them into text.")
         if self.slice is None:
             return ("Picture subtitles (Blu-ray / DVD).\nInstall FFmpeg above to preview them." if
                     not subs_mod.ffmpeg_installed() else "Picture subtitles Kura can't read (DVD).")
@@ -14619,12 +14661,12 @@ class SubStyleEditor(QWidget):
         presets.addStretch(1)
         col.addLayout(presets)
 
-        self.text_c = ColorSwatch(st["text"], "Text colour")
-        option_row(col, "Text colour", "", self.text_c)
-        self.outline_c = ColorSwatch(st["outline"], "Outline colour")
+        self.text_c = ColorSwatch(st["text"], "Text color")
+        option_row(col, "Text color", "", self.text_c)
+        self.outline_c = ColorSwatch(st["outline"], "Outline color")
         self.outline_w, outline_box = self._slider(0, 20, st["outline_w"] * 2, lambda v: f"{v / 2:g} px")
         option_row(col, "Outline", "Thickness on a 1080p picture.", self._pair(self.outline_c, outline_box))
-        self.shadow_c = ColorSwatch(st["shadow_color"], "Shadow colour")
+        self.shadow_c = ColorSwatch(st["shadow_color"], "Shadow color")
         self.shadow_w, shadow_box = self._slider(0, 16, st["shadow"] * 2, lambda v: f"{v / 2:g} px")
         option_row(col, "Shadow", "", self._pair(self.shadow_c, shadow_box))
         self.size, size_box = self._slider(60, 160, st["size"], lambda v: f"{v}%")
@@ -14917,7 +14959,7 @@ class PlaybackSettingsDialog(KuraDialog):
         self.sub_on = Toggle(self.s.get("player_sub_style_on", False))
         option_row(col, "Use my subtitle style", "Restyles the subtitles while an episode plays in Kura's player. "
                    "Your files don't change, so Jellyfin and other players keep the original look (Tools → "
-                   "Subtitle colours changes the files themselves).", self.sub_on)
+                   "Subtitles changes the files themselves).", self.sub_on)
         col.addSpacing(6)
         self.sub_editor = SubStyleEditor(self.s.get("player_sub_style") or {}, sample_episode(), preview_height=380)
         self.sub_on.toggled.connect(self.sub_editor.set_active)
@@ -15060,7 +15102,7 @@ class PlaybackSettingsDialog(KuraDialog):
         yh.addWidget(self.ytdlp_status, 1)
         yh.addWidget(self.ytdlp_btn)
         option_row(col, "yt-dlp", "Downloaded from yt-dlp's official GitHub releases into Kura's tools folder. "
-                   "Update it if trailers stop working (YouTube changes things now and then).", ytdlp,
+                   "Check for an update if trailers stop working (YouTube changes things now and then).", ytdlp,
                    stretch_control=True)
         self.ytdlp_call = None
         self.show_ytdlp()
@@ -15069,10 +15111,10 @@ class PlaybackSettingsDialog(KuraDialog):
         self.prev_on = Toggle(self.s.get("preview_enabled", True))
         option_row(col, "Preview shows when you hover them", "Library, Seasonal, Home and recommendations: the "
                    "trailer, details and synopsis in a card over the show.", self.prev_on)
-        self.prev_style = Segmented([("immersive", "Immersive"), ("tinted", "Colour panel")],
+        self.prev_style = Segmented([("immersive", "Immersive"), ("tinted", "Color panel")],
                                     self.s.get("preview_style", "immersive"))
         option_row(col, "Card style", "Immersive: the trailer fills the card and the details sit over it. "
-                   "Colour panel: trailer on top, details below in a shade of the show's cover colour.",
+                   "Color panel: trailer on top, details below in a shade of the show's cover color.",
                    self.prev_style)
         self.prev_delay = self._spin(self.s.get("preview_delay", 600), 200, 3000, "  ms")
         self.prev_delay.setSingleStep(100)
@@ -15253,7 +15295,7 @@ class PlaybackSettingsDialog(KuraDialog):
         if trl.installed():
             v = trl.version()
             self.ytdlp_status.setText(f"Installed · version {v}" if v else "Installed")
-            self.ytdlp_btn.setText("Update")
+            self.ytdlp_btn.setText("Check for update")
         else:
             self.ytdlp_status.setText("Not installed (about 18 MB). Needed for Kura's player.")
             self.ytdlp_btn.setText("Install")
@@ -15263,18 +15305,25 @@ class PlaybackSettingsDialog(KuraDialog):
         if self.ytdlp_call is not None:
             return
         updating = trl.installed()
-        self.ytdlp_status.setText("Updating…" if updating else "Downloading…")
+        self.ytdlp_status.setText("Checking for an update…" if updating else "Downloading…")
         self.ytdlp_btn.setEnabled(False)
-        self.ytdlp_call = BgCall(lambda: trl.update()[0] if updating else trl.install())
+        # installed: download only when GitHub has a newer one (result: (version, updated?)); else install it
+        self.ytdlp_call = BgCall(trl.check_update if updating else lambda: (trl.install(), None))
         self.ytdlp_call.done.connect(self.on_ytdlp)
         self.ytdlp_call.start()
 
-    def on_ytdlp(self, version, err):
+    def on_ytdlp(self, result, err):
         self.ytdlp_call.wait()
         self.ytdlp_call = None
         self.show_ytdlp()
         if err:
             self.ytdlp_status.setText(f"Couldn't get yt-dlp: {err}")
+            return
+        v, updated = result   # updated None: a first install ("Installed · version" from show_ytdlp)
+        if updated:
+            self.ytdlp_status.setText(f"Updated · version {v}" if v else "Updated")
+        elif updated is False:
+            self.ytdlp_status.setText(f"Up to date · version {v}")
 
     def done(self, r):
         for call in ("ytdlp_call", "shader_call", "ff_call"):
@@ -16958,7 +17007,7 @@ class TrackEditor(QWidget):
         files = [f for f in (self.tool.ticked_files() if self.scope.value() == "ticked" else [self.path])
                  if subs_mod.has_backup(f)] or [self.path]
         if QMessageBox.question(self, "Subtitles", f"Put the original subtitles back in {len(files)} episode"
-                                f"{'s' if len(files) != 1 else ''}? This also undoes colour changes and text tracks "
+                                f"{'s' if len(files) != 1 else ''}? This also undoes color changes and text tracks "
                                 "made from pictures.") != QMessageBox.Yes:
             return
         self.tool.start_job(FileJob(files, lambda f, say: "" if subs_mod.restore_file(f) else "nothing to restore",
@@ -17551,7 +17600,7 @@ class SubtitleTool(QWidget):
         self.tree.setEnabled(True)
         for f in job.files:   # the ✓ counts: files Kura changed
             (self.restyled.add if subs_mod.has_backup(f) else self.restyled.discard)(f)
-        text = f"{self.job_verb} {changed} episode{'s' if changed != 1 else ''}" + (", cancelled" if cancelled else "")
+        text = f"{self.job_verb} {changed} episode{'s' if changed != 1 else ''}" + (", canceled" if cancelled else "")
         if failed:
             text += f"  ·  {failed} left as they were"
         self.notify.emit(text)
@@ -17774,9 +17823,9 @@ class SubtitleTool(QWidget):
         if not files or self.job is not None:
             return
         dlg = KuraDialog(self, "Make text subtitles", 600, 0)
-        dlg.body.addWidget(label("Blu-ray picture subtitles can only be recoloured. This reads them with Windows' "
+        dlg.body.addWidget(label("Blu-ray picture subtitles can only be recolored. This reads them with Windows' "
                                  "built-in text recognition and writes a normal text track, which you can then "
-                                 "restyle like any other: colours, font, size, outline.", "muted", wrap=True))
+                                 "restyle like any other: colors, font, size, outline.", "muted", wrap=True))
         dlg.body.addWidget(label("Clean Blu-ray subtitles read very well, but expect the odd typo, italics come out "
                                  "as plain text, and signs drawn as pictures may come out garbled. English only.",
                                  "faint", wrap=True))
@@ -17838,9 +17887,9 @@ class SubtitleTool(QWidget):
         self.run_box.hide()
         self.tree.setEnabled(True)
         verb = "Restored" if restore else "Made text subtitles for" if ocr else "Restyled"
-        text = f"{verb} {changed} episode{'s' if changed != 1 else ''}" + (", cancelled" if cancelled else "")
+        text = f"{verb} {changed} episode{'s' if changed != 1 else ''}" + (", canceled" if cancelled else "")
         if self.pictures:
-            text += (f"  ·  {self.pictures} skipped: picture subtitles (Blu-ray PGS / DVD), their colours can't "
+            text += (f"  ·  {self.pictures} skipped: picture subtitles (Blu-ray PGS / DVD), their colors can't "
                      "be changed")
         if failed:
             text += f"  ·  {failed} left as they were"
@@ -17886,7 +17935,7 @@ def recycle(paths):
     rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
     if rc:
         return f"Windows couldn't do it (error {rc}); a file may be open in another app"
-    return "cancelled" if op.fAnyOperationsAborted else ""
+    return "Canceled" if op.fAnyOperationsAborted else ""
 
 
 def human(n):
@@ -17969,7 +18018,7 @@ class HealthTool(QWidget):
             self.run_btn.setText(" Stopping…")
             return
         if not subs_mod.ffmpeg_installed():
-            self.status.setText("The check reads files with FFmpeg: install it first in Tools → Subtitle colours "
+            self.status.setText("The check reads files with FFmpeg: install it first in Tools → Subtitles "
                                 "(one button, about 115 MB).")
             return
         shows = library_shows(self.library)
@@ -19304,7 +19353,7 @@ class BackupTool(QWidget):
         tool_top(v, "Backups", "Your settings, resume positions, watch time, torrent filters and history, Crunchyroll "
                  "history and matches, AniList matches and sign-ins, in one zip. Covers and other things Kura can "
                  "download again aren't included, and neither are the original subtitle tracks kept by Subtitle "
-                 "colours.", self.back)
+                 "colors.", self.back)
 
         box = card()
         bl = QVBoxLayout(box)
@@ -20774,7 +20823,7 @@ class ChannelDialog(KuraDialog):
             pm.fill(QColor(c))
             self.colour.addItem(QIcon(pm), c, c)
         self.colour.setCurrentIndex(max(0, self.colour.findData(ch.get("colour"))))
-        form.addWidget(label("Colour", "muted"), 1, 0)
+        form.addWidget(label("Color", "muted"), 1, 0)
         form.addWidget(self.colour, 1, 1)
         self.number = QSpinBox()
         self.number.setRange(0, 99)
@@ -29200,10 +29249,11 @@ class SetupFlow(QFrame):
         bl.setContentsMargins(14, 12, 14, 12)
         bl.setSpacing(8)
         self.al_help = label("Your list, progress as you watch, airing times, recommendations. Make a client on "
-                             "AniList's developer page (Redirect URL https://anilist.co/api/v2/oauth/pin) and paste its "
-                             "Client ID here.", "muted", wrap=True)
+                             "AniList's developer page with this Redirect URL, then paste its Client ID here.",
+                             "muted", wrap=True)
         self.al_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)   # never squeezed (cut-off text)
         bl.addWidget(self.al_help)
+        bl.addWidget(copy_field(acct.REDIRECT_URL, width=240))
         r = QHBoxLayout()
         self.client = QLineEdit(self.s.get("anilist_client_id") or "")
         self.client.setPlaceholderText("Client ID")
@@ -29648,8 +29698,10 @@ def main():
             splash.close()
 
         def begin():
-            if first_run:   # setup picked the folders: read the library from there
-                win.library.refresh()
+            if first_run:   # setup picked the folders and qBittorrent after the window was made: use them now
+                win.on_settings_changed()   # library scan, Organize buttons, torrent checks
+                win.downloads.apply_settings()   # qBittorrent's Web UI (it was set up as "not used")
+                win.settings_page.sync_paths()
             warm_up(win, splash, ready)
         if first_run:
             splash.ensure_wall()

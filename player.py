@@ -3698,7 +3698,7 @@ class PlayerView(QWidget):
         job.wait()
         self.clip_running = None
         if err == "cancelled":
-            self.cap_card.done("Cancelled", None, None, "Nothing was saved")
+            self.cap_card.done("Canceled", None, None, "Nothing was saved")
         elif err:
             self.cap_card.done("Couldn't make it", None, None, err[:120])
         else:

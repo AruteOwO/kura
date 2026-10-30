@@ -48,7 +48,7 @@ PRESETS = [
                                   "outline_w": 3.0, "shadow": 1.5}),
     ("yellow", "Yellow", {"text": "#FFE14D", "outline": "#000000", "shadow_color": "#000000",
                           "outline_w": 3.0, "shadow": 1.5}),
-    ("soft", "Soft grey", {"text": "#E4E4E4", "outline": "#1E1E1E", "shadow_color": "#000000",
+    ("soft", "Soft gray", {"text": "#E4E4E4", "outline": "#1E1E1E", "shadow_color": "#000000",
                            "outline_w": 2.2, "shadow": 0.0}),
     ("contrast", "High contrast", {"text": "#FFFFFF", "outline": "#000000", "shadow_color": "#000000",
                                    "outline_w": 5.0, "shadow": 3.0}),

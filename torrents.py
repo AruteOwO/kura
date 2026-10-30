@@ -313,7 +313,7 @@ class Matcher:
 STATUS_TEXT = {"CURRENT": "Watching", "REPEATING": "Rewatching", "PLANNING": "Planning", "COMPLETED": "Completed",
                "PAUSED": "Paused", "DROPPED": "Dropped", None: "Not in list"}
 AIRING_TEXT = {"RELEASING": "Airing", "FINISHED": "Finished", "NOT_YET_RELEASED": "Not yet aired",
-               "CANCELLED": "Cancelled", "HIATUS": "On hiatus"}
+               "CANCELLED": "Canceled", "HIATUS": "On hiatus"}
 YES_NO = ["Yes", "No"]
 
 # element -> (label, kind, suggested values)

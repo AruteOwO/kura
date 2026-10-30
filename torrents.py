@@ -642,6 +642,47 @@ def add_history(items):
     return history
 
 
+def _bdecode(data, i=0):
+    """One bencoded value at data[i:] (a .torrent file): (value, index after it). Strings stay bytes."""
+    c = data[i:i + 1]
+    if c == b"i":
+        end = data.index(b"e", i)
+        return int(data[i + 1:end]), end + 1
+    if c == b"l":
+        out, i = [], i + 1
+        while data[i:i + 1] != b"e":
+            v, i = _bdecode(data, i)
+            out.append(v)
+        return out, i + 1
+    if c == b"d":
+        out, i = {}, i + 1
+        while data[i:i + 1] != b"e":
+            k, i = _bdecode(data, i)
+            out[k], i = _bdecode(data, i)
+        return out, i + 1
+    colon = data.index(b":", i)
+    n = int(data[i:colon])
+    return data[colon + 1:colon + 1 + n], colon + 1 + n
+
+
+def torrent_files(url):
+    """The files inside a release, read from its .torrent (Nyaa's download link, a few KB): (name, [(path, bytes)])."""
+    req = urllib.request.Request(url, headers={"User-Agent": org.USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read(8 * 2 ** 20)
+    meta, _ = _bdecode(data)
+    info = meta.get(b"info") or {}
+    text = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else str(b)
+    name = text(info.get(b"name.utf-8") or info.get(b"name") or b"")
+    if b"files" not in info:   # a single file
+        return name, [(name, int(info.get(b"length") or 0))]
+    files = []
+    for f in info[b"files"]:
+        parts = f.get(b"path.utf-8") or f.get(b"path") or []
+        files.append(("/".join(text(x) for x in parts), int(f.get(b"length") or 0)))
+    return name, files
+
+
 def magnet(item):
     if not item["hash"]:
         return item["link"]   # plain RSS feeds: the .torrent link itself

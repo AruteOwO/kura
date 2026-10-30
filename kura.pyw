@@ -170,7 +170,7 @@ STATUS_COLORS = {"CURRENT": "#3db4f2", "REPEATING": "#3db4f2", "PLANNING": "#c08
 QSS = """
 QWidget { color: @text; }
 QMainWindow, #root { background: @bg; }
-QToolTip { background: @surface2; color: @text; border: 1px solid @border_hi; padding: 5px 8px; border-radius: 6px; }
+QToolTip { background: @surface2; color: @text; border: 1px solid @border_hi; padding: 6px 10px; border-radius: 8px; }
 
 #sidebar { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #12151d, stop:1 #0e1117);
            border-right: 1px solid @border; }
@@ -4251,7 +4251,9 @@ class SettingsPage(Page):
     crunchy_changed = Signal()   # signed in or out of Crunchyroll here
     adult_changed = Signal()     # Adult content switched / its folder changed
     move_adult_requested = Signal()
-    check_updates = Signal()     # Settings → App → Updates: Check now
+    check_updates = Signal()     # Settings → About: Check for updates
+    open_update = Signal()       # Settings → About: Update now / What's new (an update is waiting)
+    open_logs = Signal()         # Settings → About: Logs
     SECTIONS = [("GENERAL", None), ("account", ("person", "Accounts", "Your AniList and Crunchyroll sign-ins, and the search the To download page uses.")),
                 ("folders", ("folder", "Library & folders", "Where your shows live and where downloads land.")),
                 ("sorting", ("sort", "Sorting", "How new episodes are moved and named.")),
@@ -4267,7 +4269,8 @@ class SettingsPage(Page):
                 ("captures", ("photo_camera", "Captures", "Screenshots, clips and GIFs from Kura's player.")),
                 ("TORRENTS", None), ("torrent_feeds", ("rss_feed", "Feeds", "Where Kura looks for new releases, and how often.")),
                 ("torrent_downloads", ("download", "Downloads", "Your torrent app, qBittorrent's Web UI, download folders.")),
-                ("torrent_filters", ("filter_alt", "Filters", "Taiga-style filters that pick which releases to download."))]
+                ("torrent_filters", ("filter_alt", "Filters", "Taiga-style filters that pick which releases to download.")),
+                ("KURA", None), ("about", ("info", "About", "Kura's version and updates, links, and the projects it's built on."))]
 
     def __init__(self, settings, account):
         super().__init__("Settings", f"Saved to {SETTINGS_FILE.name}. Overrides live at the top of anime_organizer.py.")
@@ -4370,6 +4373,7 @@ class SettingsPage(Page):
         self.path_row(fl, "Downloads", "Optional. Adds a \"Sort downloads\" button to Tools → Organize, and is where torrents go when "
                       "a show has no library folder yet.", "downloads")
         col.addWidget(folders)
+        self.build_about()
 
         col = self.sec_cols["sorting"]
         sorting = card()
@@ -4446,22 +4450,16 @@ class SettingsPage(Page):
         self.row(al, "Start in the tray", label("When Windows starts Kura, don't open the window.", "faint",
                                                 wrap=True), mini)
         self.divider(al)
-        upd = QWidget()
-        uh = QHBoxLayout(upd)
-        uh.setContentsMargins(0, 0, 0, 0)
-        uh.setSpacing(10)
-        check = QPushButton("Check now")
-        check.setEnabled(bool(UPDATE_REPO))
-        check.clicked.connect(self.check_updates.emit)
-        auto = Toggle(settings.get("update_auto", True))
-        auto.setEnabled(bool(UPDATE_REPO))
-        auto.setToolTip("Check once a day")
-        auto.toggled.connect(lambda on: self.set("update_auto", on))
-        uh.addWidget(check)
-        uh.addWidget(auto)
-        self.row(al, "Updates", label(f"Kura {APP_VERSION}. " + ("Checks GitHub for a new version once a day (switch), "
-                                      "and tells you in the bell." if UPDATE_REPO else
-                                      "Updates aren't set up in this copy."), "faint", wrap=True), upd)
+        hints = Toggle(settings.get("hover_hints", True))
+
+        def hints_on(on):
+            HOVER_HINTS["on"] = on
+            self.set("hover_hints", on)
+            if not on:
+                QToolTip.hideText()
+        hints.toggled.connect(hints_on)
+        self.row(al, "Hover hints", label("Short explanations when you rest the mouse on a button or setting. Charts "
+                                          "still show their numbers.", "faint", wrap=True), hints)
         self.divider(al)
         own = Toggle(settings.get("own_title_bar", True))
         own.toggled.connect(lambda on: self.set("own_title_bar", on))
@@ -4709,6 +4707,192 @@ class SettingsPage(Page):
             filters = 0
         return (json.dumps(self.settings, sort_keys=True, default=str), filters,
                 len(self.account.entries) if self.account else 0)
+
+    # ---- About (user's pick: About A, canvas XMqwNYYuS9bxcaNYXAyo3n)
+    TAGLINE = "Your anime library: found, downloaded, sorted and played."
+    CREDITS_DATA = ["AniList", "AniSkip", "Jikan (MyAnimeList)", "Anime Filler List", "Anime Tosho", "Nyaa"]
+    CREDITS_BUILT = ["mpv", "FFmpeg", "Qt for Python", "yt-dlp", "anitopy", "Pillow", "Material Symbols",
+                     "Anime4K", "FSRCNNX", "ArtCNN"]
+
+    def build_about(self):
+        col = self.sec_cols["about"]
+        hero = card()
+        h = QHBoxLayout(hero)
+        h.setContentsMargins(26, 24, 26, 24)
+        h.setSpacing(22)
+        logo = QLabel("蔵")
+        logo.setFixedSize(76, 76)
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setStyleSheet(f"background: {C['accent']}; color: white; border-radius: 20px; font-size: 30pt; "
+                           "font-weight: 700;")
+        h.addWidget(logo, 0, Qt.AlignTop)
+        text = QVBoxLayout()
+        text.setSpacing(5)
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        name = QLabel(APP_NAME)
+        name.setStyleSheet("font-family: 'Segoe UI Variable Display'; font-size: 22pt; font-weight: 800;")
+        top.addWidget(name)
+        top.addWidget(label(f"Version {APP_VERSION}", "muted"), 0, Qt.AlignBottom)
+        top.addStretch(1)
+        text.addLayout(top)
+        text.addWidget(label(self.TAGLINE, "muted", wrap=True))
+        self.upd_pill = QLabel()
+        self.upd_pill.setFixedHeight(26)
+        text.addWidget(self.upd_pill, 0, Qt.AlignLeft)
+        text.addStretch(1)
+        h.addLayout(text, 1)
+        btns = QVBoxLayout()
+        btns.setSpacing(10)
+        self.upd_btn = QPushButton(" Check for updates")
+        self.upd_btn.setObjectName("primary")
+        self.upd_btn.setIcon(glyph_icon("sync", "#ffffff"))
+        self.upd_btn.setMinimumWidth(200)
+        self.upd_btn.clicked.connect(self.about_update_clicked)
+        self.upd_btn.setEnabled(bool(UPDATE_REPO))
+        news = QPushButton(" What's new")
+        news.setIcon(glyph_icon("history", C["text"]))
+        news.clicked.connect(self.about_news_clicked)
+        btns.addWidget(self.upd_btn)
+        btns.addWidget(news)
+        btns.addStretch(1)
+        h.addLayout(btns)
+        col.addWidget(hero)
+
+        auto_box = card()
+        al = QVBoxLayout(auto_box)
+        al.setContentsMargins(20, 2, 20, 2)
+        auto = Toggle(self.settings.get("update_auto", True))
+        auto.setEnabled(bool(UPDATE_REPO))
+        auto.toggled.connect(lambda on: self.set("update_auto", on))
+        self.row(al, "Check for updates automatically",
+                 label("Once a day; a new version shows up in the bell." if UPDATE_REPO else
+                       "Updates aren't set up in this copy of Kura.", "faint", wrap=True), auto)
+        col.addWidget(auto_box)
+
+        repo = f"https://github.com/{UPDATE_REPO}" if UPDATE_REPO else ""
+        grid = QHBoxLayout()
+        grid.setSpacing(12)
+        links = card()
+        ll = QVBoxLayout(links)
+        ll.setContentsMargins(20, 16, 20, 16)
+        ll.setSpacing(2)
+        ll.addWidget(label("LINKS", "section"))
+        for glyph, title, url in (("code", "Source code on GitHub", repo),
+                                  ("bug_report", "Report a problem", repo and repo + "/issues/new"),
+                                  ("new_releases", "All releases", repo and repo + "/releases")):
+            b = QPushButton(" " + title)
+            b.setObjectName("ghost")
+            b.setIcon(glyph_icon(glyph, accent_soft()))
+            b.setStyleSheet("text-align: left; padding: 8px 4px;")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setEnabled(bool(url))
+            b.clicked.connect(lambda _=False, u=url: webbrowser.open(u))
+            ll.addWidget(b)
+        soon = QLabel("Socials: coming later")
+        soon.setStyleSheet(f"border: 1px dashed {C['border_hi']}; border-radius: 10px; padding: 9px 12px; "
+                           f"color: {C['muted']};")
+        ll.addSpacing(6)
+        ll.addWidget(soon)
+        ll.addStretch(1)
+        grid.addWidget(links, 1)
+        files = card()
+        fl = QVBoxLayout(files)
+        fl.setContentsMargins(20, 16, 20, 16)
+        fl.setSpacing(8)
+        fl.addWidget(label("LICENSE & FILES", "section"))
+
+        def file_row(glyph, title, sub, button, run):
+            w = QWidget()
+            r = QHBoxLayout(w)
+            r.setContentsMargins(0, 4, 0, 4)
+            r.setSpacing(12)
+            r.addWidget(glyph_label(glyph, C["ok"], 20))
+            t = QVBoxLayout()
+            t.setSpacing(0)
+            t.addWidget(QLabel(title))
+            if sub:
+                sl = label(sub, "faint", wrap=True)
+                sl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                t.addWidget(sl)
+            r.addLayout(t, 1)
+            b = LinkButton(button)
+            b.clicked.connect(run)
+            r.addWidget(b)
+            fl.addWidget(w)
+        lic = SCRIPT_DIR / "LICENSE"
+        file_row("gavel", "Free software under GPL-3.0", "", "View license",
+                 lambda: os.startfile(lic) if lic.exists() else webbrowser.open(repo + "/blob/main/LICENSE"))
+        file_row("folder_open", "Kura's files", str(SCRIPT_DIR), "Open folder", lambda: os.startfile(SCRIPT_DIR))
+        file_row("article", "Logs", "", "Open in Tools", self.open_logs.emit)
+        fl.addStretch(1)
+        grid.addWidget(files, 1)
+        col.addLayout(grid)
+
+        thanks = card()
+        tl = QVBoxLayout(thanks)
+        tl.setContentsMargins(20, 16, 20, 18)
+        tl.setSpacing(10)
+        tl.addWidget(label("THANKS TO", "section"))
+        for what, names in (("Data from", self.CREDITS_DATA), ("Built with", self.CREDITS_BUILT)):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            k = label(what, "faint")
+            k.setFixedWidth(92)
+            row.addWidget(k, 0, Qt.AlignTop)
+            chips = QWidget()
+            flow = FlowLayout(chips, spacing=6)
+            for n in names:
+                c = QLabel(n)
+                c.setStyleSheet(f"background: {C['surface2']}; border-radius: 8px; padding: 4px 10px;")
+                flow.addWidget(c)
+            row.addWidget(chips, 1)
+            tl.addLayout(row)
+        col.addWidget(thanks)
+        col.addStretch(1)
+        self.update_rel = None
+        checked = self.settings.get("update_checked")
+        self.set_update_state("idle", time.strftime("%d %b %H:%M", time.localtime(checked)).lstrip("0") if checked
+                              else "")
+
+    def set_update_state(self, kind, info=None):
+        """The About card's line: idle (info = when last checked), checking, latest, available (info = the release),
+        error (info = why)."""
+        styles = {"ok": (C["ok"], "rgba(62,207,142,0.14)"), "warn": (C["warn"], "rgba(245,182,66,0.14)"),
+                  "muted": (C["muted"], C["surface2"])}
+        if kind == "available":
+            self.update_rel = info
+            text, look = f"Kura {info['version']} is out", "warn"
+            self.upd_btn.setText(" Update now")
+            self.upd_btn.setIcon(glyph_icon("upgrade", "#ffffff"))
+        else:
+            if kind in ("latest", "idle"):
+                self.update_rel = None
+            self.upd_btn.setText(" Check for updates")
+            self.upd_btn.setIcon(glyph_icon("sync", "#ffffff"))
+            now = time.strftime("%H:%M")
+            text, look = {"idle": (f"Last checked {info}" if info else "Not checked yet", "muted"),
+                          "checking": ("Checking…", "muted"),
+                          "latest": (f"Up to date · checked today {now}", "ok"),
+                          "error": (f"Couldn't check: {info}", "warn")}[kind]
+        fg, bg = styles[look]
+        self.upd_pill.setText(text)
+        self.upd_pill.setStyleSheet(f"background: {bg}; color: {fg}; border-radius: 13px; padding: 0 12px; "
+                                    "font-weight: 600;")
+        self.upd_btn.setEnabled(bool(UPDATE_REPO) and kind != "checking")
+
+    def about_update_clicked(self):
+        if self.update_rel:
+            self.open_update.emit()
+        else:
+            self.set_update_state("checking")
+            self.check_updates.emit()
+
+    def about_news_clicked(self):
+        if self.update_rel:
+            self.open_update.emit()
+        elif UPDATE_REPO:
+            webbrowser.open(f"https://github.com/{UPDATE_REPO}/releases/tag/v{APP_VERSION}")
 
     def build_embedded(self):
         """(Re)build the player and torrent sections from the current settings: only when something changed
@@ -12299,6 +12483,142 @@ class ProgressDelegate(QStyledItemDelegate):
         p.restore()
 
 
+SORT_ROLE = Qt.UserRole + 20   # a row's value to sort that column by (sizes, progress, seeds: numbers, not text)
+
+
+class ValueSortItem(QTreeWidgetItem):
+    """Sorts by its SORT_ROLE value where it has one (1.4 GB after 852 MB), else by the text."""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else 0
+        a, b = self.data(col, SORT_ROLE), other.data(col, SORT_ROLE)
+        if a is not None and b is not None:
+            return a < b
+        return self.text(col).casefold() < other.text(col).casefold()
+
+
+class TorrentFilesPanel(QFrame):
+    """Torrents → Files: what's inside the selected release (Feed: read from its .torrent) or download (Downloads:
+    qBittorrent's list). Hidden until the Files button opens it; the list sorts by a click on its headers."""
+    closed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("filespanel")
+        self.setStyleSheet(f"QFrame#filespanel {{ background: {C['surface']}; border: 1px solid {C['border']}; "
+                           "border-radius: 14px; }")
+        self.setFixedWidth(360)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(10)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.title = label("", "h2", wrap=True)
+        top.addWidget(self.title, 1)
+        x = QPushButton()
+        x.setObjectName("icon")
+        x.setIcon(glyph_icon("close", C["muted"]))
+        x.setToolTip("Hide files")
+        x.clicked.connect(self.closed.emit)
+        top.addWidget(x, 0, Qt.AlignTop)
+        v.addLayout(top)
+        self.meta = label("", "faint", wrap=True)
+        self.meta.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.meta)
+        self.chips = QHBoxLayout()
+        self.chips.setSpacing(6)
+        v.addLayout(self.chips)
+        self.list = QTreeWidget()
+        self.list.setObjectName("torrents")
+        self.list.setColumnCount(3)
+        self.list.setHeaderLabels(["Name", "Size", "Done"])
+        self.list.setRootIsDecorated(False)
+        self.list.setWordWrap(True)   # long file names wrap (no cut-off text)
+        self.list.setTextElideMode(Qt.ElideNone)
+        h = self.list.header()
+        h.setStretchLastSection(False)
+        h.setSectionResizeMode(QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        h.setSortIndicator(-1, Qt.AscendingOrder)   # the torrent's own order until a header is clicked
+        self.list.setSortingEnabled(True)
+        v.addWidget(self.list, 1)
+        self.status = label("", "muted", wrap=True)
+        v.addWidget(self.status)
+        v.addStretch(0)
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        self.primary = QPushButton()
+        self.primary.setObjectName("primary")
+        self.secondary = QPushButton()
+        btns.addWidget(self.primary, 1)
+        btns.addWidget(self.secondary)
+        v.addLayout(btns)
+        self.runs = (None, None)
+        self.primary.clicked.connect(lambda: self.runs[0] and self.runs[0]())
+        self.secondary.clicked.connect(lambda: self.runs[1] and self.runs[1]())
+        self.empty()
+
+    def set_buttons(self, primary=None, secondary=None):
+        """(text, run) each; None hides it."""
+        for b, a in ((self.primary, primary), (self.secondary, secondary)):
+            b.setVisible(a is not None)
+            if a:
+                b.setText(a[0])
+        self.runs = (primary and primary[1], secondary and secondary[1])
+
+    def set_chips(self, chips):
+        while self.chips.count():
+            w = self.chips.takeAt(0).widget()
+            if w is not None:
+                w.hide()   # out of the layout now; deleteLater only runs later (it was drawn over the list meanwhile)
+                w.deleteLater()
+        for text, fg, bg in chips:
+            c = QLabel(text)
+            c.setFixedHeight(24)
+            c.setStyleSheet(f"background: {bg}; color: {fg}; border-radius: 8px; padding: 0 9px; font-weight: 600;")
+            self.chips.addWidget(c)
+        self.chips.addStretch(1)
+
+    def message(self, title, meta, text, primary=None, secondary=None):
+        self.title.setText(title)
+        self.meta.setText(meta)
+        self.set_chips([])
+        self.list.clear()
+        self.list.hide()
+        self.status.setText(text)
+        self.status.show()
+        self.set_buttons(primary, secondary)
+
+    def empty(self, text="Pick a release to see what's inside."):
+        self.message("Files", "", text)
+
+    def show_files(self, title, meta, files, chips=(), done_col=False, primary=None, secondary=None):
+        """files: [{path, size, glyph, color, dim, done (text), done_v (sort value)}]."""
+        self.title.setText(title)
+        self.meta.setText(meta)
+        self.set_chips(chips)
+        self.list.setSortingEnabled(False)
+        self.list.clear()
+        self.list.setColumnHidden(2, not done_col)
+        for f in files:
+            row = ValueSortItem([f["path"].rsplit("/", 1)[-1], fmt_bytes(f["size"]), f.get("done", "")])
+            row.setData(1, SORT_ROLE, f["size"])
+            if "done_v" in f:
+                row.setData(2, SORT_ROLE, f["done_v"])
+            row.setIcon(0, glyph_icon(f["glyph"], f["color"], px=16))
+            row.setToolTip(0, f["path"])
+            if f.get("dim"):
+                for c in range(3):
+                    row.setForeground(c, QColor(C["muted"]))
+            self.list.addTopLevelItem(row)
+        self.list.setSortingEnabled(True)
+        self.list.show()
+        self.status.setText("No files listed.")
+        self.status.setVisible(not files)
+        self.set_buttons(primary, secondary)
+
+
 class TorrentPage(Page):
     open_section = Signal(str)   # a Settings section (torrent settings live there)
     """Taiga's torrent feed: releases matched to your shows and run through your filters;
@@ -12348,13 +12668,29 @@ class TorrentPage(Page):
         ask.setToolTip("When you press Check feed and it finds episodes you don't have, Kura asks whether to "
                        "download them")
         self.asked = set()   # torrents already offered after a manual check (asked once each)
-        for w in (gear, ask, check, self.dl_btn):
+        self.files_btn = QPushButton(" Files")
+        self.files_btn.setCheckable(True)
+        self.files_btn.setIcon(glyph_icon("folder_open", C["text"]))
+        self.files_btn.setToolTip("What's inside the selected release or download")
+        self.files_btn.setChecked(bool(settings.get("torrent_files_panel", False)))
+        self.files_btn.setStyleSheet(f"QPushButton:checked {{ background: rgba({accent_rgb()},0.30); "
+                                     f"border-color: {C['accent']}; }}")   # the same "on" look as other toggles
+        self.files_btn.toggled.connect(self.toggle_files)
+        for w in (gear, self.files_btn, ask, check, self.dl_btn):
             self.actions.addWidget(w)
         self.feed_only = [ask, check, self.dl_btn]
 
         # Two views: the feed (Taiga-style) and your downloads in qBittorrent
         self.stack = QStackedWidget()
-        self.outer.addWidget(self.stack, 1)
+        split = QHBoxLayout()
+        split.setSpacing(14)
+        split.addWidget(self.stack, 1)
+        self.files_panel = TorrentFilesPanel()
+        self.files_panel.closed.connect(lambda: self.files_btn.setChecked(False))
+        split.addWidget(self.files_panel)
+        self.outer.addLayout(split, 1)
+        self.files_panel.setVisible(self.files_btn.isChecked())   # parented by now (no flash as its own window)
+        self.file_cache, self.files_gen, self.files_calls = {}, 0, set()
         self.feed_box = QWidget()
         fl = QVBoxLayout(self.feed_box)
         fl.setContentsMargins(0, 0, 0, 0)
@@ -12433,6 +12769,13 @@ class TorrentPage(Page):
         head.setStretchLastSection(False)
         head.setSectionResizeMode(QHeaderView.ResizeToContents)
         head.setSectionResizeMode(1, QHeaderView.Stretch)
+        head.setSectionsClickable(True)   # sort by a column, like Explorer (a third click: Kura's own order)
+        head.sectionClicked.connect(self.sort_by)
+        self.fsort = tuple(settings.get("torrents_sort") or ()) or None
+        self.show_sort()
+        for col in (8, 9):   # the Files panel left open last time: room for the names
+            self.tree.setColumnHidden(col, self.files_btn.isChecked())
+        self.tree.currentItemChanged.connect(lambda *_: self.update_files())
         self.tree.itemChanged.connect(self.on_item_changed)
         self.tree.itemClicked.connect(lambda row, _: self.toggle_batches(row))
         self.tree.itemDoubleClicked.connect(lambda row, _: self.item_of(row) and self.open_page(self.item_of(row)))
@@ -13196,6 +13539,12 @@ class TorrentPage(Page):
         head.setSectionResizeMode(0, QHeaderView.Stretch)
         head.setSectionResizeMode(2, QHeaderView.Fixed)
         head.resizeSection(2, 170)
+        ds = self.settings.get("torrents_dl_sort")
+        head.setSortIndicator(ds[0], Qt.SortOrder(ds[1])) if ds else head.setSortIndicator(-1, Qt.AscendingOrder)
+        self.dl_tree.setSortingEnabled(True)   # a click on a header sorts, like Explorer (ValueSortItem: numbers by value)
+        head.sortIndicatorChanged.connect(lambda c, o: (self.settings.__setitem__("torrents_dl_sort", [c, o.value]),
+                                                        save_settings(self.settings)))
+        self.dl_tree.currentItemChanged.connect(lambda *_: self.update_files())
         self.dl_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.dl_tree.customContextMenuRequested.connect(self.download_menu)
         self.dl_tree.itemDoubleClicked.connect(lambda row, _: self.open_download_folder(self.download_of(row)))
@@ -13213,6 +13562,7 @@ class TorrentPage(Page):
             self.fill_downloads()
         else:
             self.populate()
+        self.update_files()   # the panel shows that view's selection
 
     def set_downloads(self, downloads):
         self.downloads = downloads
@@ -13247,7 +13597,7 @@ class TorrentPage(Page):
         for h, t in torrents.items():
             row = self.dl_rows.get(h)
             if row is None:
-                row = self.dl_rows[h] = QTreeWidgetItem()
+                row = self.dl_rows[h] = ValueSortItem()
                 row.setData(0, Qt.UserRole, h)
                 self.dl_tree.addTopLevelItem(row)
             mid, ep = t.get("mid"), t.get("episode")
@@ -13264,6 +13614,14 @@ class TorrentPage(Page):
                 if row.text(c) != v:
                     row.setText(c, v)
             row.setData(2, Qt.UserRole, float(t.get("progress", 0)))
+            try:
+                ep_v = float(ep or 0)
+            except (TypeError, ValueError):
+                ep_v = 0.0
+            for c, v in ((1, ep_v), (2, float(t.get("progress", 0))), (3, t.get("size", 0)), (4, speed),
+                         (5, 10 ** 12 if done else eta), (6, t.get("num_seeds", 0))):
+                if row.data(c, SORT_ROLE) != v:
+                    row.setData(c, SORT_ROLE, v)
             row.setData(2, Qt.UserRole + 1, "done" if done else "paused" if "paused" in t.get("state", "")
                         or "stopped" in t.get("state", "") else "error" if t.get("state") in ("error", "missingFiles")
                         else "active")
@@ -13653,6 +14011,11 @@ class TorrentPage(Page):
         rows = [(i, it) for i, it in enumerate(self.items) if show_hidden or not it.get("hidden")]
         rows.sort(key=lambda r: (bool((r[1].get("parsed") or {}).get("batch")),
                                  not r[1].get("suggested"), TORRENT_ORDER.index(r[1].get("state", "neutral")), r[0]))
+        if self.fsort:   # a clicked column, within the single episodes and within the batches (the group stays below)
+            col, desc = self.fsort
+            is_batch = lambda r: bool((r[1].get("parsed") or {}).get("batch"))
+            rows = [r for grp in (False, True) for r in sorted((r for r in rows if is_batch(r) == grp),
+                                                               key=lambda r: self.sort_key(r[1], col), reverse=desc)]
         batches_open = self.settings.get("torrents_batches_open", True)
         n_batches = sum(1 for _, it in rows if (it.get("parsed") or {}).get("batch"))
         header_done = False
@@ -13741,6 +14104,168 @@ class TorrentPage(Page):
             parts.append("checked " + time.strftime("%H:%M", time.localtime(self.checked_at)))
         self.subtitle.setText("  ·  ".join(parts))
         self.update_button()
+
+    # ---- sorting by a column (Explorer-like)
+    def sort_by(self, col):
+        first_desc = col in (5, 6)   # Size, Seeds: biggest first
+        cur = self.fsort
+        if not cur or cur[0] != col:
+            self.fsort = (col, first_desc)
+        elif cur[1] == first_desc:
+            self.fsort = (col, not first_desc)
+        else:
+            self.fsort = None   # third click: Kura's own order (ticked and suggested first)
+        self.settings["torrents_sort"] = list(self.fsort) if self.fsort else None
+        save_settings(self.settings)
+        self.show_sort()
+        self.populate()
+
+    def show_sort(self):
+        head = self.tree.header()
+        head.setSortIndicatorShown(bool(self.fsort))
+        if self.fsort:
+            head.setSortIndicator(self.fsort[0], Qt.DescendingOrder if self.fsort[1] else Qt.AscendingOrder)
+
+    def sort_key(self, it, col):
+        p = it.get("parsed") or {}
+        if col == 0:
+            return 0 if it.get("selected") else 1
+        if col == 1:
+            return (self.titles.get(it.get("mid")) or p.get("name") or it["title"]).casefold()
+        if col == 2:
+            eps = it.get("batch_eps") or p.get("episodes") or []
+            try:
+                return float(min(eps) if eps else it.get("episode") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        if col == 3:
+            return (p.get("group") or "").casefold()
+        if col == 4:
+            return int(re.sub(r"\D", "", p.get("resolution") or "") or 0)
+        if col == 5:
+            return tor._size_mib(it.get("size"))
+        if col == 6:
+            return it.get("seeders") or 0
+        if col == 7:
+            state = it.get("state", "neutral")
+            return TORRENT_ORDER.index(state) if state in TORRENT_ORDER else len(TORRENT_ORDER)
+        if col == 8:
+            return (it.get("reason") or "").casefold()
+        return self.found_text(it).casefold()
+
+    # ---- the Files panel
+    def toggle_files(self, on):
+        self.settings["torrent_files_panel"] = on
+        save_settings(self.settings)
+        self.files_panel.setVisible(on)
+        for col in (8, 9):   # Filter, Found by: room for the names while the panel is open (their hover hint stays)
+            self.tree.setColumnHidden(col, on)
+        if on:
+            self.update_files()
+
+    def show_files_for(self, tree, row):
+        tree.setCurrentItem(row)
+        self.files_btn.setChecked(True)
+        self.update_files()
+
+    def update_files(self):
+        if not self.files_panel.isVisible():
+            return
+        self.files_gen += 1
+        if self.stack.currentIndex() == 1:
+            row = self.dl_tree.currentItem()
+            self.show_download_files(self.download_of(row) if row is not None else None)
+        else:
+            self.show_feed_files(self.item_of(self.tree.currentItem()))
+
+    def show_feed_files(self, it):
+        panel = self.files_panel
+        if it is None:
+            return panel.empty()
+        p = it.get("parsed") or {}
+        title = self.titles.get(it.get("mid")) or p.get("name") or it["title"]
+        page = ("Torrent page", lambda i=it: self.open_page(i)) if it.get("page") else None
+        key = it.get("hash") or it.get("link") or it["title"]
+        cached = self.file_cache.get(key)
+        if cached is None:
+            link = it.get("link") or ""
+            if not link.endswith(".torrent"):
+                return panel.message(title, it["title"], "This release has no .torrent file to read; its page lists "
+                                     "the files.", page)
+            panel.message(title, it["title"], "Reading the file list…")
+            gen = self.files_gen
+            call = BgCall(lambda u=link: tor.torrent_files(u))
+
+            def done(res, err, k=key, i=it, c=call):
+                c.wait()
+                self.files_calls.discard(c)
+                if res:
+                    self.file_cache[k] = res
+                if gen != self.files_gen:
+                    return
+                if res:
+                    self.show_feed_files(i)
+                else:
+                    panel.message(title, i["title"], f"Couldn't read the file list ({err}).", page)
+            call.done.connect(done)
+            self.files_calls.add(call)
+            call.start()
+            return
+        _, files = cached
+        have, new = set(it.get("batch_have") or []), set(it.get("batch_new") or [])
+        rows = []
+        for path, size in files:
+            fname = path.rsplit("/", 1)[-1]
+            video = Path(fname).suffix.lower() in org.VIDEO_EXTS
+            eps = set(tor.parse_release(fname).get("episodes") or []) if video else set()
+            if not eps:
+                glyph, color, dim = "description", C["faint"], True   # extras: fonts, NCOP, subtitles...
+            elif have and eps <= have:
+                glyph, color, dim = "check_circle", C["ok"], True
+            else:
+                glyph, color, dim = "movie", accent_soft(), False
+            rows.append({"path": path, "size": size, "glyph": glyph, "color": color, "dim": dim})
+        n, total = len(files), sum(size for _, size in files)
+        meta = f"{it['title']}\n{n} file{'s' if n != 1 else ''} · {fmt_bytes(total)}"
+        chips = []
+        if have:
+            chips.append((f"You have {episode_ranges(sorted(have))}", C["ok"], "rgba(62,207,142,0.14)"))
+        if have and new:
+            chips.append((f"New for you: {episode_ranges(sorted(new))}", accent_soft(), "rgba(124,108,255,0.18)"))
+        s = self.settings
+        only_new = bool(have and new and s.get("torrent_app") == "qbit" and s.get("torrent_only_missing", True))
+        get = (f"Download the {len(new)} new" if only_new else "Download", lambda i=it: self.download([i]))
+        panel.show_files(title, meta, rows, chips, primary=get, secondary=page)
+
+    def show_download_files(self, t):
+        panel = self.files_panel
+        if t is None:
+            return panel.empty("Pick a download to see its files.")
+        title = self.titles.get(t.get("mid")) or tor.parse_release(t.get("name", ""))["name"] or t.get("name", "")
+        client = self.downloads.client if self.downloads else None
+        if client is None:
+            return panel.message(title, t.get("name", ""), "qBittorrent's Web UI isn't connected.")
+        panel.message(title, t.get("name", ""), "Asking qBittorrent for the file list…")
+        gen, h = self.files_gen, t.get("hash")
+
+        def done(files, err):
+            if gen != self.files_gen:
+                return
+            if err or files is None:
+                return panel.message(title, t.get("name", ""), f"qBittorrent didn't list the files ({err}).")
+            rows = []
+            for f in files:
+                prog, skip = float(f.get("progress", 0)), f.get("priority", 1) == 0
+                glyph, color = (("block", C["faint"]) if skip else ("check_circle", C["ok"]) if prog >= 1
+                                else ("downloading", accent_soft()))
+                rows.append({"path": f.get("name", ""), "size": int(f.get("size", 0)), "glyph": glyph,
+                             "color": color, "dim": skip or prog >= 1,
+                             "done": "Skipped" if skip else f"{prog * 100:.0f}%", "done_v": -1.0 if skip else prog})
+            meta = f"{t.get('name', '')}\n{len(files)} file{'s' if len(files) != 1 else ''} · " \
+                   f"{fmt_bytes(t.get('size', 0))}"
+            panel.show_files(title, meta, rows, done_col=True,
+                             primary=("Open folder", lambda: self.open_download_folder(t)))
+        self.downloads.run(lambda: client.files(h), done)
 
     def item_of(self, row):
         i = row.data(0, Qt.UserRole) if row is not None else None
@@ -13930,6 +14455,7 @@ class TorrentPage(Page):
         menu = QMenu(self)
         menu.addAction(glyph_icon(G["download"], C["text"]),
                        f"Download {len(picked)} torrents" if len(picked) > 1 else "Download", lambda: self.download(picked))
+        menu.addAction(glyph_icon("folder_open", C["text"]), "Show files", lambda: self.show_files_for(self.tree, row))
         menu.addAction(glyph_icon(G["globe"], C["text"]), "Open torrent page", lambda: self.open_page(it))
         menu.addAction(glyph_icon(G["copy"], C["text"]), "Copy magnet link",
                        lambda: QApplication.clipboard().setText(tor.magnet(it)))
@@ -15379,6 +15905,9 @@ class PlaybackSettingsDialog(KuraDialog):
         save_settings(s)
 
 
+HOVER_HINTS = {"on": True}   # Settings → App → Hover hints (WheelDebounce's filter blocks ToolTip events when off)
+
+
 class WheelDebounce(QObject):
     """The user's mouse wheel bounces: while spinning it sometimes sends a single tick the
     wrong way, often in the same millisecond as a real tick, or just before one after a
@@ -15401,7 +15930,16 @@ class WheelDebounce(QObject):
                             timerType=Qt.PreciseTimer)
 
     def eventFilter(self, obj, e):
-        if self.replaying or e.type() != QEvent.Wheel:
+        t = e.type()
+        if t == QEvent.ToolTip:   # Settings → App → Hover hints off: no hover text (charts draw their own readouts)
+            return not HOVER_HINTS["on"]
+        if t == QEvent.Polish and obj.isWidgetType() and obj.metaObject().className() == "QTipLabel":
+            # Qt's hover text is a small window of its own: see-through so the rounded style shows (a solid one
+            # has square corners) and without Windows' square drop shadow
+            obj.setAttribute(Qt.WA_TranslucentBackground)
+            obj.setWindowFlags(obj.windowFlags() | Qt.NoDropShadowWindowHint)   # (setWindowFlag(f) alone: no-op)
+            return False
+        if self.replaying or t != QEvent.Wheel:
             return False
         d, ts = e.angleDelta().y(), e.timestamp()
         if not d:
@@ -26697,6 +27235,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
+        HOVER_HINTS["on"] = self.settings.get("hover_hints", True)
         self.job = None
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
@@ -26956,7 +27495,10 @@ class MainWindow(QMainWindow):
         acct.ADULT["on"] = False
         self.settings_page.adult_changed.connect(lambda: apply_settings(self.settings))
         self.settings_page.move_adult_requested.connect(self.move_adult_shows)
-        self.settings_page.check_updates.connect(lambda: self.check_updates(manual=True))
+        self.settings_page.check_updates.connect(lambda: self.check_updates(manual=True, quiet=True))
+        self.settings_page.open_update.connect(
+            lambda: getattr(self, "latest_release", None) and UpdateDialog(self, self.latest_release).exec())
+        self.settings_page.open_logs.connect(lambda: (self.go(self.TOOLS), self.tools.open_tool(8)))
         QShortcut(QKeySequence("Ctrl+Shift+A"), self, activated=lambda: self.settings.get("adult_enabled") and
                   self.set_mode(not acct.ADULT["on"]))
         tl.captures.art_changed.connect(self.custom_art_changed)
@@ -28570,8 +29112,9 @@ class MainWindow(QMainWindow):
             return
         self.check_updates()
 
-    def check_updates(self, manual=False):
-        """Ask GitHub for the newest release. New: a note in the bell (manual: the update window at once)."""
+    def check_updates(self, manual=False, quiet=False):
+        """Ask GitHub for the newest release. New: a note in the bell (manual: the update window at once; quiet,
+        from Settings → About: only About's card says what was found)."""
         if not UPDATE_REPO:
             if manual:
                 self.notify("Updates aren't set up in this copy of Kura", keep=False)
@@ -28585,15 +29128,21 @@ class MainWindow(QMainWindow):
             self.update_job = None
             self.settings["update_checked"] = time.time()
             save_settings(self.settings)
+            sp = self.settings_page
             if err or not rel:
-                if manual:
+                sp.set_update_state("error", str(err) if err else "no updates published yet")
+                if manual and not quiet:
                     self.notify(f"Couldn't check for updates: {err}" if err else "No updates published yet",
                                 keep=False)
                 return
             self.latest_release = rel
             if not upd_mod.is_newer(rel["version"], APP_VERSION):
-                if manual:
+                sp.set_update_state("latest")
+                if manual and not quiet:
                     self.notify(f"Kura {APP_VERSION} is the newest version", keep=False)
+                return
+            sp.set_update_state("available", rel)
+            if quiet:
                 return
             if manual:
                 UpdateDialog(self, rel).exec()
@@ -29597,6 +30146,9 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)   # the tray keeps Kura running; quitting is explicit
+    # hover text appears at once: Qt's slide / fade plays in a solid window of its own (square corners flash)
+    QApplication.setEffectEnabled(Qt.UI_AnimateTooltip, False)
+    QApplication.setEffectEnabled(Qt.UI_FadeTooltip, False)
     app._wheel_debounce = WheelDebounce(app)
     app.installEventFilter(app._wheel_debounce)   # no end-of-page jitter from stray wheel ticks
 

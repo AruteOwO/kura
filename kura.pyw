@@ -64,7 +64,7 @@ DETAILS_FILE = SCRIPT_DIR / "anilist_details.json"   # show info for the detail 
 PLAYBACK_STATE_FILE = SCRIPT_DIR / "playback_state.json"   # where Kura's player left off, per file
 APP_NAME = "Kura"
 APP_ID = "Kura.AnimeLibrary"   # Windows groups the taskbar button and icon under this
-APP_VERSION = "1.0.5"          # release.py sets it
+APP_VERSION = "1.0.6"          # release.py sets it
 UPDATE_REPO = "AruteOwO/kura"               # "owner/name" on GitHub: where updates come from (updater.py); empty = no updates
 
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -242,6 +242,7 @@ QLineEdit { background: @surface2; border: 1px solid @border; border-radius: 8px
 QLineEdit:focus { border-color: @accent; }
 QLineEdit#search { min-width: 240px; }
 
+QTextBrowser { background: @bg; border: 1px solid @border; border-radius: 10px; padding: 6px; }
 QPlainTextEdit#log { background: #0b0d11; border: 1px solid @border; border-radius: 10px; padding: 8px;
                      selection-background-color: @accent; }
 QListWidget#queue { background: transparent; border: none; outline: none; }
@@ -316,6 +317,10 @@ QMenu { background: @surface2; border: 1px solid @border_hi; border-radius: 8px;
 QMenu::item { padding: 7px 18px; border-radius: 5px; }
 QMenu::item:selected { background: rgba(124, 108, 255, 0.22); }
 QMessageBox { background: @surface; }
+QDialog[kuraframe="true"], QMessageBox[kuraframe="true"], QInputDialog[kuraframe="true"] { background: transparent; }
+QPushButton#dlgclose { background: transparent; border: none; border-radius: 8px; padding: 0; }
+QPushButton#dlgclose:hover { background: #c42b1c; }
+QPushButton#dlgclose:pressed { background: #a8261a; }
 QMessageBox QLabel { color: @text; }
 """
 
@@ -4463,8 +4468,9 @@ class SettingsPage(Page):
         self.divider(al)
         own = Toggle(settings.get("own_title_bar", True))
         own.toggled.connect(lambda on: self.set("own_title_bar", on))
-        self.row(al, "Kura's own title bar", label("Window buttons in Kura's colors, the search on top. Off: Windows' "
-                                                   "title bar. Takes effect when Kura starts again.", "faint",
+        self.row(al, "Kura's own title bar", label("Window buttons in Kura's colors, the search on top, and the same "
+                                                   "bar on pop-ups. Off: Windows' title bars. Takes effect when Kura "
+                                                   "starts again.", "faint",
                                                    wrap=True), own)
         self.divider(al)
         look = QComboBox()
@@ -10407,6 +10413,159 @@ def dot_icon(color, px=10):
     return QIcon(pm)
 
 
+# ---------------------------------------------------------------- pop-ups with Kura's own title bar
+DIALOG_FRAME = {"on": False}   # Settings → App → Kura's own title bar (MainWindow sets it); off: Windows' frame
+FRAME_SHADOW, FRAME_BAR, FRAME_RADIUS = 14, 42, 14
+
+
+class DialogBack(QWidget):
+    """Behind a framed pop-up: a soft shadow in its margin and the rounded panel. Its edges resize the pop-up when it
+    can be resized (the shadow margin counts, like Windows 11)."""
+
+    def __init__(self, dlg):
+        super().__init__(dlg)
+        self.setObjectName("kura_back")
+        self.setMouseTracking(True)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        sh = FRAME_SHADOW
+        card = QRectF(self.rect()).adjusted(sh, sh, -sh, -sh)
+        p.setPen(Qt.NoPen)
+        for i in range(sh, 0, -1):   # layers of a faint shadow, darker near the panel, a little lower than it
+            p.setBrush(QColor(0, 0, 0, 7))
+            p.drawRoundedRect(card.adjusted(-i, -i + 3, i, i + 3), FRAME_RADIUS + i, FRAME_RADIUS + i)
+        p.setBrush(QColor(C["surface"]))
+        p.setPen(QPen(QColor(C["border_hi"]), 1))
+        p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), FRAME_RADIUS, FRAME_RADIUS)
+        p.setPen(QPen(QColor(C["border"]), 1))   # under the title bar
+        y = card.top() + FRAME_BAR + 0.5
+        p.drawLine(QPointF(card.left() + 1, y), QPointF(card.right() - 1, y))
+
+    def edges(self, pos):
+        dlg = self.window()
+        if dlg.minimumSize() == dlg.maximumSize() or isinstance(dlg, QMessageBox):
+            return Qt.Edges()
+        band = FRAME_SHADOW + 5
+        e = Qt.Edges()
+        if pos.x() < band:
+            e |= Qt.LeftEdge
+        elif pos.x() >= self.width() - band:
+            e |= Qt.RightEdge
+        if pos.y() < band:
+            e |= Qt.TopEdge
+        elif pos.y() >= self.height() - band:
+            e |= Qt.BottomEdge
+        return e
+
+    def mouseMoveEvent(self, e):
+        edges = self.edges(e.position().toPoint())
+        shapes = {Qt.LeftEdge: Qt.SizeHorCursor, Qt.RightEdge: Qt.SizeHorCursor, Qt.TopEdge: Qt.SizeVerCursor,
+                  Qt.BottomEdge: Qt.SizeVerCursor, Qt.LeftEdge | Qt.TopEdge: Qt.SizeFDiagCursor,
+                  Qt.RightEdge | Qt.BottomEdge: Qt.SizeFDiagCursor, Qt.RightEdge | Qt.TopEdge: Qt.SizeBDiagCursor,
+                  Qt.LeftEdge | Qt.BottomEdge: Qt.SizeBDiagCursor}
+        shape = shapes.get(edges)
+        if shape is None:
+            self.unsetCursor()
+        else:
+            self.setCursor(shape)
+
+    def mousePressEvent(self, e):
+        edges = self.edges(e.position().toPoint())
+        handle = self.window().windowHandle()
+        if e.button() == Qt.LeftButton and edges and handle is not None:
+            handle.startSystemResize(edges)
+
+
+class DialogBar(QWidget):
+    """A framed pop-up's title bar: 蔵, its title, a close button; dragging it moves the pop-up (Windows moves it,
+    so it snaps like any window)."""
+
+    def __init__(self, dlg):
+        super().__init__(dlg)
+        self.setObjectName("kura_bar")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 0, 8, 0)
+        h.setSpacing(10)
+        tile = QLabel("蔵")
+        tile.setFixedSize(22, 22)
+        tile.setAlignment(Qt.AlignCenter)
+        tile.setStyleSheet(f"background: {C['accent']}; color: white; border-radius: 6px; font-size: 9pt; "
+                           "font-weight: 700;")
+        h.addWidget(tile)
+        self.text = QLabel(dlg.windowTitle())
+        self.text.setObjectName("kura_title")
+        self.text.setStyleSheet(f"color: {C['muted']};")
+        h.addWidget(self.text, 1)
+        close = QPushButton()
+        close.setObjectName("dlgclose")
+        close.setFixedSize(38, 30)
+        close.setIcon(glyph_icon("close", C["text"], "#ffffff", px=16))
+        close.setFocusPolicy(Qt.NoFocus)
+        close.setToolTip("Close")
+        close.clicked.connect(dlg.reject if isinstance(dlg, QDialog) else dlg.close)
+        h.addWidget(close)
+
+    def mousePressEvent(self, e):
+        handle = self.window().windowHandle()
+        if e.button() == Qt.LeftButton and handle is not None:
+            handle.startSystemMove()
+
+
+def frame_dialog(dlg):
+    """Kura's look for a pop-up, as it's polished (before its window exists): frameless and see-through, the shadow +
+    panel behind, the title bar on top; its own contents keep their layout, moved in by the frame's margins."""
+    dlg.setProperty("kuraframe", True)
+    dlg.setWindowFlags(dlg.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)   # (setWindowFlag(f): no-op)
+    dlg.setAttribute(Qt.WA_TranslucentBackground)
+    dlg.style().unpolish(dlg)
+    dlg.style().polish(dlg)   # the transparent background (QSS [kuraframe="true"])
+    sh = FRAME_SHADOW
+    m = dlg.contentsMargins()
+    dlg.setContentsMargins(m.left() + sh, m.top() + sh + FRAME_BAR, m.right() + sh, m.bottom() + sh)
+    grow = QSize(2 * sh, 2 * sh + FRAME_BAR)
+    if dlg.minimumSize() == dlg.maximumSize() and dlg.minimumWidth() > 0:
+        dlg.setFixedSize(dlg.minimumSize() + grow)
+    else:
+        if dlg.minimumWidth() or dlg.minimumHeight():
+            dlg.setMinimumSize(dlg.minimumSize() + grow)
+        if dlg.testAttribute(Qt.WA_Resized):   # a size the code asked for: the same room inside
+            dlg.resize(dlg.size() + grow)
+    back = DialogBack(dlg)
+    back.lower()
+    bar = DialogBar(dlg)
+    place_frame(dlg)
+    back.show()
+    bar.show()
+
+
+def place_frame(dlg):
+    back, bar = dlg.findChild(QWidget, "kura_back"), dlg.findChild(QWidget, "kura_bar")
+    if back is None or bar is None:
+        return
+    sh = FRAME_SHADOW
+    back.setGeometry(0, 0, dlg.width(), dlg.height())
+    back.lower()
+    bar.setGeometry(sh + 1, sh + 1, dlg.width() - 2 * sh - 2, FRAME_BAR)
+    bar.raise_()
+
+
+def frame_event(obj, t):
+    """From the app-wide filter (WheelDebounce): pop-ups get the frame as they're polished, then keep it in place."""
+    if t == QEvent.Polish:
+        if (DIALOG_FRAME["on"] and isinstance(obj, QDialog) and obj.isWindow() and not isinstance(obj, QFileDialog)
+                and not obj.property("kuraframe") and not obj.property("kura_native")):
+            frame_dialog(obj)
+    elif obj.property("kuraframe"):
+        if t == QEvent.Resize:
+            place_frame(obj)
+        elif t == QEvent.WindowTitleChange:
+            title = obj.findChild(QLabel, "kura_title")
+            if title is not None:
+                title.setText(obj.windowTitle())
+
+
 class KuraDialog(QDialog):
     """Dialog with Kura's look (dark title bar, padding)."""
 
@@ -15938,6 +16097,9 @@ class WheelDebounce(QObject):
             # has square corners) and without Windows' square drop shadow
             obj.setAttribute(Qt.WA_TranslucentBackground)
             obj.setWindowFlags(obj.windowFlags() | Qt.NoDropShadowWindowHint)   # (setWindowFlag(f) alone: no-op)
+            return False
+        if t in (QEvent.Polish, QEvent.Resize, QEvent.WindowTitleChange) and obj.isWidgetType() and obj.isWindow():
+            frame_event(obj, t)
             return False
         if self.replaying or t != QEvent.Wheel:
             return False
@@ -27236,6 +27398,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = load_settings()
         HOVER_HINTS["on"] = self.settings.get("hover_hints", True)
+        DIALOG_FRAME["on"] = (os.name == "nt" and self.settings.get("own_title_bar", True)
+                              and "--selftest-native" not in sys.argv)
         self.job = None
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())

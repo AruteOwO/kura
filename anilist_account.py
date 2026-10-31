@@ -26,12 +26,103 @@ import anime_organizer as org
 
 TOKEN_FILE = org.SCRIPT_DIR / "anilist_token.bin"
 LIST_FILE = org.LIST_FILE
-DEVELOPER_URL = "https://anilist.co/settings/developer"
-REDIRECT_URL = "https://anilist.co/api/v2/oauth/pin"   # AniList shows the token so it can be pasted
+# Kura's AniList client sends the login back here (its Redirect URL): TokenCatcher listens on this PC only, only
+# while you're connecting, so "Authorize" in the browser is all it takes (nothing to paste)
+REDIRECT_PORT = 52831
+REDIRECT_URL = f"http://localhost:{REDIRECT_PORT}/anilist"
 
 
 def authorize_url(client_id):
     return f"https://anilist.co/api/v2/oauth/authorize?client_id={client_id}&response_type=token"
+
+
+# The browser tab AniList sends you back to: the token is in the address's #fragment (the browser never sends that
+# part), so this page hands it to Kura, wipes it from the address bar and says you can close the tab
+CATCH_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Kura</title><style>
+body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0f1115;color:#e7e9ef;
+font-family:'Segoe UI',system-ui,sans-serif}.c{text-align:center;padding:24px}.t{width:72px;height:72px;
+border-radius:18px;background:#7c6cff;color:#fff;font-size:40px;font-weight:700;display:flex;align-items:center;
+justify-content:center;margin:0 auto 20px}h1{font-size:24px;margin:0 0 8px}p{color:#8a92a6;margin:0;font-size:15px}
+</style></head><body><div class="c"><div class="t">蔵</div><h1 id="h">Connecting…</h1><p id="p"></p></div><script>
+const h = new URLSearchParams(location.hash.slice(1)), q = new URLSearchParams(location.search);
+const tok = h.get("access_token");
+const say = (a, b) => { document.getElementById("h").textContent = a; document.getElementById("p").textContent = b; };
+history.replaceState(null, "", location.pathname);
+fetch("/token", {method: "POST", body: tok || ""}).then(() => tok
+  ? say("Kura is connected", "You can close this tab and go back to Kura.")
+  : say("Not connected", (h.get("error_description") || q.get("error_description") || "AniList didn't send a login.")
+        + " You can close this tab."))
+  .catch(() => say("Kura isn't waiting any more", "Go back to Kura and press Connect AniList again."));
+</script></body></html>"""
+
+
+class TokenCatcher(QObject):
+    """Connect AniList without pasting: listens on localhost:REDIRECT_PORT (this PC only, IPv4 and IPv6) until
+    the browser's tab hands over the token, or for 5 minutes. got(token) / failed(reason) arrive on Kura's thread."""
+    got = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.servers = []
+        self.timer = QTimer(self, singleShot=True, interval=5 * 60 * 1000,
+                            timeout=lambda: (self.stop(), self.failed.emit("No answer from AniList (5 minutes).")))
+
+    def start(self):
+        """True when it's listening (False: the port is taken by another program)."""
+        import http.server
+        import socket
+        import threading
+        self.stop()
+        catcher = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):   # (never log the token)
+                pass
+
+            def do_GET(self):
+                if self.path.split("?")[0] != "/anilist":
+                    self.send_error(404)
+                    return
+                body = CATCH_PAGE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                if self.path != "/token":
+                    self.send_error(404)
+                    return
+                n = min(int(self.headers.get("Content-Length") or 0), 8192)
+                token = self.rfile.read(n).decode("utf-8", "replace").strip()
+                self.send_response(204)
+                self.end_headers()
+                if token:
+                    catcher.got.emit(token)
+                else:
+                    catcher.failed.emit("AniList didn't send a login (Authorize wasn't clicked).")
+
+        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            try:
+                server_cls = type("CatchServer", (http.server.ThreadingHTTPServer,), {"address_family": family})
+                srv = server_cls((host, REDIRECT_PORT), Handler)
+            except OSError:
+                continue
+            threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.3}, daemon=True).start()
+            self.servers.append(srv)
+        if self.servers:
+            self.timer.start()
+        return bool(self.servers)
+
+    def stop(self):
+        import threading
+        self.timer.stop()
+        for srv in self.servers:   # shutdown() waits for its loop: off Kura's thread
+            threading.Thread(target=lambda s=srv: (s.shutdown(), s.server_close()), daemon=True).start()
+        self.servers = []
 
 
 STATUS_ORDER = ["CURRENT", "PLANNING", "COMPLETED", "REPEATING", "PAUSED", "DROPPED"]

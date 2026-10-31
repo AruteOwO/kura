@@ -68,6 +68,12 @@ APP_NAME = "Kura"
 APP_ID = "Kura.AnimeLibrary"   # Windows groups the taskbar button and icon under this
 APP_VERSION = "1.0.7"          # release.py sets it
 UPDATE_REPO = "AruteOwO/kura"               # "owner/name" on GitHub: where updates come from (updater.py); empty = no updates
+# Kura's own Discord application (Rich Presence shows "Watching Kura"): a public ID, not a secret, so everyone's
+# Discord status works with just the switch, like Taiga
+DISCORD_APP_ID = "1566151221255868468"
+# Kura's own AniList client (implicit grant, redirect = anilist_account.REDIRECT_URL on localhost): public, no
+# secret. Connect → Authorize in the browser → Kura is signed in (acct.TokenCatcher); nobody makes a client
+ANILIST_CLIENT_ID = "54169"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 try:
@@ -869,7 +875,6 @@ def default_settings():
         "link": org.LINK_RELATED if org else True,
         "dry_run": False,
         "geometry": "",
-        "anilist_client_id": "",
         "search_url": DEFAULT_SEARCH_URL,   # (from before search_sites: kept for the migration)
         "search_sites": [dict(x) for x in DEFAULT_SEARCHES],   # To download's searches (Settings → Account)
         "links": [dict(x) for x in DEFAULT_LINKS],             # the sidebar's LINKS (user's pick: Links 1)
@@ -920,7 +925,6 @@ def default_settings():
         "progress_percent": 80,          # built-in player: counts as watched at this point
         # Discord Rich Presence
         "discord_enabled": False,
-        "discord_app_id": "",
         "discord_show_user": True,
         "discord_show_group": True,
         "discord_show_elapsed": True,
@@ -5083,13 +5087,6 @@ class SettingsPage(Page):
         else:
             if a and a.token is None and a.user:
                 v.addWidget(self._note("Your login expired. Connect again to keep your list in sync."))
-            self.text_row(v, "Client ID", "Create one at anilist.co/settings/developer → Create New Client. "
-                          "Name it anything and paste the Redirect URL below into it.", "anilist_client_id",
-                          "e.g. 12345", width=140)
-            self.divider(v)
-            self.row(v, "Redirect URL", label("AniList asks for this when you make the client.", "faint", wrap=True),
-                     copy_field(acct.REDIRECT_URL))
-            self.divider(v)
             row = QWidget()
             h = QHBoxLayout(row)
             h.setContentsMargins(0, 12, 0, 12)
@@ -5097,16 +5094,13 @@ class SettingsPage(Page):
             text = QVBoxLayout()
             text.setSpacing(2)
             text.addWidget(label("Connect your account", "h2"))
-            text.addWidget(label("See your progress, scores and lists, and update them from the app.", "faint", wrap=True))
+            text.addWidget(label("See your progress, scores and lists, and update them from the app. Your browser "
+                                 "opens AniList: press Authorize and Kura is connected.", "faint", wrap=True))
             h.addLayout(text, 1)
-            dev = QPushButton("Developer page")
-            dev.setObjectName("ghost")
-            dev.clicked.connect(lambda: webbrowser.open(acct.DEVELOPER_URL))
             go = QPushButton("Connect AniList")
             go.setObjectName("primary")
             go.setCursor(Qt.PointingHandCursor)
-            go.clicked.connect(self.connect_account)
-            h.addWidget(dev)
+            go.clicked.connect(lambda: self.connect_account(go))
             h.addWidget(go)
             v.addWidget(row)
         self.divider(v)
@@ -5203,21 +5197,22 @@ class SettingsPage(Page):
         n.setStyleSheet(f"color: {C['warn']}; padding-top: 12px;")
         return n
 
-    def connect_account(self):
-        client_id = (self.settings.get("anilist_client_id") or "").strip()
-        if not client_id.isdigit():
-            QMessageBox.information(self, "AniList", "Enter your AniList Client ID first (the number shown "
-                                    "after creating a client on the developer page).")
-            return
-        webbrowser.open(acct.authorize_url(client_id))
-        token, ok = QInputDialog.getText(self, "Connect AniList",
-                                         "Approve the app in your browser, then copy the token AniList shows\n"
-                                         "and paste it here:")
-        if ok and token.strip():
-            def done(err):
-                if err:
-                    QMessageBox.warning(self, "AniList", err)
-            self.account.sign_in(token, done)
+    def connect_account(self, button=None):
+        """AniList opens in the browser; its Authorize comes straight back to Kura (anilist_connect)."""
+        def waiting(on):
+            try:
+                if button is not None:
+                    button.setEnabled(not on)
+                    button.setText("Waiting for AniList…" if on else "Connect AniList")
+            except RuntimeError:   # the page was rebuilt meanwhile
+                pass
+
+        def finished(err):
+            waiting(False)
+            if err:
+                QMessageBox.warning(self, "AniList", err)
+        if anilist_connect(self, finished):
+            waiting(True)
 
     def disconnect_account(self):
         box = QMessageBox(QMessageBox.Question, "Disconnect AniList",
@@ -12341,32 +12336,33 @@ def folder_picker(text, placeholder="Not set"):
     return w
 
 
-def copy_field(text, width=330):
-    """Text to paste somewhere else (AniList's Redirect URL): a read-only box and a Copy button."""
-    w = QWidget()
-    h = QHBoxLayout(w)
-    h.setContentsMargins(0, 0, 0, 0)
-    h.setSpacing(8)
-    edit = QLineEdit(text)
-    edit.setReadOnly(True)
-    edit.setMinimumWidth(width)
-    edit.setCursorPosition(0)
-    btn = QPushButton(" Copied")
-    btn.setIcon(glyph_icon("content_copy", C["text"]))
-    btn.setMinimumWidth(btn.sizeHint().width())   # the same width whichever it says (no jumping, no cut-off)
-    btn.setText(" Copy")
+def anilist_connect(parent, done, account=None):
+    """Connect AniList: Kura listens for the answer (acct.TokenCatcher), the browser opens AniList's Authorize page,
+    and the token comes straight back, signed in. done(error or None) when it's over. False = couldn't start."""
+    account = account or parent.account
+    old = getattr(parent, "_al_catcher", None)
+    if old is not None:
+        old.stop()
+    catcher = parent._al_catcher = acct.TokenCatcher(parent)
 
-    def copy():
-        QApplication.clipboard().setText(text)
-        edit.selectAll()
-        btn.setText(" Copied")
-        btn.setIcon(glyph_icon("check", C["ok"]))
-        QTimer.singleShot(1500, lambda: (btn.setText(" Copy"), btn.setIcon(glyph_icon("content_copy", C["text"]))))
-    btn.clicked.connect(copy)
-    h.addWidget(edit, 1)
-    h.addWidget(btn)
-    w.edit, w.button = edit, btn
-    return w
+    def got(token):
+        catcher.stop()
+        win = parent.window()
+        win.raise_()
+        win.activateWindow()
+        account.sign_in(token, done)
+
+    def failed(reason):
+        catcher.stop()
+        done(reason)
+    catcher.got.connect(got)
+    catcher.failed.connect(failed)
+    if not catcher.start():
+        QMessageBox.warning(parent, "AniList", f"Kura couldn't wait for AniList's answer: another program is using "
+                            f"port {acct.REDIRECT_PORT} on this PC. Close it and try again.")
+        return False
+    webbrowser.open(acct.authorize_url(ANILIST_CLIENT_ID))
+    return True
 
 
 class PresetDialog(KuraDialog):
@@ -15171,8 +15167,8 @@ class NowPlaying(QObject):
     # ---- setup
     def apply_settings(self):
         s = self.settings
-        app_id = (s.get("discord_app_id") or "").strip()
-        want = bool(s.get("discord_enabled") and app_id.isdigit())
+        app_id = DISCORD_APP_ID
+        want = bool(s.get("discord_enabled"))
         if self.presence and (not want or self.presence.client_id != app_id):
             self.presence.stop()
             self.presence = None
@@ -16188,18 +16184,8 @@ class PlaybackSettingsDialog(KuraDialog):
         page, col = self._page()
         col.addWidget(label("DISCORD", "section"))
         self.discord = Toggle(self.s.get("discord_enabled", False))
-        option_row(col, "Update rich presence", "Shows “Watching <anime> · Episode 5 of 12” on your Discord profile. "
-                   "Needs the Discord desktop app.", self.discord)
-        self.app_id = QLineEdit(self.s.get("discord_app_id", ""))
-        self.app_id.setPlaceholderText("Application ID (a long number)")
-        option_row(col, "Discord application ID",
-                   "One time: discord.com/developers/applications → New Application → name it “Kura” → copy the "
-                   "Application ID here. The name you give it is what Discord shows (“Watching Kura”).",
-                   self.app_id, stretch_control=True)
-        portal = QPushButton("Open Discord Developer Portal")
-        portal.setObjectName("ghost")
-        portal.clicked.connect(lambda: webbrowser.open("https://discord.com/developers/applications"))
-        col.addWidget(portal, 0, Qt.AlignLeft)
+        option_row(col, "Update rich presence", "Shows “Watching Kura” with the anime and “Episode 5 of 12” on your "
+                   "Discord profile. Needs the Discord desktop app, nothing to set up.", self.discord)
         col.addSpacing(10)
         col.addWidget(label("OPTIONS", "section"))
         self.d_user = Toggle(self.s.get("discord_show_user", True))
@@ -16491,7 +16477,7 @@ class PlaybackSettingsDialog(KuraDialog):
             "recog_crunchyroll": self.use_crunchy.isChecked(),
             "recog_jellyfin": self.use_jelly.isChecked(), "jellyfin_url": self.jurl.text().strip(),
             "jellyfin_key": self.jkey.text().strip(), "jellyfin_user": self.juser.text().strip(),
-            "discord_enabled": self.discord.isChecked(), "discord_app_id": self.app_id.text().strip(),
+            "discord_enabled": self.discord.isChecked(),
             "discord_show_user": self.d_user.isChecked(), "discord_show_group": self.d_group.isChecked(),
             "discord_show_elapsed": self.d_time.isChecked(),
             "capture_dir": self.cap_dir.edit.text().strip(), "capture_subfolders": self.cap_sub.isChecked(),
@@ -29583,6 +29569,8 @@ class MainWindow(QMainWindow):
         player_mod.EPISODE_INFO = self.player_episodes   # the player's episode list (titles, stills, watched, missing)
         player_mod.EPISODE_PICS = self.player_pics
         player_mod.PAD_GLYPH = lambda button, h: PadGlyph(self.settings, button, h)   # TV mode's button hints
+        player_mod.PAD_PAINT = lambda p, x, y, h, button: paint_pad_glyph(
+            p, x, y, h, pad_label(self.settings, button), button in PAD_FACE)   # the same, painted (Live TV's guide)
         player_mod.COVER = lambda item: (QImage(str(cover_file(item.get("mid")))) if item.get("mid")
                                          and cover_file(item.get("mid")) else None)
         self.player_thumbs = None   # pictures for the player's episode list (its own worker)
@@ -32267,23 +32255,15 @@ class SetupFlow(QFrame):
         bl = QVBoxLayout(box)
         bl.setContentsMargins(14, 12, 14, 12)
         bl.setSpacing(8)
-        self.al_help = label("Your list, progress as you watch, airing times, recommendations. Make a client on "
-                             "AniList's developer page with this Redirect URL, then paste its Client ID here.",
-                             "muted", wrap=True)
+        self.al_help = label("Your list, progress as you watch, airing times, recommendations. Your browser opens "
+                             "AniList: press Authorize and Kura is connected.", "muted", wrap=True)
         self.al_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)   # never squeezed (cut-off text)
         bl.addWidget(self.al_help)
-        bl.addWidget(copy_field(acct.REDIRECT_URL, width=240))
         r = QHBoxLayout()
-        self.client = QLineEdit(self.s.get("anilist_client_id") or "")
-        self.client.setPlaceholderText("Client ID")
-        self.client.textChanged.connect(lambda t: self.s.__setitem__("anilist_client_id", t.strip()))
-        dev = QPushButton("Developer page")
-        dev.clicked.connect(lambda: webbrowser.open(acct.DEVELOPER_URL))
-        self.connect_btn = QPushButton("Connect")
+        r.addStretch(1)
+        self.connect_btn = QPushButton("Connect AniList")
         self.connect_btn.setObjectName("primary")
         self.connect_btn.clicked.connect(self.connect_anilist)
-        r.addWidget(self.client, 1)
-        r.addWidget(dev)
         r.addWidget(self.connect_btn)
         bl.addLayout(r)
         self.al_state = label("", "faint")
@@ -32334,25 +32314,17 @@ class SetupFlow(QFrame):
             self.al_state.setText("You can skip this and connect later in Settings → Account.")
 
     def connect_anilist(self):
-        cid = (self.s.get("anilist_client_id") or "").strip()
-        if not cid.isdigit():
-            self.al_state.setText("Paste your Client ID first (the number on the developer page).")
-            self.al_state.setStyleSheet(f"color: {C['warn']};")
-            return
-        webbrowser.open(acct.authorize_url(cid))
-        token, ok = QInputDialog.getText(self, "Connect AniList", "Approve Kura in your browser, then paste the token "
-                                         "AniList shows here:")
-        if not ok or not token.strip():
-            return
-        self.al_state.setText("Connecting…")
-
         def done(err):
+            self.connect_btn.setEnabled(True)
             if err:
                 self.al_state.setText(f"Couldn't connect: {err}")
                 self.al_state.setStyleSheet(f"color: {C['bad']};")
             else:
                 self.update_anilist()
-        self.win.account.sign_in(token.strip(), done)
+        if anilist_connect(self, done, account=self.win.account):
+            self.connect_btn.setEnabled(False)
+            self.al_state.setText("Waiting for you to press Authorize in your browser…")
+            self.al_state.setStyleSheet(f"color: {C['muted']};")
 
     def set_app(self, key):
         self.s["torrent_app"] = key

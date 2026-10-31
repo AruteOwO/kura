@@ -1228,9 +1228,12 @@ class LiveGuide(QWidget):
     """The guide inside the player (user's pick: Player C, Oct 2026): the whole screen dark, the channel playing
     shrunk into the top right corner (PlayerView moves the video there), the selected programme described top left,
     the channel × time grid below with the now line. Arrows move, Enter tunes in (on now) or sets a reminder
-    (later), G / Esc go back to the video. Painted, no child widgets (it sits over an OpenGL surface)."""
+    (later), G / Esc go back to the video. Painted, no child widgets (it sits over an OpenGL surface).
+    In Kura's TV mode (view.tv) everything is scaled up for the couch (sized for 720 px of height), it shows an
+    hour instead of 90 minutes and the hints are the controller's buttons (PAD_PAINT)."""
     PAD, TOP, HEAD, ROW, NAMES, SPAN = 32, 300, 32, 54, 210, 90 * 60
     VIDEO = (420, 236)
+    s = 1.0
 
     def __init__(self, view):
         super().__init__(view)
@@ -1250,8 +1253,9 @@ class LiveGuide(QWidget):
         now = time.time()
         self.t0 = now - now % 1800
         self.sel_t = now
-        self.keep_visible()
         self.setGeometry(self.parentWidget().rect())
+        self.rescale()
+        self.keep_visible()
         self.show()
         self.raise_()
         self.timer.start()
@@ -1260,9 +1264,26 @@ class LiveGuide(QWidget):
     def hideEvent(self, e):
         self.timer.stop()
 
+    def resizeEvent(self, e):
+        self.rescale()
+
+    def rescale(self):
+        """Desktop: the sizes above. TV mode: a bigger guide that grows with the screen."""
+        if getattr(self.view, "tv", False):
+            s = max(1.0, self.height() / 720)
+            self.s = s
+            self.PAD, self.TOP, self.HEAD, self.ROW, self.NAMES = (int(n * s) for n in (40, 270, 34, 62, 240))
+            self.SPAN, self.VIDEO = 60 * 60, (int(400 * s), int(225 * s))
+        else:
+            for k in ("s", "PAD", "TOP", "HEAD", "ROW", "NAMES", "SPAN", "VIDEO"):
+                self.__dict__.pop(k, None)   # back to the class's desktop sizes
+
+    def u(self, n):
+        return n * self.s
+
     def video_rect(self):
         w, h = self.VIDEO
-        return QRect(self.width() - self.PAD - w, 28, w, h)
+        return QRect(self.width() - self.PAD - w, int(self.u(28)), w, h)
 
     # ---- what's where
     def progs(self, row):
@@ -1277,7 +1298,7 @@ class LiveGuide(QWidget):
         return ch, prog
 
     def visible_rows(self):
-        return max(1, (self.height() - self.TOP - self.HEAD - 16) // self.ROW)
+        return max(1, int((self.height() - self.TOP - self.HEAD - self.u(16)) // self.ROW))
 
     def keep_visible(self):
         n = self.visible_rows() if self.height() > self.TOP else 6
@@ -1370,80 +1391,67 @@ class LiveGuide(QWidget):
         now = time.time()
         f = QFont(self.font())
         # top left: the selected channel and programme
-        x, y = self.PAD, 34
-        right = self.video_rect().left() - 28
+        u = self.u
+        x, y = self.PAD, u(34)
+        right = self.video_rect().left() - u(28)
         if ch:
             colour = QColor(ch.get("colour") or ACCENT)
-            f.setPointSizeF(30)
+            f.setPointSizeF(u(30))
             f.setBold(True)
             p.setFont(f)
             p.setPen(colour)
             num = str(ch.get("number", ""))
-            p.drawText(QRectF(x, y, 120, 54), Qt.AlignLeft | Qt.AlignVCenter, num)
-            nw = QFontMetrics(f).horizontalAdvance(num) + 14
-            f.setPointSizeF(15)
+            p.drawText(QRectF(x, y, u(120), u(54)), Qt.AlignLeft | Qt.AlignVCenter, num)
+            nw = QFontMetrics(f).horizontalAdvance(num) + u(14)
+            f.setPointSizeF(u(15))
             p.setFont(f)
             p.setPen(QColor("white"))
-            p.drawText(QRectF(x + nw, y, right - x - nw, 54), Qt.AlignLeft | Qt.AlignVCenter,
+            p.drawText(QRectF(x + nw, y, right - x - nw, u(54)), Qt.AlignLeft | Qt.AlignVCenter,
                        f"{ch.get('name', '')}   ")
-            f.setPointSizeF(11)
+            f.setPointSizeF(u(11))
             f.setBold(False)
             p.setFont(f)
             p.setPen(QColor(255, 255, 255, 140))
-            p.drawText(QRectF(x, y, right - x, 54), Qt.AlignRight | Qt.AlignVCenter, clock(now))
+            p.drawText(QRectF(x, y, right - x, u(54)), Qt.AlignRight | Qt.AlignVCenter, clock(now))
         if prog:
             on = prog["start"] <= now < prog["end"]
-            f.setPointSizeF(9)
+            f.setPointSizeF(u(9))
             f.setBold(True)
             p.setFont(f)
             p.setPen(QColor("#ff5d73") if on else QColor("#9184ff"))
-            p.drawText(QPointF(x, y + 86), ("ON NOW" if on else "LATER") + f"  ·  {clock(prog['start'])} – {clock(prog['end'])}")
-            f.setPointSizeF(21)
+            p.drawText(QPointF(x, y + u(86)), ("ON NOW" if on else "LATER") + f"  ·  {clock(prog['start'])} – {clock(prog['end'])}")
+            f.setPointSizeF(u(21))
             p.setFont(f)
             p.setPen(QColor("white"))
             fm = QFontMetrics(f)
-            p.drawText(QPointF(x, y + 128), fm.elidedText(prog.get("title") or "", Qt.ElideRight, int(right - x)))
-            f.setPointSizeF(11)
+            p.drawText(QPointF(x, y + u(128)), fm.elidedText(prog.get("title") or "", Qt.ElideRight, int(right - x)))
+            f.setPointSizeF(u(11))
             f.setBold(False)
             p.setFont(f)
             p.setPen(QColor(255, 255, 255, 170))
             sub = (f"Season {prog['season']} · " if prog.get("season") else "") + f"Episode {prog['ep']}" \
                 if prog.get("kind") == "episode" and prog.get("ep") is not None else "Break"
-            p.drawText(QPointF(x, y + 158), sub)
+            p.drawText(QPointF(x, y + u(158)), sub)
             hint = "Tune in" if on else ("Remind me" if prog["start"] > now else "")
-            keys = ([("Enter", hint)] if hint else []) + [("↑ ↓ ← →", "Move"), ("G", "Back to the video")]
-            kx = x
-            f.setPointSizeF(9)
-            for key, text in keys:
-                f.setBold(True)
-                p.setFont(f)
-                kw = QFontMetrics(f).horizontalAdvance(key) + 14
-                p.setPen(Qt.NoPen)
-                p.setBrush(QColor(255, 255, 255, 30))
-                p.drawRoundedRect(QRectF(kx, y + 186, kw, 24), 6, 6)
-                p.setPen(QColor("white"))
-                p.drawText(QRectF(kx, y + 186, kw, 24), Qt.AlignCenter, key)
-                f.setBold(False)
-                p.setFont(f)
-                p.setPen(QColor(255, 255, 255, 170))
-                tw = QFontMetrics(f).horizontalAdvance(text)
-                p.drawText(QPointF(kx + kw + 8, y + 203), text)
-                kx += kw + tw + 30
+            if getattr(self.view, "tv", False) and PAD_PAINT is not None:
+                self.paint_pad_hints(p, f, x, y + u(186), [(("A",), hint)] if hint else [])
+            else:
+                self.paint_key_hints(p, f, x, y + 186, [("Enter", hint)] if hint else [])
         # the video's frame (the video itself is a sibling, moved into this rect)
         p.setPen(QPen(QColor(255, 255, 255, 40), 1))
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(QRectF(self.video_rect()).adjusted(-1, -1, 1, 1), 10, 10)
+        p.drawRoundedRect(QRectF(self.video_rect()).adjusted(-1, -1, 1, 1), u(10), u(10))
         # times
         gx = self.PAD + self.NAMES
         hy = self.TOP
-        f.setPointSizeF(9)
+        f.setPointSizeF(u(9))
         f.setBold(False)
         p.setFont(f)
         p.setPen(QColor(255, 255, 255, 120))
         for k in range(4):
             t = self.t0 + k * 1800
-            if self.x_of(t) + 50 < self.width() - self.PAD:   # a label that wouldn't fit isn't drawn (cut off)
-                p.drawText(QPointF(self.x_of(t) + 4, hy + 20), clock(t))
+            if self.x_of(t) + u(50) < self.width() - self.PAD:   # a label that wouldn't fit isn't drawn (cut off)
+                p.drawText(QPointF(self.x_of(t) + u(4), hy + u(20)), clock(t))
         p.setPen(QColor(255, 255, 255, 25))
         p.drawLine(QPointF(self.PAD, hy + self.HEAD - 1), QPointF(self.width() - self.PAD, hy + self.HEAD - 1))
         # rows
@@ -1451,50 +1459,85 @@ class LiveGuide(QWidget):
         playing = (self.view.live or {}).get("cid")
         p.save()
         p.setClipRect(QRectF(self.PAD, y0, self.width() - 2 * self.PAD, self.height() - y0))
-        for i in range(self.first_row, min(len(self.rows), self.first_row + self.visible_rows() + 1)):
+        for i in range(self.first_row, min(len(self.rows), self.first_row + self.visible_rows())):   # whole rows only
             c = self.rows[i]
             ry = y0 + (i - self.first_row) * self.ROW
             if c["id"] == playing:
                 p.fillRect(QRectF(self.PAD, ry, self.width() - 2 * self.PAD, self.ROW), QColor(255, 93, 115, 16))
-            f.setPointSizeF(12)
+            f.setPointSizeF(u(12))
             f.setBold(True)
             p.setFont(f)
             p.setPen(QColor("#ff5d73") if c["id"] == playing else QColor(255, 255, 255, 140))
-            p.drawText(QRectF(self.PAD, ry, 34, self.ROW), Qt.AlignRight | Qt.AlignVCenter, str(c.get("number", "")))
-            f.setPointSizeF(10)
+            p.drawText(QRectF(self.PAD, ry, u(34), self.ROW), Qt.AlignRight | Qt.AlignVCenter, str(c.get("number", "")))
+            f.setPointSizeF(u(10))
             p.setFont(f)
             p.setPen(QColor("white"))
-            p.drawText(QRectF(self.PAD + 46, ry, self.NAMES - 56, self.ROW), Qt.AlignLeft | Qt.AlignVCenter,
-                       QFontMetrics(f).elidedText(c.get("name", ""), Qt.ElideRight, self.NAMES - 56))
+            p.drawText(QRectF(self.PAD + u(46), ry, self.NAMES - u(56), self.ROW), Qt.AlignLeft | Qt.AlignVCenter,
+                       QFontMetrics(f).elidedText(c.get("name", ""), Qt.ElideRight, int(self.NAMES - u(56))))
             for pr in self.progs(i):
                 x1, x2 = max(gx, self.x_of(pr["start"])), min(self.width() - self.PAD, self.x_of(pr["end"]))
-                if x2 - x1 < 3:
+                if x2 - x1 < u(3):
                     continue
-                cell = QRectF(x1 + 2, ry + 4, x2 - x1 - 4, self.ROW - 8)
+                cell = QRectF(x1 + u(2), ry + u(4), x2 - x1 - u(4), self.ROW - u(8))
                 sel = i == self.sel_r and pr["start"] <= self.sel_t < pr["end"]
-                p.setPen(QPen(QColor("#9184ff"), 2) if sel else Qt.NoPen)
+                p.setPen(QPen(QColor("#9184ff"), u(2)) if sel else Qt.NoPen)
                 p.setBrush(QColor(124, 108, 255, 76) if sel else QColor(255, 255, 255, 14))
-                p.drawRoundedRect(cell, 6, 6)
-                if cell.width() > 30:
-                    f.setPointSizeF(9.5)
+                p.drawRoundedRect(cell, u(6), u(6))
+                if cell.width() > u(30):
+                    f.setPointSizeF(u(9.5))
                     f.setBold(True)
                     p.setFont(f)
                     p.setPen(QColor("white"))
-                    inner = cell.adjusted(9, 5, -6, -5)
-                    p.drawText(QRectF(inner.left(), inner.top(), inner.width(), 18), Qt.AlignLeft | Qt.AlignVCenter,
+                    inner = cell.adjusted(u(9), u(5), -u(6), -u(5))
+                    p.drawText(QRectF(inner.left(), inner.top(), inner.width(), u(18)), Qt.AlignLeft | Qt.AlignVCenter,
                                QFontMetrics(f).elidedText(pr.get("title") or "Break", Qt.ElideRight, int(inner.width())))
                     f.setBold(False)
-                    f.setPointSizeF(8.5)
+                    f.setPointSizeF(u(8.5))
                     p.setFont(f)
                     p.setPen(QColor(255, 255, 255, 130))
                     small = (f"S{pr['season']} E{pr['ep']}" if pr.get("season") else f"E{pr['ep']}") \
                         if pr.get("kind") == "episode" and pr.get("ep") is not None else "Break"
-                    p.drawText(QRectF(inner.left(), inner.top() + 18, inner.width(), 16), Qt.AlignLeft | Qt.AlignVCenter,
+                    p.drawText(QRectF(inner.left(), inner.top() + u(18), inner.width(), u(16)), Qt.AlignLeft | Qt.AlignVCenter,
                                QFontMetrics(f).elidedText(small, Qt.ElideRight, int(inner.width())))
         p.restore()
         nx = self.x_of(now)
         if gx <= nx <= self.width() - self.PAD:
-            p.fillRect(QRectF(nx - 1, hy + self.HEAD - 6, 2, self.height() - hy - self.HEAD + 6), QColor("#ff5d73"))
+            p.fillRect(QRectF(nx - u(1), hy + self.HEAD - u(6), u(2), self.height() - hy - self.HEAD + u(6)), QColor("#ff5d73"))
+
+    def paint_key_hints(self, p, f, x, y, keys):
+        kx = x
+        f.setPointSizeF(9)
+        for key, text in keys + [("↑ ↓ ← →", "Move"), ("G", "Back to the video")]:
+            f.setBold(True)
+            p.setFont(f)
+            kw = QFontMetrics(f).horizontalAdvance(key) + 14
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 30))
+            p.drawRoundedRect(QRectF(kx, y, kw, 24), 6, 6)
+            p.setPen(QColor("white"))
+            p.drawText(QRectF(kx, y, kw, 24), Qt.AlignCenter, key)
+            f.setBold(False)
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255, 170))
+            tw = QFontMetrics(f).horizontalAdvance(text)
+            p.drawText(QPointF(kx + kw + 8, y + 17), text)
+            kx += kw + tw + 30
+
+    def paint_pad_hints(self, p, f, x, y, hints):
+        """TV mode: gray button glyphs (the user's controller layout, PAD_PAINT) and what they do."""
+        h = self.u(30)
+        f.setPointSizeF(self.u(11))
+        f.setBold(False)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        kx = x
+        for buttons, text in hints + [(("LB", "RB"), "Channels"), (("B",), "Back to the video")]:
+            for b in buttons:
+                kx += PAD_PAINT(p, kx, y, h, b) + self.u(6)
+            tw = fm.horizontalAdvance(text)
+            p.setPen(QColor(255, 255, 255, 170))
+            p.drawText(QRectF(kx + self.u(2), y, tw + 4, h), Qt.AlignLeft | Qt.AlignVCenter, text)
+            kx += tw + self.u(34)
 
 
 class CaptureCard(QFrame):
@@ -1843,6 +1886,7 @@ def run_background(works):
 
 
 PAD_GLYPH = None        # Kura sets this: (button "A" / "LB"..., height) -> a button hint widget (its layout setting)
+PAD_PAINT = None        # and this: (painter, x, y, height, button) -> paints that hint on a painted overlay, its width
 
 
 class TvSeekBar(SeekBar):

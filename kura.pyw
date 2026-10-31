@@ -2577,6 +2577,11 @@ class DetailLoader(QThread):
         for s in result["sections"]:
             if s["cover"]:
                 jobs.append((f"thumb:{s['id']}", s["cover"], str(s["id"])))
+            tr = (s.get("media") or {}).get("trailer") or {}
+            if s["id"] and tr.get("site") == "youtube" and tr.get("id") != trailer.get("id"):   # a season's own
+                jobs.append((f"trailer:{s['id']}", f"https://i.ytimg.com/vi/{tr['id']}/maxresdefault.jpg", f"trailer_{tr['id']}"))
+                if tr.get("thumbnail"):
+                    jobs.append((f"trailer:{s['id']}", tr["thumbnail"], f"trailer_{tr['id']}_small"))
         for r in result.get("recs") or []:
             url = (r["media"].get("coverImage") or {}).get("extraLarge")
             if url:
@@ -6620,8 +6625,13 @@ class TrailerCard(QFrame):
         f.setPointSizeF(10)
         f.setWeight(QFont.DemiBold)
         p.setFont(f)
+        fm = QFontMetrics(f)
+        pill = QRectF(12, self.H - fm.height() - 20, fm.horizontalAdvance("Trailer") + 20, fm.height() + 8)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 170))   # its own dark pill: the trailer's picture often has text there
+        p.drawRoundedRect(pill, pill.height() / 2 - 1, pill.height() / 2 - 1)
         p.setPen(QColor("white"))
-        p.drawText(r.adjusted(16, 0, -16, -12), Qt.AlignLeft | Qt.AlignBottom, "Trailer")
+        p.drawText(pill, Qt.AlignCenter, "Trailer")
         p.setClipping(False)
         p.setPen(QPen(QColor(255, 255, 255, 20), 1))
         p.setBrush(Qt.NoBrush)
@@ -7350,6 +7360,7 @@ class DetailPage(QWidget):
         self.images = {}          # pictures already loaded for this show (a rebuild puts them back)
         self.thumb_slots = {}
         self.section_pick = {}    # show folder → the season tab you picked
+        self.picked, self.header_d = 0, None   # that tab on the page now, and the AniList entry its header shows
         self.editing = False      # Edit info: the page's editable parts are dashed (user's pick C)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -7469,7 +7480,7 @@ class DetailPage(QWidget):
                             w = sub.takeAt(0).widget()
                             if w:
                                 w.deleteLater()
-                lay.addLayout(self.stats_row(r, r.get("hero") or {}))
+                lay.addLayout(self.stats_row(r, getattr(self, "header_d", None) or r.get("hero") or {}))
             except RuntimeError:   # the page was made again meanwhile
                 pass
         for b in getattr(self, "tab_btns", []):
@@ -7518,9 +7529,20 @@ class DetailPage(QWidget):
         self.trailer = None
         if not r.get("loading"):
             self.result, self.cover = r, cover
-        hero_d = r.get("hero") or {}
-        t = hero_d.get("title") or {}
+        show_d = r.get("hero") or {}   # the show (its first season): title, other names
+        t = show_d.get("title") or {}
         name = r["name"]
+        # the season you picked (else the one you're watching): the header, tiles, About and trailer are its own
+        # AniList entry's, so nothing adds seasons up or shows Season 1's facts on Season 2
+        secs = [] if r.get("loading") else r.get("sections") or []
+        self.picked = 0
+        if len(secs) > 1:
+            nxt = next_episode(secs, self.account) if self.tracking() else None
+            first = next((k for k, sec in enumerate(secs) if nxt and nxt["section"] is sec), 0)
+            self.picked = max(0, min(self.section_pick.get(r.get("path") or name, first), len(secs) - 1))
+        hero_d = self.header_media(self.picked) if secs else show_d
+        self.header_d = hero_d
+        own_season = len(secs) > 1 and hero_d.get("id") != show_d.get("id")
 
         content = QWidget()
         col = QVBoxLayout(content)
@@ -7569,13 +7591,16 @@ class DetailPage(QWidget):
         poster = RoundedImage(210, 298, 14, name)
         if cover is not None:
             poster.set_image(cover)
-        self.slots["cover"] = [poster, hero]
+        if own_season:   # that season's cover (the season cards' picture), the show's until it's loaded
+            self.slots.setdefault(f"thumb:{hero_d['id']}", []).extend([poster, hero])
+        else:
+            self.slots["cover"] = [poster, hero]
         row.addWidget(poster, 0, Qt.AlignVCenter)
 
         info = QVBoxLayout()
         info.setSpacing(8)
         info.addStretch(1)
-        shown = (org.DISPLAY_TITLES.get(str(hero_d.get("id")))
+        shown = (org.DISPLAY_TITLES.get(str(show_d.get("id")))
                  or (t.get("english") if org.TITLE_LANGUAGE == "english" else t.get("romaji")) or t.get("romaji") or name)
         if editing:
             info.addWidget(edit_chip(shown, "edit", lambda: self.edit_title(r, shown), big=True), 0, Qt.AlignLeft)
@@ -7584,11 +7609,13 @@ class DetailPage(QWidget):
             info.addWidget(title)
         seasons = r.get("seasons") or []
         alt = next((x for x in (t.get("native"), t.get("romaji")) if x and x != shown), "")
-        statuses = [x.get("status") for x in seasons] or [hero_d.get("status")]
+        statuses = [x.get("status") for x in seasons] or [show_d.get("status")]
         announced = "New season announced" if [x for x in statuses if x != "NOT_YET_RELEASED"] and \
             "NOT_YET_RELEASED" in statuses else ""
-        line = [alt, FORMAT_TEXT.get(hero_d.get("format"), ""), season_label(hero_d),
-                f"{len(seasons)} seasons" if len(seasons) > 1 else "", ", ".join(hero_d.get("genres") or []), announced]
+        line = [secs[self.picked]["title"] if len(secs) > 1 else "", alt,
+                FORMAT_TEXT.get(hero_d.get("format"), ""), season_label(hero_d),
+                f"{len(seasons)} seasons" if len(seasons) > 1 else "",
+                ", ".join(hero_d.get("genres") or show_d.get("genres") or []), announced]
         if any(line):
             info.addWidget(label("  ·  ".join(x for x in line if x), "muted", wrap=True))
         if editing:   # which AniList entry this folder is
@@ -7671,13 +7698,16 @@ class DetailPage(QWidget):
             bv.addWidget(self.stats_box)
 
         desc = clean_description(hero_d.get("description"))
-        self.trailer = TrailerCard(r["trailer"]) if r.get("trailer") else None
+        trailer = hero_d.get("trailer") if (hero_d.get("trailer") or {}).get("site") in ("youtube", "dailymotion") \
+            else None if own_season else r.get("trailer")   # never Season 1's trailer on Season 2
+        self.trailer = TrailerCard(trailer) if trailer else None
         if desc or self.trailer:
             bv.addSpacing(8)
             about = QHBoxLayout()
             about.setSpacing(26)
             if self.trailer:
-                self.slots["trailer"] = [self.trailer]
+                same = trailer.get("id") == (r.get("trailer") or {}).get("id")   # the show's (loaded as "trailer")
+                self.slots["trailer" if same else f"trailer:{hero_d.get('id')}"] = [self.trailer]
                 QTimer.singleShot(800, warm_up_trailers)
                 about.addWidget(self.trailer, 0, Qt.AlignTop)
             text = QVBoxLayout()
@@ -7747,9 +7777,7 @@ class DetailPage(QWidget):
             bv.addWidget(c)
         self.section_cards = cards
         if len(cards) > 1:
-            nxt = next_episode(r["sections"], self.account) if self.tracking() else None
-            first = next((k for k, sec in enumerate(r["sections"]) if nxt and nxt["section"] is sec), 0)
-            self.pick_section(self.section_pick.get(r.get("path") or r["name"], first), remember=False)
+            self.pick_section(self.picked, remember=False)
 
         # ---- relations, like AniList's (user's pick A): story first, then the rest of the franchise
         if r.get("relations"):
@@ -7775,13 +7803,20 @@ class DetailPage(QWidget):
         """E4 v2's tiles: your progress, status, score, in your library, studio."""
         row = QHBoxLayout()
         row.setSpacing(12)
-        aired = r["have"] + r["missing"]
+        # the season shown in the header (its AniList entry); a page with unmatched folders adds them up
+        own = [sec for sec in r["sections"] if sec.get("id") and sec["id"] == hero_d.get("id")]
+        have = sum(sec["have"] for sec in own if sec["counted"]) if own else r["have"]
+        missing = sum(sec["missing"] for sec in own if sec["counted"]) if own else r["missing"]
+        aired = have + missing
         if self.tracking():
-            mine = [(sec, self.account.entry(sec["id"])) for sec in r["sections"] if sec.get("id")]
-            total = sum((sec.get("total") or 0) for sec, _ in mine)
+            mine = [(sec, self.account.entry(sec["id"])) for sec in (own or r["sections"]) if sec.get("id")]
+            # a season still airing with no known length counts what has aired so far ("18 / 18 aired")
+            open_ended = any(not sec.get("total") for sec, _ in mine)
+            total = sum((sec.get("total") or sec.get("aired") or 0) for sec, _ in mine)
             done = sum(((e or {}).get("progress") or 0) for _, e in mine)
+            of = f"/ {total} aired" if open_ended and total else f"/ {total or '?'}"
             row.addWidget(stat_tile("Your progress", f"{done} <span style='font-size:10pt; color:{C['muted']};"
-                                    f" font-weight:500;'>/ {total or '?'}</span>", bar=(done / total) if total else 0), 1)
+                                    f" font-weight:500;'>{of}</span>", bar=min(1.0, done / total) if total else 0), 1)
             listed = [e for _, e in mine if e]
             st = next((e["status"] for e in listed if e["status"] in ("CURRENT", "REPEATING")),
                       listed[-1]["status"] if listed else None)
@@ -7790,9 +7825,9 @@ class DetailPage(QWidget):
         score = hero_d.get("averageScore")
         row.addWidget(stat_tile("Score", f"★ {score}%" if score else "–", C["warn"] if score else C["muted"]), 1)
         if r.get("path"):
-            here = "all here" if aired and not r["missing"] else f"{r['missing']} missing" if r["missing"] else ""
-            row.addWidget(stat_tile("In your library", f"{r['have']} <span style='font-size:10pt; color:"
-                                    f"{C['ok'] if not r['missing'] else C['warn']}; font-weight:500;'>{here}</span>"), 1)
+            here = "all here" if aired and not missing else f"{missing} missing" if missing else ""
+            row.addWidget(stat_tile("In your library", f"{have} <span style='font-size:10pt; color:"
+                                    f"{C['ok'] if not missing else C['warn']}; font-weight:500;'>{here}</span>"), 1)
         studios = ", ".join(n["name"] for n in ((hero_d.get("studios") or {}).get("nodes") or []))
         if studios:
             tile = stat_tile("Studio", studios)
@@ -8053,12 +8088,27 @@ class DetailPage(QWidget):
         super().resizeEvent(e)
         QTimer.singleShot(0, self.update_recs_toggle)
 
+    def header_media(self, n):
+        """The AniList entry the header shows for season tab n: its own, else the show's (Extras, unmatched)."""
+        r = self.result or {}
+        secs = r.get("sections") or []
+        sec = secs[n] if 0 <= n < len(secs) else {}
+        return (sec.get("media") if sec.get("id") else None) or r.get("hero") or {}
+
     def pick_section(self, n, remember=True):
-        """Show one season's card (tabs)."""
+        """Show one season's card (tabs); the header, tiles, About and trailer follow it."""
         cards = getattr(self, "section_cards", [])
         if not cards:
             return
         n = max(0, min(n, len(cards) - 1))
+        if remember and self.result and n != self.picked and \
+                self.header_media(n).get("id") != (self.header_d or {}).get("id"):
+            self.section_pick[self.result.get("path") or self.result["name"]] = n
+            pos = self.scroll.verticalScrollBar().value()
+            self.render(self.result, self.cover)
+            self.scroll.verticalScrollBar().setValue(pos)
+            return
+        self.picked = n
         for k, c in enumerate(cards):
             c.setVisible(k == n)
         for k, b in enumerate(getattr(self, "tab_btns", [])):
@@ -31940,13 +31990,14 @@ Rectangle {
         Item {
             rotation: -12; transformOrigin: Item.TopLeft
             Image {
+                id: marks   // the animators below only see it by id (bare x0 / y0 were undefined there)
                 readonly property real x0: -252
                 readonly property real y0: -236 - root.textUp
                 x: x0; y: y0
                 source: "image://wall/marks/" + root.stamp
                 cache: false
-                XAnimator on x { from: x0; to: x0 - 126; duration: 42000; loops: Animation.Infinite }
-                YAnimator on y { from: y0; to: y0 - 63; duration: 42000; loops: Animation.Infinite }
+                XAnimator on x { from: marks.x0; to: marks.x0 - 126; duration: 42000; loops: Animation.Infinite }
+                YAnimator on y { from: marks.y0; to: marks.y0 - 63; duration: 42000; loops: Animation.Infinite }
             }
         }
     }

@@ -2067,6 +2067,7 @@ class TvLayer(QWidget):
         self.view, self.menu, self.s = view, None, 1.0
         self.rows, self.cards, self.focus, self.opts = [], [], 0, []
         self.menu_widgets, self.paused_shown, self.built_for = [], None, None
+        self.bfocus = 3   # the round button the d-pad is on (3 = play); it starts there each time the controls show
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.fx = QGraphicsOpacityEffect(self)
         self.fx.setOpacity(0.0)
@@ -2158,9 +2159,7 @@ class TvLayer(QWidget):
             b.setToolTip(tip)
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
-            b.setStyleSheet(f"QPushButton {{ background: {'white' if big else 'rgba(255,255,255,0.13)'}; border: none;"
-                            f" border-radius: {d // 2 - 1}px; }} QPushButton:hover {{ background: "
-                            f"{'#e7e9ef' if big else 'rgba(255,255,255,0.22)'}; }}")
+            b.big, b.d = big, d
             if not big:
                 b.setIcon(icon(glyph, TEXT, px=self.px(30)))
             b.clicked.connect(fn)
@@ -2168,6 +2167,16 @@ class TvLayer(QWidget):
             self.btns.append(b)
         self.play_b = self.btns[3]
         self.paused_shown = None   # the play icon is set again by sync
+        self.mark_buttons()
+
+    def mark_buttons(self):
+        """The round button the d-pad is on gets a white ring (the others none)."""
+        for k, b in enumerate(self.btns):
+            on = k == self.bfocus and not self.menu
+            ring = f"border: {self.px(3)}px solid {'#7c6cff' if b.big else 'white'};" if on else "border: none;"
+            b.setStyleSheet(f"QPushButton {{ background: {'white' if b.big else 'rgba(255,255,255,0.13)'}; {ring}"
+                            f" border-radius: {b.d // 2 - 1}px; }} QPushButton:hover {{ background: "
+                            f"{'#e7e9ef' if b.big else 'rgba(255,255,255,0.22)'}; }}")
 
     # ---- showing
     def fade(self, on):
@@ -2175,7 +2184,10 @@ class TvLayer(QWidget):
         if on and self.view.live_guide.isVisible():
             return   # Live TV's guide fills the screen: the controls come back when it closes
         if on:
+            if not (self.isVisible() and self.anim.endValue() == 1.0):   # coming up: the d-pad starts on play
+                self.bfocus = 3
             self.build()
+            self.mark_buttons()
             self.place()
             self.show()
             self.raise_()
@@ -2292,6 +2304,7 @@ class TvLayer(QWidget):
             self.set_legend()
 
     def set_legend(self):
+        self.mark_buttons()   # the ring hides while a menu is open
         lay = self.legend.layout()
         while lay.count():
             w = lay.takeAt(0).widget()
@@ -2303,10 +2316,10 @@ class TvLayer(QWidget):
         elif self.menu in ("subs", "more"):
             items = [(["A"], "Choose"), (["B"], "Close")]
         elif self.view.live:
-            items = [(["A"], "Play" if self.paused_shown else "Pause"), (["LB", "RB"], "Channel"),
+            items = [(["A"], self.focus_text()), (["LEFTRIGHT"], "Move"), (["LB", "RB"], "Channel"),
                      (["DOWN"], "Guide"), (["X"], "Subtitles"), (["START"], "More"), (["B"], "Back to TV mode")]
         else:
-            items = [(["A"], "Play" if self.paused_shown else "Pause"), (["LEFTRIGHT"], "Skip"),
+            items = [(["A"], self.focus_text()), (["LEFTRIGHT"], "Move"),
                      (["DOWN"], "Episodes"), (["X"], "Subtitles"), (["START"], "More"), (["B"], "Back to TV mode")]
         for buttons, text in items:
             cell = QWidget()
@@ -2491,6 +2504,12 @@ class TvLayer(QWidget):
         self.card.raise_()
         self.mark_focus()
 
+    def focus_text(self):
+        """What A does: the highlighted round button (its tooltip), Play / Pause on the play button."""
+        if self.bfocus == 3 or not (0 <= self.bfocus < len(self.btns)):
+            return "Play" if self.paused_shown else "Pause"
+        return self.btns[self.bfocus].toolTip()
+
     def mark_focus(self):
         for c, col in enumerate(self.opts):
             for r, o in enumerate(col):
@@ -2563,6 +2582,20 @@ class TvLayer(QWidget):
             self.mark_focus()
             return True
         short = int(v.settings.get("player_skip_short", 10))
+        shown = self.isVisible() and self.anim.endValue() == 1.0
+        if name in ("DPAD_LEFT", "DPAD_RIGHT"):
+            if not shown:   # controls hidden: skip, and they stay hidden (so you can press again)
+                v.skip(-short if name == "DPAD_LEFT" else short)
+                return True
+            self.bfocus = max(0, min(len(self.btns) - 1, self.bfocus + (1 if name == "DPAD_RIGHT" else -1)))
+            self.set_legend()   # moves the ring too
+            v.show_controls()
+            return True
+        if name == "A" and shown and 0 <= self.bfocus < len(self.btns):
+            v.show_controls()
+            self.btns[self.bfocus].click()
+            self.set_legend()
+            return True
         acts = {"A": v.toggle_pause, "DPAD_LEFT": lambda: v.skip(-short), "DPAD_RIGHT": lambda: v.skip(short),
                 "DPAD_DOWN": lambda: self.open_menu("eps"), "X": lambda: self.open_menu("subs"),
                 "START": lambda: self.open_menu("more"), "LB": lambda: v.step_episode(-1),

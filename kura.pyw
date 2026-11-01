@@ -710,13 +710,13 @@ class CapButton(QAbstractButton):
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_Hover)
         self.nc_hover = self.nc_down = False
-        self.dot = None
+        self.unread = False   # the bell's dot, painted here (a child label left a dark speck when hidden)
         self.setToolTip({"min": "Minimize", "max": "Maximize", "close": "Close", "bell": "Notifications"}[kind])
-        if kind == "bell":
-            self.dot = QLabel(self)   # unread notifications
-            self.dot.setFixedSize(6, 6)
-            self.dot.move(w // 2 + 4, h // 2 - 8)
-            self.dot.hide()
+
+    def set_unread(self, on):
+        if on != self.unread:
+            self.unread = on
+            self.update()
 
     def set_nc_hover(self, on):
         if on != self.nc_hover:
@@ -738,11 +738,14 @@ class CapButton(QAbstractButton):
                 p.fillRect(self.rect(), accent_color(70 if down else 46))
         active = self.window().isActiveWindow()
         fg = QColor("white" if (hover and self.kind == "close") or hover else C["text"] if active else C["faint"])
-        if self.dot is not None:
-            self.dot.setStyleSheet(f"background: {C['accent_hi']}; border-radius: 3px;")
         if self.kind == "bell":
             pm = glyph_pixmap("notifications", fg.name(), 16)
             p.drawPixmap((self.width() - 16) // 2, (self.height() - 16) // 2, pm)
+            if self.unread:
+                p.setRenderHint(QPainter.Antialiasing)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(C["accent_hi"]))
+                p.drawEllipse(QRectF(self.width() // 2 + 4, self.height() // 2 - 8, 6, 6))
             return
         dpr = self.devicePixelRatioF()
         pen = QPen(fg, 1.0 / dpr * max(1, round(dpr)))   # one device pixel (crisp, like Windows' own)
@@ -876,7 +879,7 @@ def default_settings():
         "dry_run": False,
         "geometry": "",
         "search_url": DEFAULT_SEARCH_URL,   # (from before search_sites: kept for the migration)
-        "search_sites": [dict(x) for x in DEFAULT_SEARCHES],   # To download's searches (Settings → Account)
+        "search_sites": [dict(x) for x in DEFAULT_SEARCHES],   # To download's searches (Settings → Feeds)
         "links": [dict(x) for x in DEFAULT_LINKS],             # the sidebar's LINKS (user's pick: Links 1)
         "schedule_planning": True,
         # Player: "builtin" (Kura's, mpv engine), "external" (player_path) or "system" (Windows default)
@@ -4268,12 +4271,13 @@ class SettingsPage(Page):
     open_torrents = Signal()
     open_playback = Signal()
     crunchy_changed = Signal()   # signed in or out of Crunchyroll here
+    crunchy_sync_requested = Signal()   # the card's Sync now (MainWindow opens the import tool)
     adult_changed = Signal()     # Adult content switched / its folder changed
     move_adult_requested = Signal()
     check_updates = Signal()     # Settings → About: Check for updates
     open_update = Signal()       # Settings → About: Update now / What's new (an update is waiting)
     open_logs = Signal()         # Settings → About: Logs
-    SECTIONS = [("GENERAL", None), ("account", ("person", "Accounts", "Your AniList and Crunchyroll sign-ins, and the search the To download page uses.")),
+    SECTIONS = [("GENERAL", None), ("account", ("person", "Accounts", "Your AniList and Crunchyroll sign-ins.")),
                 ("folders", ("folder", "Library & folders", "Where your shows live and where downloads land.")),
                 ("sorting", ("sort", "Sorting", "How new episodes are moved and named.")),
                 ("icons", ("photo_library", "Icons & links", "Folder icons in Explorer, and spin-offs inside their parent show.")),
@@ -4287,7 +4291,7 @@ class SettingsPage(Page):
                 ("discord", ("forum", "Discord", "Show what you're watching on your Discord profile.")),
                 ("trailers", ("movie", "Trailers & previews", "Trailer player, hover previews and the Home banner.")),
                 ("captures", ("photo_camera", "Captures", "Screenshots, clips and GIFs from Kura's player.")),
-                ("TORRENTS", None), ("torrent_feeds", ("rss_feed", "Feeds", "Where Kura looks for new releases, and how often.")),
+                ("TORRENTS", None), ("torrent_feeds", ("rss_feed", "Feeds", "Where Kura looks for new releases, how often, and the sites the Search menu opens.")),
                 ("torrent_downloads", ("download", "Downloads", "Your torrent app, qBittorrent's Web UI, download folders.")),
                 ("torrent_filters", ("filter_alt", "Filters", "Taiga-style filters that pick which releases to download.")),
                 ("KURA", None), ("about", ("info", "About", "Kura's version and updates, links, and the projects it's built on."))]
@@ -4379,9 +4383,28 @@ class SettingsPage(Page):
         self.crunchy_holder.setContentsMargins(0, 0, 0, 0)
         col.addLayout(self.crunchy_holder)
         self.crunchy_card = self.cr_signer = None
+        self.cr_paste_open = False
         self.cr_note = ""
         self.cr_toggle = None
         self.build_crunchy_card()
+
+        # Download searches: shown at the bottom of Feeds (that page is the torrent dialog's, rebuilt by
+        # build_embedded, which moves this box into it each time)
+        self.searches_box = QWidget()
+        sv = QVBoxLayout(self.searches_box)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(4)
+        sv.addSpacing(10)
+        sv.addWidget(label("OPEN IN BROWSER", "section"))
+        sv.addWidget(label("Download searches: the Search menu on To download opens these sites in your browser "
+                           "({query} becomes the show and episode). The starred one (one per side) is what a plain "
+                           "click uses. Kura's own searches use the RSS feed above.", "faint", wrap=True))
+        sv.addSpacing(6)
+        self.searches_lay = QVBoxLayout()
+        self.searches_lay.setContentsMargins(0, 0, 0, 0)
+        self.searches_lay.setSpacing(6)
+        sv.addLayout(self.searches_lay)
+        self.build_searches()
 
         col = self.sec_cols["folders"]
         folders = card()
@@ -4994,6 +5017,7 @@ class SettingsPage(Page):
         for dlg in (self.pb_dlg, self.tor_dlg):
             if dlg is not None and getattr(dlg, "ytdlp_call", None) is not None:
                 return   # yt-dlp is still downloading: keep these pages until it's done
+        self.searches_box.setParent(None)   # out of the old Feeds page before it goes
         old = [self.pb_dlg, self.tor_dlg]
         self.pb_dlg = PlaybackSettingsDialog(self, self.settings, self.presence_status())
         self.pb_dlg.use_crunchy.toggled.connect(self.sync_crunchy_toggle)
@@ -5013,6 +5037,11 @@ class SettingsPage(Page):
                 holder.addWidget(page)
                 page.show()   # taking it out of the dialog's tabs hid it
                 self.watch_changes(page, kind)
+        feeds = self.sec_cols["torrent_feeds"].itemAt(0).widget().widget().layout()   # its scroll area's column
+        at = next((i for i in range(feeds.count()) if isinstance(feeds.itemAt(i).widget(), QLabel)
+                   and feeds.itemAt(i).widget().text() == "AUTOMATION"), feeds.count())
+        feeds.insertWidget(at - 1, self.searches_box)   # under SOURCES (before AUTOMATION's spacing)
+        self.searches_box.show()
         for dlg in old:
             if dlg is not None:
                 dlg.deleteLater()
@@ -5108,16 +5137,6 @@ class SettingsPage(Page):
             go.clicked.connect(lambda: self.connect_account(go))
             h.addWidget(go)
             v.addWidget(row)
-        self.divider(v)
-        v.addWidget(label("Download searches", "h2"))
-        v.addWidget(label("The Search menu on To download. {query} becomes the show and episode; the starred one "
-                          "(one per side) is what a plain click uses.", "faint", wrap=True))
-        self.searches_box = QWidget()
-        self.searches_lay = QVBoxLayout(self.searches_box)
-        self.searches_lay.setContentsMargins(0, 0, 0, 0)
-        self.searches_lay.setSpacing(6)
-        v.addWidget(self.searches_box)
-        self.build_searches()
         self.account_holder.addWidget(box)
 
     def build_searches(self):
@@ -5261,6 +5280,12 @@ class SettingsPage(Page):
             text.addWidget(label(f"Signed in as {creds.get('name') or 'your account'}", "h2"))
             text.addWidget(label(f"History: {len(store.get('episodes', {})):,} episodes  ·  last synced {when}",
                                  "faint", wrap=True))
+            sync = QPushButton("Sync now")
+            sync.setObjectName("primary")
+            sync.setCursor(Qt.PointingHandCursor)
+            sync.setToolTip("Tools → Crunchyroll import")
+            sync.clicked.connect(self.crunchy_sync)
+            h.addWidget(sync, 0, Qt.AlignVCenter)
             out = QPushButton("Sign out")
             out.setObjectName("ghost")
             out.clicked.connect(self.crunchy_sign_out)
@@ -5272,35 +5297,59 @@ class SettingsPage(Page):
                 n = label(self.cr_note, "muted", wrap=True)
                 n.setStyleSheet(f"color: {C['warn']}; padding-top: 4px; background: transparent;")
                 text.addWidget(n)
-            how = LinkButton("How to get the etp_rt cookie  ›")
-            steps = label("Crunchyroll has no app sign-in, so Kura uses your browser's: on crunchyroll.com (signed "
-                          "in), press F12 → Application (Chrome, Edge) or Storage (Firefox) → Cookies → "
-                          "https://www.crunchyroll.com, and copy the value of etp_rt. Kura keeps the sign-in "
-                          "Crunchyroll gives it in return (renewed as it goes) encrypted on this PC, never your "
-                          "password. Treat the cookie like a password.", "faint", wrap=True)
-            steps.setContentsMargins(0, 6, 0, 0)
-            steps.hide()
-            how.clicked.connect(lambda: (steps.setVisible(not steps.isVisible()),
-                                         how.setText("How to get the etp_rt cookie  " +
-                                                     ("⌄" if steps.isVisible() else "›"))))
-            text.addSpacing(4)
-            text.addWidget(how, 0, Qt.AlignLeft)
-            text.addWidget(steps)
-            form = QWidget()
-            f = QHBoxLayout(form)
-            f.setContentsMargins(0, 0, 0, 12)
-            f.setSpacing(8)
+            web = web_engine_ok()
+            # the cookie box: a fallback behind a link (Google / Apple sign-ins, or no browser engine)
+            paste = QWidget()
+            p = QVBoxLayout(paste)
+            p.setContentsMargins(0, 8, 0, 0)
+            p.setSpacing(8)
+            p.addWidget(label("On crunchyroll.com (signed in), press F12 → Application (Chrome, Edge) or Storage "
+                              "(Firefox) → Cookies → https://www.crunchyroll.com, and copy the value of etp_rt. "
+                              "Treat the cookie like a password.", "faint", wrap=True))
+            form = QHBoxLayout()
+            form.setSpacing(8)
             self.cr_cookie = QLineEdit()
             self.cr_cookie.setEchoMode(QLineEdit.Password)
             self.cr_cookie.setPlaceholderText("Paste the etp_rt cookie")
             self.cr_cookie.returnPressed.connect(self.crunchy_sign_in)
-            f.addWidget(self.cr_cookie, 1)
+            form.addWidget(self.cr_cookie, 1)
             self.cr_sign_btn = QPushButton("Sign in")
             self.cr_sign_btn.setObjectName("primary")
             self.cr_sign_btn.setCursor(Qt.PointingHandCursor)
             self.cr_sign_btn.clicked.connect(self.crunchy_sign_in)
-            f.addWidget(self.cr_sign_btn)
-            v.addWidget(form)
+            form.addWidget(self.cr_sign_btn)
+            p.addLayout(form)
+            paste.setVisible(self.cr_paste_open or not web)
+            if web:
+                buttons = QHBoxLayout()
+                buttons.setContentsMargins(0, 12, 0, 0)
+                buttons.setSpacing(16)
+                go = QPushButton(" Sign in with Crunchyroll")
+                go.setIcon(glyph_icon("login", "white"))
+                go.setCursor(Qt.PointingHandCursor)
+                go.setFixedHeight(38)
+                go.setStyleSheet(f"QPushButton {{ background: {CR_ORANGE}; color: white; border: none; "
+                                 f"border-radius: 10px; padding: 0 18px; font-weight: 600; }}"
+                                 f" QPushButton:hover {{ background: #f68a45; }} QPushButton:pressed {{ background: #d9631a; }}")
+                go.clicked.connect(self.crunchy_web_sign_in)
+                buttons.addWidget(go)
+                link = LinkButton("Paste a cookie instead  " + ("⌄" if not paste.isHidden() else "›"))
+                link.clicked.connect(lambda: (paste.setVisible(paste.isHidden()),
+                                              setattr(self, "cr_paste_open", not paste.isHidden()),
+                                              link.setText("Paste a cookie instead  " +
+                                                           ("⌄" if not paste.isHidden() else "›"))))
+                buttons.addWidget(link)
+                buttons.addStretch(1)
+                text.addLayout(buttons)
+                safe = QHBoxLayout()
+                safe.setContentsMargins(0, 8, 0, 0)
+                safe.setSpacing(6)
+                safe.addWidget(glyph_label("lock", C["faint"], 14))
+                safe.addWidget(label("You sign in on Crunchyroll's own page. Kura never sees your password.",
+                                     "faint", wrap=True), 1)
+                text.addLayout(safe)
+            text.addWidget(paste)
+            text.addSpacing(12)
         self.divider(v)
         # the switch itself lives with the other recognition sources (one place for it)
         self.cr_toggle = label("", "faint", wrap=True)
@@ -5328,6 +5377,20 @@ class SettingsPage(Page):
         self.cr_signer = BgCall(lambda: crunchy.Crunchyroll({}).sign_in(cookie))
         self.cr_signer.done.connect(self.on_crunchy_signed_in)
         self.cr_signer.start()
+
+    def crunchy_web_sign_in(self):
+        dlg = CrunchySignIn(self.window())
+        dlg.exec()
+        if dlg.creds:
+            self.build_crunchy_card(note="")
+            self.crunchy_changed.emit()
+        elif dlg.paste:
+            self.cr_paste_open = True
+            self.build_crunchy_card()
+        dlg.deleteLater()
+
+    def crunchy_sync(self):
+        self.crunchy_sync_requested.emit()
 
     def on_crunchy_signed_in(self, creds, err):
         self.cr_signer.wait()
@@ -6324,6 +6387,185 @@ def shut_down_trailers():
     if page is not None:
         import shiboken6
         shiboken6.delete(page)
+
+
+def web_engine_ok():
+    """Qt's browser engine is there (it is in Kura.exe; a bare Python install may lack it)."""
+    try:
+        import PySide6.QtWebEngineWidgets  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def finish_threads(wait_ms=3000):
+    """Last step of quitting: background threads nobody stopped get asked to stop and a moment to finish (Python
+    tearing one down while it runs is Qt's "QThread: Destroyed while thread is still running", and a cache
+    file it was writing could be left half done). Logged by name, so the one that needs its own stop shows."""
+    import gc
+    me = QThread.currentThread()
+    left = [o for o in gc.get_objects() if isinstance(o, QThread) and o is not me and o.isRunning()]
+    for t in left:
+        t.requestInterruption()
+        if isinstance(getattr(t, "wake", None), threading.Event):   # workers that sleep until there's work
+            t.wake.set()
+    end = time.monotonic() + wait_ms / 1000   # one budget for all of them: quitting never hangs long
+    for t in left:
+        name = type(t).__name__ + (f" ({t.objectName()})" if t.objectName() else "")
+        if t.wait(max(0, int((end - time.monotonic()) * 1000))):
+            klog.info(f"Quitting: waited for {name}")
+        else:
+            klog.warning(f"Quitting: {name} still running after {wait_ms / 1000:g} s")
+
+
+class CrunchySignIn(QDialog):
+    """Crunchyroll's own login page in a private browser window: when it sets the etp_rt cookie, Kura trades
+    it for its own sign-in (crunchy.sign_in) and closes. Nothing the page stores is kept, and Kura never sees
+    the password. Google / Apple sign-in may refuse an embedded browser; `paste` = the user wants the old
+    cookie box instead."""
+    LOGIN = "https://www.crunchyroll.com/login"
+    GOOGLE = "Google or Apple sign-in may not work here."
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        self.setWindowTitle("Sign in to Crunchyroll")
+        self.resize(560, 760)
+        self.creds, self.paste, self.signer, self.cookie, self.tried = None, False, None, "", set()
+        self.profile = QWebEngineProfile(self)   # off-the-record: cookies only live in memory
+        # the "QtWebEngine/6.x" token gets embedded browsers turned away by some bot checks
+        self.profile.setHttpUserAgent(re.sub(r"\s*QtWebEngine/\S+", "", self.profile.httpUserAgent()))
+        self.profile.cookieStore().cookieAdded.connect(self.on_cookie)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        bar = QFrame()
+        bar.setObjectName("crbar")
+        bar.setStyleSheet(f"#crbar {{ background: {C['surface']}; border-bottom: 1px solid {C['border']}; }}")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(14, 6, 8, 6)
+        h.setSpacing(8)
+        self.lock = glyph_label("lock", C["ok"], 16)
+        h.addWidget(self.lock)
+        self.address = label("crunchyroll.com", "faint")
+        h.addWidget(self.address, 1)
+        reload = QPushButton()
+        reload.setIcon(glyph_icon("refresh", C["muted"]))
+        reload.setToolTip("Reload")
+        reload.setFixedSize(30, 30)
+        reload.setStyleSheet(f"QPushButton {{ background: transparent; border: none; border-radius: 8px; }}"
+                             f" QPushButton:hover {{ background: {C['hover']}; }}")
+        reload.setCursor(Qt.PointingHandCursor)
+        h.addWidget(reload)
+        v.addWidget(bar)
+        self.stack = QStackedWidget()
+        self.view = QWebEngineView()
+        self.page = QWebEnginePage(self.profile, self.view)
+        self.view.setPage(self.page)
+        self.page.urlChanged.connect(self.on_url)
+        self.page.loadFinished.connect(lambda ok: self.maybe_try())
+        reload.clicked.connect(self.view.reload)
+        self.stack.addWidget(self.view)
+        done = QWidget()
+        d = QVBoxLayout(done)
+        d.setContentsMargins(40, 40, 40, 40)
+        d.setSpacing(14)
+        d.addStretch(1)
+        d.addWidget(glyph_label("check_circle:fill", C["ok"], 56), 0, Qt.AlignHCenter)
+        t = label("You're signed in")
+        t.setStyleSheet("font-family: 'Segoe UI Variable Display'; font-size: 15pt; font-weight: 600;")
+        d.addWidget(t, 0, Qt.AlignHCenter)
+        sub = label("Kura is setting up its own sign-in with Crunchyroll. This window closes by itself.", "muted",
+                    wrap=True)
+        sub.setAlignment(Qt.AlignCenter)
+        d.addWidget(sub)
+        prog = QProgressBar()
+        prog.setRange(0, 0)
+        prog.setTextVisible(False)
+        prog.setFixedSize(260, 4)
+        d.addWidget(prog, 0, Qt.AlignHCenter)
+        d.addStretch(1)
+        self.stack.addWidget(done)
+        v.addWidget(self.stack, 1)
+        foot = QFrame()
+        foot.setObjectName("crfoot")
+        foot.setStyleSheet(f"#crfoot {{ background: {C['surface']}; border-top: 1px solid {C['border']}; }}")
+        f = QVBoxLayout(foot)
+        f.setContentsMargins(16, 12, 16, 12)
+        f.setSpacing(8)
+        for glyph, color, text in (("shield_lock", C["muted"], "Kura closes this window once you're signed in. It "
+                                    "keeps only Crunchyroll's sign-in, encrypted on this PC, never your password."),):
+            r = QHBoxLayout()
+            r.setSpacing(8)
+            r.addWidget(glyph_label(glyph, color, 16), 0, Qt.AlignTop)
+            r.addWidget(label(text, "faint", wrap=True), 1)
+            f.addLayout(r)
+        r = QHBoxLayout()
+        r.setSpacing(8)
+        r.addWidget(glyph_label("info", C["warn"], 16))
+        self.hint = label(self.GOOGLE, "faint", wrap=True)
+        r.addWidget(self.hint, 1)
+        paste = LinkButton("Paste a cookie instead  ›")
+        paste.clicked.connect(self.want_paste)
+        r.addWidget(paste)
+        f.addLayout(r)
+        v.addWidget(foot)
+        self.view.setUrl(QUrl(self.LOGIN))
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        dark_title_bar(self)
+
+    def on_url(self, url):
+        self.address.setText(url.host() or url.toString())
+        self.lock.setVisible(url.scheme() == "https")
+        self.maybe_try()
+
+    def on_cookie(self, c):
+        if bytes(c.name()) == b"etp_rt" and c.domain().lstrip(".").endswith("crunchyroll.com"):
+            self.cookie = bytes(c.value()).decode("ascii", "replace")
+            self.maybe_try()
+
+    def maybe_try(self):
+        """Try the cookie once you've left the login pages (a visitor's cookie, before signing in, isn't one
+        Crunchyroll accepts)."""
+        url = self.page.url()
+        on_login = url.host().startswith("sso.") or "/login" in url.path()
+        if not self.cookie or self.cookie in self.tried or on_login or self.signer is not None:
+            return
+        self.tried.add(self.cookie)
+        self.hint.setText(self.GOOGLE)
+        self.hint.setStyleSheet("")
+        self.stack.setCurrentIndex(1)
+        cookie = self.cookie
+        self.signer = BgCall(lambda: crunchy.Crunchyroll({}).sign_in(cookie))
+        self.signer.done.connect(self.on_signed_in)
+        self.signer.start()
+
+    def on_signed_in(self, creds, err):
+        self.signer.wait()
+        self.signer = None
+        if creds:
+            self.creds = creds
+            QTimer.singleShot(600, self.accept)
+            return
+        self.stack.setCurrentIndex(0)   # back to the page: you can sign in again or paste a cookie
+        self.hint.setText(err)
+        self.hint.setStyleSheet(f"color: {C['warn']};")
+
+    def want_paste(self):
+        self.paste = True
+        self.reject()
+
+    def done(self, r):
+        if self.signer is not None:   # a sign-in is finishing: let it
+            return
+        super().done(r)
+        if self.view is not None:   # the engine wants its pages (the view's child) gone before the profile
+            self.profile.cookieStore().cookieAdded.disconnect(self.on_cookie)
+            shiboken6.delete(self.view)
+            self.view = None
 
 
 def trailer_urls(trailer):
@@ -11228,13 +11470,13 @@ class ModeMenu(QFrame):
         head.setStyleSheet(f"color: {C['faint']}; font-size: 7.5pt; font-weight: 700; letter-spacing: 1px;"
                            " padding: 2px 6px 4px 6px; background: transparent;")
         v.addWidget(head)
-        anime = ModeOption(("#8f7dff", "#5b4be0"), "#7c6cff", "Anime", "Your anime library", not adult)
+        anime = ModeOption(("#8f7dff", "#5b4be0"), "#7c6cff", "Anime", "Your Anime Library", not adult)
         anime.clicked.connect(lambda: self.pick(win, False))
         v.addWidget(anime)
         if s.get("adult_enabled"):
             locked = bool(s.get("adult_lock")) and not getattr(win, "adult_unlocked", False)
             x = ModeOption(("#e86b93", "#a8284f"), ADULT_ACCENT, "Hentai",
-                           "Your hentai library · Sukebei" + (" · locked" if locked and not adult else ""), adult, locked and not adult)
+                           "Your Hentai Library" + (" · Locked" if locked and not adult else ""), adult, locked and not adult)
             x.clicked.connect(lambda: self.pick(win, True))
             v.addWidget(x)
         else:
@@ -11247,9 +11489,6 @@ class ModeMenu(QFrame):
             v.addWidget(self.row("tv", "TV mode", win.tv.open_tv))
         if s.get("adult_enabled") and s.get("adult_lock") and getattr(win, "adult_unlocked", False):
             v.addWidget(self.row("lock", "Lock the hentai side now", win.lock_adult))
-        if s.get("adult_enabled"):
-            v.addWidget(self.row("tune", "Hentai settings", lambda: win.open_settings_section("adult"),
-                                 "Ctrl+Shift+A"))
 
     def row(self, glyph, text, fn, hint=""):
         b = QPushButton(f"  {text}")
@@ -15465,12 +15704,25 @@ class NowPlaying(QObject):
                 show_group=False, show_elapsed=s.get("discord_show_elapsed", True),
                 show_username=s.get("discord_show_user", True), paused=bool(n.get("paused"))))
             return
+        # where you are in the episode (Kura's player, Crunchyroll): Discord's progress bar. The start is kept
+        # while it's within a few seconds, so the card isn't sent again on each poll (Discord's rate limit)
+        started, ends, pos, dur = n["started"], None, n.get("pos"), n.get("duration")
+        if pos is not None and dur and not n.get("paused"):
+            start = time.time() - pos
+            if abs(start - (n.get("anchor") or 0)) > 4:
+                n["anchor"] = start
+            started, ends = n["anchor"], n["anchor"] + dur
+        t = m.get("title") or {}
+        alt = next((x for x in (t.get("romaji"), t.get("native")) if x and x.lower() != n["title"].lower()), "")
+        av = (self.account.user or {}).get("avatar") if self.account else None
+        av = (av.get("large") or av.get("medium")) if isinstance(av, dict) else av
         self.presence.update(recog.activity_for(
             n["title"], n["ep"], total=m.get("episodes"), group=n.get("group", ""),
             cover=(m.get("coverImage") or {}).get("extraLarge") or "", url=m.get("siteUrl") or "",
-            started=n["started"], username=user, show_group=s.get("discord_show_group", True),
+            started=started, ends=ends, username=user, show_group=s.get("discord_show_group", True),
             show_elapsed=s.get("discord_show_elapsed", True), show_username=s.get("discord_show_user", True),
-            paused=bool(n.get("paused"))))
+            paused=bool(n.get("paused")), alt=alt, avatar=av or "",
+            profile=((self.account.user or {}).get("siteUrl") or "") if self.account else ""))
 
     def shutdown(self):
         self.timer.stop()
@@ -21572,21 +21824,20 @@ class TvMode(QWidget):
     def play(self, path):
         if not path:
             return
-        self.hide()
+        # the player covers the window first, then TV mode steps aside: hiding first showed the normal pages
         self.win.play(path)
         if self.win.player is None or not self.win.player.isVisible():
-            self.show()   # another app plays it (Settings → Player)
-            return
+            return   # another app plays it (Settings → Player): TV mode stays
+        self.hide()
         self.for_player = True
         self.win.player.set_tv(True)   # its TV-sized controls (player.TvLayer)
         self.player_watch.start()
 
     def watch(self, cid):
-        self.hide()
         self.win.watch_live(cid)
         if self.win.player is None:
-            self.show()
             return
+        self.hide()
         self.for_player = True
         self.win.player.set_tv(True)   # the TV-sized controls for a channel too
         self.player_watch.start()
@@ -21596,6 +21847,13 @@ class TvMode(QWidget):
         if pl is not None and pl.isVisible():
             return
         self.back_from_player()
+
+    def shutdown(self):
+        """Kura is quitting: its picture thread stops (it wasn't, and Python tore it down mid-run)."""
+        if self.worker is not None:
+            self.worker.requestInterruption()
+            self.worker.wake.set()
+            self.worker.wait(5000)
 
     def back_from_player(self):
         """The player closed: TV mode again at once, fading in over it (no window jump: close_player keeps the
@@ -25779,12 +26037,6 @@ def countdown(ts):
     return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{max(1, m)}m"
 
 
-def greeting(name):
-    h = datetime.now().hour
-    part = "Good morning" if 5 <= h < 12 else "Good afternoon" if 12 <= h < 18 else "Good evening" if h < 24 and h >= 18 else "Up late"
-    return f"{part}, {name}" if name else part
-
-
 class ProgressRing(QWidget):
     """A small ring that fills up (downloads)."""
 
@@ -26373,7 +26625,7 @@ class HeroScrim(QWidget):
 
 
 def paint_hero_shade(p, r):
-    """Over the banner's art or trailer: dark on the left so the words read, a little at the top (greeting and
+    """Over the banner's art or trailer: dark on the left so the words read, a little at the top (the status
     pills), and down into the page's colour at the bottom (the banner runs into the rows below)."""
     side = QLinearGradient(r.topLeft(), r.topRight())
     side.setColorAt(0, QColor(10, 12, 16, 235))
@@ -26395,7 +26647,7 @@ def paint_hero_shade(p, r):
 
 class HomeHero(QWidget):
     """The big banner across the top of Home: the front of Continue watching, one at a time (the small previews
-    bottom right switch, it moves on by itself). The greeting and status pills sit on it (set_header)."""
+    bottom right switch, it moves on by itself). The status pills sit on it (set_header)."""
     play = Signal(object)
     open = Signal(object)
     watched = Signal(object)
@@ -26647,7 +26899,7 @@ class HomeHero(QWidget):
             t.setVisible((i + 1) * (t.width() + 6) <= room)
 
     def set_header(self, widget):
-        """The greeting and pills along the top (new ones each time Home is built)."""
+        """The pills along the top (new ones each time Home is built)."""
         while self.top.count():
             w = self.top.takeAt(0).widget()
             if w is not None:
@@ -26804,7 +27056,7 @@ class HomeSkeleton(QWidget):
         p.drawRect(hero)
 
 class HomePage(QWidget):
-    """Home: the banner across the top (the greeting and status pills on it), Continue watching (Crunchyroll-style:
+    """Home: the banner across the top (the status pills on it), Continue watching (Crunchyroll-style:
     a show jumps to the front when its next episode arrives), Fresh in your library (tabs), and Recommended."""
     open_show = Signal(str, object)
     open_media = Signal(int, str, object)
@@ -27183,7 +27435,7 @@ class HomePage(QWidget):
         col.setSpacing(0)
         a = self.account
 
-        # the banner across the top: the front of Continue watching (then spotlight), greeting and pills on it
+        # the banner across the top: the front of Continue watching (then spotlight), pills on it
         hero_items = []
         for c in model["continue"][:5] + model.get("spotlight", []):
             m = c.get("media") or self.media(c["mid"])
@@ -27292,19 +27544,15 @@ class HomePage(QWidget):
             self.details.update(details)
             self.mark_dirty()
 
-    # ---- greeting, notifications, panels
+    # ---- pills, notifications, panels
     def header(self, model):
-        """On the banner: the greeting, and pills for downloads (kept up to date by update_pills), the next
+        """On the banner, top right: pills for downloads (kept up to date by update_pills), the next
         episode to air and how many new episodes are waiting (click: Fresh's New episodes tab)."""
         w = QWidget()
         w.setStyleSheet("background: transparent;")
         row = QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        name = (self.account.user or {}).get("name") if self.tracking() else ""
-        t = QLabel(greeting(name))
-        t.setStyleSheet("color: white; font-family: 'Segoe UI Variable Display'; font-size: 12.5pt; font-weight: 600;")
-        row.addWidget(t)
         row.addStretch(1)
         self.dl_pill = HomePill("downloading", C["ok"])
         self.dl_pill.clicked.connect(self.open_downloads.emit)
@@ -29814,6 +30062,8 @@ class MainWindow(QMainWindow):
         # signed in or out in Settings: the tool's header and recognition's client follow
         self.settings_page.crunchy_changed.connect(cr_tool.on_account_changed)
         self.settings_page.crunchy_changed.connect(lambda: setattr(self.now_playing, "cr_client", None))
+        self.settings_page.crunchy_sync_requested.connect(
+            lambda: (self.go(self.TOOLS), self.tools.open_tool(1), cr_tool.sync()))
         self.account.changed.connect(cr_tool.on_account_changed)
 
         # qBittorrent Web UI: follow Kura's downloads, organize them when they finish
@@ -30612,8 +30862,8 @@ class MainWindow(QMainWindow):
         self.player_strip = None
         if self.own_title:   # the window's buttons above the video (not in fullscreen)
             self.player_strip = PlayerTitleStrip(self)
+            lay.addWidget(self.player_strip)   # in the layout first: shown without a parent it's its own window
             self.player_strip.setVisible(not self.isFullScreen())
-            lay.addWidget(self.player_strip)
         lay.addWidget(self.player)
         self.player.top.setProperty("kura_drag", True)   # the player's title bar moves the window too
         self.player_overlay.setGeometry(host.rect())
@@ -30637,7 +30887,7 @@ class MainWindow(QMainWindow):
         dark_title_bar(self.player_popout)
         self.player.setFocus()
 
-    def unembed(self, view=None):
+    def unembed(self, view=None, pages=True):
         view = view or self.player
         if self.player_overlay is not None:
             self.centralWidget().removeEventFilter(self)
@@ -30646,8 +30896,9 @@ class MainWindow(QMainWindow):
             self.player_overlay.deleteLater()
             self.player_overlay = None
             self.player_strip = None
-            self.side.show()
-            self.page_col.show()
+            if pages:
+                self.side.show()
+                self.page_col.show()
 
     def prefetch_filler(self, playlist):
         filler_mod.prefetch([it.get("mid") for it in playlist], lambda mid: filler_info(mid, self.account),
@@ -31134,7 +31385,10 @@ class MainWindow(QMainWindow):
         elif self.isFullScreen() and self.player_overlay is not None:
             self.showNormal()
         view.stop()
-        self.unembed(view)
+        # back to TV mode: the pages stay hidden while it fades in (they showed through the fade)
+        self.unembed(view, pages=not to_tv)
+        if to_tv:
+            QTimer.singleShot(260, lambda: self.player_overlay is None and (self.side.show(), self.page_col.show()))
         if self.player_popout is not None:
             self.player_popout.take_view()
             self.player_popout.close()
@@ -31231,7 +31485,7 @@ class MainWindow(QMainWindow):
 
     def update_bell(self):
         unread = sum(1 for n in self.visible_notes() if not n.get("read"))
-        self.strip.caps.bell.dot.setVisible(unread > 0)
+        self.strip.caps.bell.set_unread(unread > 0)
         self.strip.caps.bell.setToolTip(f"Notifications · {unread} new" if unread else "Notifications")
 
     def open_notifications(self):
@@ -31364,6 +31618,8 @@ class MainWindow(QMainWindow):
             t.shutdown()
         self.kickoff.shutdown()
         self.livetv.shutdown()
+        if getattr(self, "tv", None) is not None:
+            self.tv.shutdown()
         if getattr(self, "sequel_call", None) is not None:
             self.sequel_call.wait(60000)
         if APP.get("subprev") is not None:
@@ -31386,6 +31642,7 @@ class MainWindow(QMainWindow):
             self.detail.trailer.stop()
         shut_down_trailers()
         self.tray.hide()
+        finish_threads()
         super().closeEvent(e)
         if getattr(self, "restart_after", False):   # a restore: the new Kura waits for this one to be gone
             from PySide6.QtCore import QProcess
@@ -32426,9 +32683,7 @@ class SetupFlow(QFrame):
         self.startup_on = get_startup()
         items = [("Start with Windows (in the tray)", self.startup_on, self.set_startup_choice),
                  ("Check for new episodes every 15 min", bool(self.s.get("torrent_auto_check")),
-                  lambda on: self.s.__setitem__("torrent_auto_check", on)),
-                 ("Hentai side (set a PIN in Settings)", bool(self.s.get("adult_enabled")),
-                  lambda on: self.s.__setitem__("adult_enabled", on))]
+                  lambda on: self.s.__setitem__("torrent_auto_check", on))]
         for i, (text, val, fn) in enumerate(items):
             row = QHBoxLayout()
             row.setSpacing(10)

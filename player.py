@@ -2200,7 +2200,7 @@ class TvLayer(QWidget):
         self.anim.start()
 
     def height_for(self):
-        return self.px({"eps": 500, "subs": 600, "more": 600}.get(self.menu, 390))
+        return self.px({"eps": 500, "subs": 600, "more": 600, "pic": 680}.get(self.menu, 390))
 
     def place(self):
         v = self.view
@@ -2238,7 +2238,7 @@ class TvLayer(QWidget):
             self.ep_label.adjustSize()
             self.ep_label.move(m, seek_y + self.seek.height() + self.px(30))
             self.place_cards()
-        if self.menu in ("subs", "more"):
+        if self.menu in ("subs", "more", "pic"):
             self.card.adjustSize()
             cx = (W - m - self.card.width()) if self.menu == "subs" else (W - self.card.width()) // 2
             self.card.move(cx, self.title.y() - self.px(20) - self.card.height())
@@ -2313,7 +2313,7 @@ class TvLayer(QWidget):
                 w.deleteLater()
         if self.menu == "eps":
             items = [(["A"], "Play"), (["LB", "RB"], "Season"), (["B"], "Close")]
-        elif self.menu in ("subs", "more"):
+        elif self.menu in ("subs", "more", "pic"):
             items = [(["A"], "Choose"), (["B"], "Close")]
         elif self.view.live:
             items = [(["A"], self.focus_text()), (["LEFTRIGHT"], "Move"), (["LB", "RB"], "Channel"),
@@ -2345,7 +2345,7 @@ class TvLayer(QWidget):
         self.close_menu(quiet=True)
         self.menu = which
         self.view.show_controls()
-        {"eps": self.open_eps, "subs": self.open_subs, "more": self.open_more}[which]()
+        {"eps": self.open_eps, "subs": self.open_subs, "more": self.open_more, "pic": self.open_pic}[which]()
         self.set_legend()
         self.place()
 
@@ -2495,11 +2495,46 @@ class TvLayer(QWidget):
                 cur = 1.0
             nxt = speeds[(speeds.index(cur) + 1) % len(speeds)] if cur in speeds else 1.0
             items.append(("Speed", f"{cur:g}×", "speed", False, lambda: v.set_speed(nxt)))
-        items.append(("Picture", "", "auto_awesome", False, v.picture_menu))
+        if PICTURE is not None:
+            items.append(("Picture", PICTURE.describe(PICTURE.full(v.picture_source()[1])), "auto_awesome", False,
+                          lambda: QTimer.singleShot(0, lambda: self.open_menu("pic"))))
         items.append(("Screenshot", "", "photo_camera", False, lambda: v.screenshot(False)))
         items.append(("Close the player", "", "close", False, v.close_requested.emit))
         self.opts = [self.column(lay, None, items)]
         self.fcol, self.frow = 0, 0
+        self.card.show()
+        self.card.raise_()
+        self.mark_focus()
+
+    def open_pic(self):
+        """Picture enhancement as a TV card: the looks in two columns, then the options and where it's kept
+        (the same choices as the player's ⋯ → Picture menu)."""
+        v = self.view
+        lay = self.card_layout()
+        source, pic = v.picture_source()
+        pic = PICTURE.full(pic)
+        looks = []
+        if not PICTURE.installed():
+            looks.append(("Get upscalers", "3 MB", "download", False, v.download_shaders))
+        looks += [(name, "", None, pic["mode"] == mode, lambda m=mode: v.set_picture({"mode": m}))
+                  for mode, name, _ in PICTURE.MODES]
+        half = (len(looks) + 1) // 2
+        opts = [("High quality", "", None, pic["quality"] != "fast",
+                 lambda: v.set_picture({"quality": "fast" if pic["quality"] != "fast" else "hq"})),
+                ("Deband", "", None, pic["deband"], lambda: v.set_picture({"deband": not pic["deband"]})),
+                ("Sharpen", "", None, pic["sharpen"], lambda: v.set_picture({"sharpen": not pic["sharpen"]})),
+                ("Only for this show", "", None, source == "show", lambda: v.set_picture({}, "show")),
+                ("Make this my default", "", None, False, lambda: v.set_picture({}, "default"))]
+        if source == "show":
+            opts.append(("Use my default again", "", None, False, v.forget_show_picture))
+        kept = {"session": "NOT SAVED", "show": "THIS SHOW", "default": "YOUR DEFAULT"}[source]
+        self.opts = [self.column(lay, "LOOK", looks[:half]), self.column(lay, " ", looks[half:]),
+                     self.column(lay, f"OPTIONS  ·  {kept}", opts)]
+        self.fcol, self.frow = 0, 0
+        for c, col in enumerate(self.opts[:2]):   # start on the look you have
+            for r, o in enumerate(col):
+                if o.checked:
+                    self.fcol, self.frow = c, r
         self.card.show()
         self.card.raise_()
         self.mark_focus()
@@ -2522,7 +2557,7 @@ class TvLayer(QWidget):
         speed = menu == "more" and self.opts and self.opts[0][min(row, len(self.opts[0]) - 1)].text == "Speed"
         if fn is not None:
             fn()
-        if menu == "subs" or speed:   # stays open: you see the check / the speed change
+        if menu in ("subs", "pic") or speed:   # stays open: you see the check / the speed change
             def again():
                 if self.menu == menu:
                     keep = (self.fcol, self.frow)
@@ -2566,7 +2601,7 @@ class TvLayer(QWidget):
             elif name in ("B", "DPAD_UP"):
                 self.close_menu()
             return True
-        if self.menu in ("subs", "more"):
+        if self.menu in ("subs", "more", "pic"):
             col = self.opts[self.fcol] if self.opts else []
             if name in ("DPAD_UP", "DPAD_DOWN") and col:
                 self.frow = max(0, min(len(col) - 1, self.frow + (1 if name == "DPAD_DOWN" else -1)))

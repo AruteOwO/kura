@@ -260,9 +260,12 @@ class DiscordPresence(threading.Thread):
                 try:
                     self._apply(wanted)
                 except ValueError:
-                    # older Discord: retry without the newer fields
+                    # older Discord: retry without the newer fields (the card type, the clickable title / pictures)
                     if wanted:
-                        wanted = {k: v for k, v in wanted.items() if k not in ("status_display_type", "type")}
+                        wanted = {k: v for k, v in wanted.items()
+                                  if k not in ("status_display_type", "type", "details_url", "state_url")}
+                        if "assets" in wanted:
+                            wanted["assets"] = {k: v for k, v in wanted["assets"].items() if not k.endswith("_url")}
                     self._apply(wanted)
                 self.sent, last = key, time.time()
             except (OSError, ValueError) as e:
@@ -279,20 +282,35 @@ class DiscordPresence(threading.Thread):
 
 
 def activity_for(title, episode, total=None, group="", cover="", url="", started=None, username="",
-                 show_group=True, show_elapsed=True, show_username=True, paused=False):
-    """The 'Watching <anime>' card, like Taiga's."""
+                 show_group=True, show_elapsed=True, show_username=True, paused=False, ends=None, alt="", avatar="",
+                 profile=""):
+    """The 'Watching <anime>' card, like Taiga's. With `ends` Discord draws a progress bar (0:14 ━━ 23:40);
+    the cover's hover text is the show's other name (the card already shows this one), your name sits on a
+    small AniList avatar. The title and cover open the show's AniList page, the avatar your profile."""
     state = f"Episode {episode}" + (f" of {total}" if total else "") if episode else "Watching"
     if group and show_group:
         state += f" · {group}"
     act = {"type": 3, "status_display_type": 2, "details": title[:128], "state": state[:128]}
+    if url:
+        act["details_url"] = url
     if paused:
         act["state"] = (state + " · Paused")[:128]
     elif started and show_elapsed:
-        act["timestamps"] = {"start": int(started)}
+        act["timestamps"] = {"start": int(started), **({"end": int(ends)} if ends else {})}
     assets = {}
+    named = bool(username and show_username)
     if cover:
         assets["large_image"] = cover
-        assets["large_text"] = (f"{username} · " if username and show_username else "") + title[:100]
+        if url:
+            assets["large_url"] = url
+        text = alt if alt and alt != title else ""
+        if named and not avatar:
+            text = f"{username} · {text}" if text else username
+        if len(text) >= 2:
+            assets["large_text"] = text[:128]
+        if named and avatar:
+            assets["small_image"], assets["small_text"] = avatar, f"{username} on AniList"[:128]
+            assets["small_url"] = profile or f"https://anilist.co/user/{urllib.parse.quote(username)}/"
     if assets:
         act["assets"] = assets
     if url:

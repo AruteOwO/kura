@@ -38,7 +38,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import (QByteArray, QEasingCurve, QElapsedTimer, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRect,
+from PySide6.QtCore import (QByteArray, QEasingCurve, QElapsedTimer, QEvent, QItemSelectionModel, QObject, QPoint, QPointF, QPropertyAnimation, QRect,
                             QRectF, QSize,
                             QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal, Property)
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence, QPolygonF,
@@ -1316,6 +1316,7 @@ class Downloads(QObject):
     changed = Signal()
     finished = Signal(dict)            # the torrent, with Kura's "mid"/"episode" added
     error = Signal(str)
+    arrived = Signal(object)   # {AniList id}: shows whose finished downloads are in the library now
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -1330,6 +1331,9 @@ class Downloads(QObject):
         self.guesses = {}
         self.pick_files = None         # (torrent) → skips a batch's episodes you already have
         self.picking = set()
+        # finished downloads on their way into the library (qBittorrent no longer lists them once Kura removed
+        # them, and the show page said "Not downloaded" until the move and the rescan were done)
+        self.moving = {}               # hash → torrent (progress 1), "done" once organized
         self.timer = QTimer(self, timeout=self.poll)
         self.apply_settings()
 
@@ -1403,6 +1407,7 @@ class Downloads(QObject):
                 self.picking.add(h)
                 self.pick_files(t)
         self.torrents, self.connected, self.status = fresh, True, ""
+        self.save_hints(fresh)
         for h, t in fresh.items():
             if tor.is_done(t) and h not in self.handled:
                 self.handled.add(h)
@@ -1432,6 +1437,56 @@ class Downloads(QObject):
         call.done.connect(finished)
         self.calls.add(call)
         call.start()
+
+    def save_hints(self, torrents):
+        """Tell the organizer which show each download is for (organizer_hints.json): a release spelled unlike
+        AniList ("Onna no Ko … Shimaasu" for "Onnanoko … Shimasu") went to a new folder of its own, though Kura knew
+        the show. Written only when a new name comes in; the last 300 names are kept."""
+        new = {t["name"].lower(): t["mid"] for t in torrents.values() if t.get("name") and t.get("mid")}
+        hints = getattr(self, "hints", None)
+        if hints is None:
+            hints = self.hints = dict(org.load_hints())
+        if all(hints.get(k) == v for k, v in new.items()):
+            return
+        for k, v in new.items():
+            hints.pop(k, None)
+            hints[k] = v   # newest last
+        while len(hints) > 300:
+            hints.pop(next(iter(hints)))
+        try:
+            tmp = org.HINTS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(hints, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, org.HINTS_FILE)
+        except OSError:
+            pass
+
+    def active(self):
+        """Torrents in qBittorrent, plus finished ones still being moved into the library (progress 1)."""
+        return list(self.torrents.values()) + [t for h, t in self.moving.items() if h not in self.torrents]
+
+    def start_moving(self, t):
+        self.moving[t["hash"]] = {**t, "progress": 1.0, "since": time.time()}
+        self.changed.emit()
+
+    def end_moving(self, h, ok=True):
+        """Organized (kept until the library has rescanned) or failed (gone at once)."""
+        if h in self.moving:
+            if ok:
+                self.moving[h]["done"] = True
+            else:
+                del self.moving[h]
+                self.changed.emit()
+
+    def library_updated(self):
+        """The library rescanned: what was organized is in it now (and nothing waits forever)."""
+        arrived = {t.get("mid") for t in self.moving.values() if t.get("done") and t.get("mid")}
+        old = len(self.moving)
+        self.moving = {h: t for h, t in self.moving.items()
+                       if not t.get("done") and time.time() - t["since"] < 3600}
+        if len(self.moving) != old:
+            self.changed.emit()
+        if arrived:
+            self.arrived.emit(arrived)
 
     def for_episode(self, mid, episode):
         """The torrent downloading this episode (a batch counts for all of its episodes)."""
@@ -5693,7 +5748,9 @@ class EpisodeGrid(QWidget):
                 watched = self.progress is not None and text.isdigit() and int(text) <= self.progress
                 tip = self.chips[i][2] + ("  ·  watched" if watched else "")
                 if text in self.downloading and self.chips[i][1] != HAVE:
-                    tip = f"Episode {text} · downloading {int(self.downloading[text] * 100)}%"
+                    frac = self.downloading[text]
+                    tip = (f"Episode {text} · moving to your library" if frac >= 1 else
+                           f"Episode {text} · downloading {int(frac * 100)}%")
 
                 kind = self.kinds.get(int(text)) if text.isdigit() else None
                 tip += f"  ·  {KIND_NAMES[kind]}" if kind else ""
@@ -5821,7 +5878,8 @@ class EpisodeCards(QWidget):
         text, state, tip, path = self.chips[i]
         dur = self.media.get("duration")
         if text in self.downloading and state != HAVE:
-            return f"Downloading · {int(self.downloading[text] * 100)}%"
+            frac = self.downloading[text]
+            return "Moving to your library…" if frac >= 1 else f"Downloading · {int(frac * 100)}%"
         if state == MISSING:
             return "Not downloaded · find a torrent"
         if state == UPCOMING:
@@ -5893,7 +5951,7 @@ class EpisodeCards(QWidget):
                 p.setPen(QColor(C["bad"] if state == MISSING else C["faint"]))
                 label_ = "Not downloaded" if state == MISSING else "Not aired yet"
                 if text in self.downloading:
-                    label_ = "Downloading…"
+                    label_ = "Moving…" if self.downloading[text] >= 1 else "Downloading…"
                     p.setPen(QColor(C["accent_hi"]))
                 p.drawText(r, Qt.AlignCenter, label_)
             if watched and not hot:
@@ -5961,7 +6019,7 @@ class EpisodeCards(QWidget):
                        fm.elidedText(title, Qt.ElideRight, int(r.width() - 4)))
             p.setFont(f_sub)
             sub = self.subtitle(i)
-            p.setPen(QColor(C["accent_hi"] if sub.startswith(("Resume", "Downloading")) else
+            p.setPen(QColor(C["accent_hi"] if sub.startswith(("Resume", "Downloading", "Moving")) else
                             C["bad"] if state == MISSING else C["faint"]))
             p.drawText(QRectF(r.x() + 2, r.bottom() + 26, r.width() - 4, 16), Qt.AlignLeft | Qt.AlignVCenter,
                        QFontMetrics(f_sub).elidedText(sub, Qt.ElideRight, int(r.width() - 4)))
@@ -7616,7 +7674,8 @@ class DetailPage(QWidget):
         """path = the show's folder, or None for a show you haven't downloaded (media_id + name).
         quiet: the same show read again (another version picked): the page stays up, no loading screen, and keeps
         its scroll position."""
-        if quiet and self.result and path == self.path and media_id is None:
+        if quiet and self.result and (path == self.path or self.path is None) and media_id is None:
+            self.path = path
             for ld in list(self.loaders):
                 ld.requestInterruption()
             self.load_id += 1
@@ -7678,6 +7737,19 @@ class DetailPage(QWidget):
         if self.trailer is not None and not self.isVisibleTo(self.window()):
             self.trailer.stop()
 
+    def on_arrived(self, mids, path_for_media):
+        """Downloads of this show were organized into the library: read its episodes again (the page said
+        "Moving…" and then "Not downloaded" until you reopened it)."""
+        r = self.result
+        if r is None:
+            return
+        shown = {s.get("id") for s in r.get("sections") or []} | {self.media_id}
+        if not shown & set(mids):
+            return
+        path = self.path or next((path_for_media(m) for m in mids & shown if m and path_for_media(m)), None)
+        if path and Path(path).exists():
+            self.open(str(path), self.cover, quiet=True)
+
     def on_account_changed(self):
         if self.result is not None:
             pos = self.scroll.verticalScrollBar().value()
@@ -7696,7 +7768,7 @@ class DetailPage(QWidget):
             return
         for grid in self.grids.values():
             got = {}
-            for t in (d.torrents.values() if d else ()):
+            for t in (d.active() if d else ()):
                 if grid.mid and t.get("mid") == grid.mid:
                     frac = float(t.get("progress", 0))
                     if t.get("episode"):
@@ -9075,7 +9147,7 @@ class ToDownloadPage(AccountPage):
         if not self.dl_labels:
             return
         by_mid = {}
-        for t in (self.downloads.torrents.values() if self.downloads else ()):
+        for t in (self.downloads.active() if self.downloads else ()):
             if t.get("mid") in self.dl_labels:
                 by_mid.setdefault(t["mid"], []).append(t)
         for mid, labels in self.dl_labels.items():
@@ -9085,7 +9157,8 @@ class ToDownloadPage(AccountPage):
                 eps = sorted({e for t in ts for e in ([t["episode"]] if t.get("episode") else t.get("episodes") or [])})
                 frac = sum(float(t.get("progress", 0)) for t in ts) / len(ts)
                 what = f"episode{'s' if len(eps) > 1 else ''} {episode_ranges(eps)}" if eps else "batch"
-                text = f"Downloading {what} · {int(frac * 100)}%"
+                text = (f"Moving {what} to your library…" if frac >= 1 else
+                        f"Downloading {what} · {int(frac * 100)}%")
             for lbl in labels:
                 lbl.setText(text)
                 lbl.setVisible(bool(text))
@@ -12765,6 +12838,12 @@ class FilterDialog(KuraDialog):
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if mid in chosen else Qt.Unchecked)
             self.anime_list.addItem(it)
+        for key in sorted(a for a in chosen if isinstance(a, str)):   # by a release's name (Torrents → right-click)
+            it = QListWidgetItem(f"“{key[len(tor.TITLE_PREFIX):]}” (by its name)")
+            it.setData(Qt.UserRole, key)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked)
+            self.anime_list.insertItem(0, it)
         av.addWidget(self.anime_search)
         av.addWidget(self.anime_list)
         self.anime_box.setVisible(self.scope.value() != "all")
@@ -13133,7 +13212,9 @@ class TorrentSettingsDialog(KuraDialog):
         if not ids:
             return "All"
         names = dict(self.anime_choices)
-        text = names.get(ids[0], "1 anime") if len(ids) == 1 else f"{len(ids)} anime"
+        first = ids[0]
+        one = f"“{first[len(tor.TITLE_PREFIX):]}”" if isinstance(first, str) else names.get(first, "1 anime")
+        text = one if len(ids) == 1 else f"{len(ids)} anime"
         return f"All except {text}" if f.get("anime_mode") == "except" else text
 
     def fill_filters(self, select=None):
@@ -13387,30 +13468,42 @@ class ValueSortItem(QTreeWidgetItem):
 
 
 class TorrentFilesPanel(QFrame):
-    """Torrents → Files: what's inside the selected release (Feed: read from its .torrent) or download (Downloads:
-    qBittorrent's list). Hidden until the Files button opens it; the list sorts by a click on its headers."""
-    closed = Signal()
+    """Torrents → the side panel (user's pick, canvas PruAZ2FLRydCsVgvh324QM 3b), two tabs. Show = which anime the
+    selected release is (cover, synopsis, your list, its rules; "This is…" when Kura doesn't know it). Files = what's
+    inside the release (Feed: read from its .torrent) or download (Downloads: qBittorrent's list). Opened and hidden
+    by the panel button in the top bar (no × of its own); the file list sorts by a click on its headers."""
+    tab_changed = Signal(str)
 
-    def __init__(self):
+    def __init__(self, tab="show"):
         super().__init__()
         self.setObjectName("filespanel")
         self.setStyleSheet(f"QFrame#filespanel {{ background: {C['surface']}; border: 1px solid {C['border']}; "
                            "border-radius: 14px; }")
-        self.setFixedWidth(360)
-        v = QVBoxLayout(self)
-        v.setContentsMargins(18, 16, 18, 16)
+        self.setFixedWidth(370)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 14)
+        outer.setSpacing(10)
+        self.tabs = Segmented([("show", "Show"), ("files", "Files")], tab)
+        self.tabs.changed.connect(self.set_tab)
+        outer.addWidget(self.tabs, 0, Qt.AlignLeft)
+        self.pages = QStackedWidget()
+        outer.addWidget(self.pages, 1)
+        # Show
+        self.show_scroll = QScrollArea()
+        self.show_scroll.setWidgetResizable(True)
+        self.show_scroll.setFrameShape(QFrame.NoFrame)
+        self.show_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pages.addWidget(self.show_scroll)
+        self.images, self.image_calls, self.jobs, self.want_image = {}, set(), set(), None
+        # Files
+        files = QWidget()
+        v = QVBoxLayout(files)
+        v.setContentsMargins(4, 4, 4, 0)
         v.setSpacing(10)
-        top = QHBoxLayout()
-        top.setSpacing(8)
+        self.pages.addWidget(files)
+        self.pages.setCurrentIndex(0 if tab == "show" else 1)
         self.title = label("", "h2", wrap=True)
-        top.addWidget(self.title, 1)
-        x = QPushButton()
-        x.setObjectName("icon")
-        x.setIcon(glyph_icon("close", C["muted"]))
-        x.setToolTip("Hide files")
-        x.clicked.connect(self.closed.emit)
-        top.addWidget(x, 0, Qt.AlignTop)
-        v.addLayout(top)
+        v.addWidget(self.title)
         self.meta = label("", "faint", wrap=True)
         self.meta.setTextInteractionFlags(Qt.TextSelectableByMouse)
         v.addWidget(self.meta)
@@ -13447,6 +13540,127 @@ class TorrentFilesPanel(QFrame):
         self.secondary.clicked.connect(lambda: self.runs[1] and self.runs[1]())
         self.empty()
 
+    def tab(self):
+        return self.tabs.value()
+
+    def set_tab(self, tab):
+        self.tabs.buttons[tab].setChecked(True)
+        self.pages.setCurrentIndex(0 if tab == "show" else 1)
+        self.tab_changed.emit(tab)
+
+    # ---- Show
+    def show_info(self, info):
+        """info: {kind: "show" | "unknown" | "looking" | "empty", title, alt, chips, text, list (glyph, color, text),
+        mid, cover (url), actions: [(glyph, text, run, primary)]}."""
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(4, 4, 8, 4)
+        v.setSpacing(10)
+        kind = info.get("kind")
+        self.want_image = None
+        if kind == "empty":
+            v.addWidget(label(info.get("text") or "Pick a release to see which anime it is.", "muted", wrap=True))
+        else:
+            top = QHBoxLayout()
+            top.setSpacing(14)
+            pic = QLabel()
+            pic.setFixedSize(92, 130)
+            pic.setAlignment(Qt.AlignCenter)
+            pic.setStyleSheet(f"background: {C['surface2']}; border-radius: 9px;"
+                              + ("" if kind == "show" else f" border: 1px dashed {C['border_hi']};"))
+            if kind == "show":
+                self.want_image = (pic, info.get("mid"), info.get("cover"))
+                self.load_cover()
+            else:
+                pic.setPixmap(glyph_pixmap("hourglass_top" if kind == "looking" else "help", C["faint"], 30))
+            top.addWidget(pic, 0, Qt.AlignTop)
+            names = QVBoxLayout()
+            names.setSpacing(3)
+            t = label(info.get("title") or "", None, wrap=True)
+            t.setStyleSheet("font-family: 'Segoe UI Variable Display'; font-size: 13pt; font-weight: 600;")
+            names.addWidget(t)
+            if info.get("alt"):
+                names.addWidget(label(info["alt"], "faint", wrap=True))
+            if info.get("chips"):
+                flow_box = QWidget()
+                flow = FlowLayout(flow_box, spacing=6)
+                for c in info["chips"]:
+                    chip = QLabel(c)
+                    chip.setStyleSheet(f"background: {C['surface2']}; color: #c2c8d6; border: 1px solid {C['border_hi']};"
+                                       " border-radius: 10px; padding: 2px 8px; font-size: 8.5pt;")
+                    flow.addWidget(chip)
+                names.addSpacing(4)
+                names.addWidget(flow_box)
+            names.addStretch(1)
+            top.addLayout(names, 1)
+            v.addLayout(top)
+            if info.get("text"):
+                v.addWidget(label(info["text"], "muted", wrap=True))
+            if info.get("list"):
+                glyph, color, text = info["list"]
+                row = QHBoxLayout()
+                row.setSpacing(6)
+                row.addWidget(glyph_label(glyph, color, 16), 0, Qt.AlignTop)
+                lt = label(text, None, wrap=True)
+                lt.setStyleSheet(f"color: {color}; background: transparent;")
+                row.addWidget(lt, 1)
+                v.addLayout(row)
+            if info.get("actions"):
+                v.addSpacing(4)
+            for glyph, text, run, primary in info.get("actions") or []:
+                b = QPushButton(" " + text)
+                b.setIcon(glyph_icon(glyph, "white" if primary else C["text"]))
+                if primary:
+                    b.setObjectName("primary")
+                b.setCursor(Qt.PointingHandCursor)
+                b.setMinimumHeight(36)
+                b.setStyleSheet("text-align: left; padding-left: 12px; padding-right: 12px;")
+                b.clicked.connect(run)
+                v.addWidget(b)
+        v.addStretch(1)
+        old = self.show_scroll.takeWidget()
+        if old is not None:
+            old.deleteLater()
+        self.show_scroll.setWidget(body)
+
+    def load_cover(self):
+        """The wanted cover: from memory or cover_cache, else fetched from AniList's CDN and shown if still wanted."""
+        pic, mid, url = self.want_image or (None, None, None)
+        if pic is None or not mid:
+            return
+        img = self.images.get(mid)
+        if img is None:
+            f = cover_file(mid)
+            img = QImage(str(f)) if f else None
+            if img is not None and not img.isNull():
+                self.images[mid] = img
+        if img is not None and not img.isNull():
+            w, h = 92, 130
+            pm = QPixmap.fromImage(img).scaled(w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            out = QPixmap(w, h)
+            out.fill(Qt.transparent)
+            p = QPainter(out)
+            p.setRenderHint(QPainter.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, w, h), 9, 9)
+            p.setClipPath(path)
+            p.drawPixmap(0, 0, pm, (pm.width() - w) // 2, (pm.height() - h) // 2, w, h)
+            p.end()
+            pic.setPixmap(out)
+        elif url and mid not in self.image_calls:
+            self.image_calls.add(mid)
+            job = ImageFetcher([(str(mid), url, str(mid))])
+            job.image.connect(lambda key, image: (self.images.__setitem__(int(key), image), self.load_cover()))
+            job.finished.connect(lambda j=job: (self.jobs.discard(j), j.deleteLater()))
+            self.jobs.add(job)
+            job.start()
+
+    def stop(self):
+        for j in list(self.jobs):
+            j.requestInterruption()
+            j.wait(3000)
+
+    # ---- Files
     def set_buttons(self, primary=None, secondary=None):
         """(text, run) each; None hides it."""
         for b, a in ((self.primary, primary), (self.secondary, secondary)):
@@ -13556,15 +13770,10 @@ class TorrentPage(Page):
         ask.setToolTip("When you press Check feed and it finds episodes you don't have, Kura asks whether to "
                        "download them")
         self.asked = set()   # torrents already offered after a manual check (asked once each)
-        self.files_btn = QPushButton(" Files")
-        self.files_btn.setCheckable(True)
-        self.files_btn.setIcon(glyph_icon("folder_open", C["text"]))
-        self.files_btn.setToolTip("What's inside the selected release or download")
-        self.files_btn.setChecked(bool(settings.get("torrent_files_panel", False)))
-        self.files_btn.setStyleSheet(f"QPushButton:checked {{ background: rgba({accent_rgb()},0.30); "
-                                     f"border-color: {C['accent']}; }}")   # the same "on" look as other toggles
-        self.files_btn.toggled.connect(self.toggle_files)
-        for w in (gear, self.files_btn, ask, check, self.dl_btn):
+        # the side panel's button: one at the end of each view's top row (next to the feed's toggles, and the
+        # Downloads status line), right beside the panel; both show the same state
+        self.files_btn, self.dl_panel_btn = self.panel_button(), self.panel_button()
+        for w in (gear, ask, check, self.dl_btn):
             self.actions.addWidget(w)
         self.feed_only = [ask, check, self.dl_btn]
 
@@ -13573,9 +13782,11 @@ class TorrentPage(Page):
         split = QHBoxLayout()
         split.setSpacing(14)
         split.addWidget(self.stack, 1)
-        self.files_panel = TorrentFilesPanel()
-        self.files_panel.closed.connect(lambda: self.files_btn.setChecked(False))
+        self.files_panel = TorrentFilesPanel(settings.get("torrent_panel_tab", "show"))
+        self.files_panel.tab_changed.connect(lambda tab: (self._remember("torrent_panel_tab", tab), self.update_files()))
         split.addWidget(self.files_panel)
+        # release names Kura couldn't match: looked up on AniList (strict), or picked by you ("This is…")
+        self.lookups, self.lookup_wait, self.lookup_call, self.info_calls = load_lookups(), {}, None, {}
         self.outer.addLayout(split, 1)
         self.files_panel.setVisible(self.files_btn.isChecked())   # parented by now (no flash as its own window)
         self.file_cache, self.files_gen, self.files_calls = {}, 0, set()
@@ -13633,7 +13844,20 @@ class TorrentPage(Page):
         self.show_all.toggled.connect(lambda on: self._remember("torrents_show_all", on) or self.populate())
         row.addWidget(label("Show hidden", "muted"))
         row.addWidget(self.show_all)
+        row.addSpacing(10)
+        self.group_others = Toggle(settings.get("torrents_group_others", False))
+        self.group_others.toggled.connect(lambda on: self._remember("torrents_group_others", on) or self.populate())
+        others = label("Group not on my list", "muted")
+        others.setToolTip("Releases of shows that aren't on your list or in your library go under their own header "
+                          "at the bottom")
+        row.addWidget(others)
+        row.addWidget(self.group_others)
+        row.addSpacing(6)
+        row.addWidget(self.files_btn)
         fl.addLayout(row)
+        self.lookup_note = label("", "faint")
+        self.lookup_note.hide()
+        fl.addWidget(self.lookup_note)
         self.chip_box = QWidget()   # every name of the show being searched (tick the ones to use)
         self.chip_lay = FlowLayout(self.chip_box, spacing=8)
         self.chip_box.hide()
@@ -14412,6 +14636,7 @@ class TorrentPage(Page):
         self.dl_setup = QPushButton("Set up qBittorrent")
         self.dl_setup.clicked.connect(lambda: self.open_settings(1))
         bar.addWidget(self.dl_setup)
+        bar.addWidget(self.dl_panel_btn)
         col.addLayout(bar)
         self.dl_tree = QTreeWidget()
         self.dl_tree.setObjectName("torrents")
@@ -14618,6 +14843,7 @@ class TorrentPage(Page):
         self.update_filters_btn()
         self.notify.emit(f"Added filter “{flt['name']}”")
         self.refilter()
+        self.refilter()
 
     def use_group_for(self, mid, title, group):
         """Get this anime from another group: it becomes an exception to "only one group"
@@ -14628,7 +14854,7 @@ class TorrentPage(Page):
                                                       for c in f.get("conditions") or [])
             if strict and not (f.get("anime") and f.get("anime_mode", "only") == "only"):
                 f["anime_mode"] = "except"
-                f["anime"] = sorted(set(f.get("anime") or []) | {mid})
+                f["anime"] = sorted(set(f.get("anime") or []) | {mid}, key=str)
         flt = tor._f(f"[{group}] {title}", "prefer", [("release_group", "is", group)], anime=[mid])
         filters.insert(next((n for n, f in enumerate(filters) if f["action"] == "prefer"), len(filters)), flt)
         tor.save_filters(enabled, filters)
@@ -14796,9 +15022,15 @@ class TorrentPage(Page):
         """Re-run the filters (list, library or filters may have changed)."""
         if self.items:
             matcher, describe, self.titles = build_matcher(self.library, self.account)
+            for v in self.lookups.values():   # shows found for release names: their AniList title in the table
+                if v.get("mid") and v["mid"] not in self.titles:
+                    m = media_for(v["mid"], self.account)
+                    if m.get("title"):
+                        self.titles[v["mid"]] = media_title(m)
             enabled, filters = torrent_filters(self.settings)
-            tor.evaluate(self.items, matcher, describe, tor.load_history(), filters, enabled,
-                         tracking=bool(self.account and self.account.connected))
+            tor.evaluate(self.items, tor.LookupMatcher(matcher, self.lookups), describe, tor.load_history(), filters,
+                         enabled, tracking=bool(self.account and self.account.connected))
+            self.queue_lookups()
             for it in self.items:   # what you ticked or unticked yourself wins over the filters
                 if self.pick_key(it) in self.sent_keys:
                     it["selected"] = False
@@ -14887,29 +15119,62 @@ class TorrentPage(Page):
         self.update_button()
 
     def toggle_batches(self, row):
-        if row.data(0, Qt.UserRole) == -1:
-            self._remember("torrents_batches_open", not self.settings.get("torrents_batches_open", True))
+        which = {-1: "torrents_batches_open", -2: "torrents_others_open"}.get(row.data(0, Qt.UserRole))
+        if which:
+            self._remember(which, not self.settings.get(which, True))
             self.populate()
 
     # ---- table
     def populate(self):
+        # the table is rebuilt (filters ran again, a lookup found a show...): the release you had picked stays
+        # picked and the list stays where it was scrolled (it jumped back to the top, deselected)
+        cur = self.item_of(self.tree.currentItem())
+        keep = self.pick_key(cur) if cur is not None else None
+        chosen = {self.pick_key(x) for x in (self.item_of(r) for r in self.tree.selectedItems()) if x is not None}
+        scroll = self.tree.verticalScrollBar().value()
+        cur_row = self.tree.currentItem()
+        offset = self.tree.indexOfTopLevelItem(cur_row) - scroll if cur_row is not None else 0   # rows from the top
         self.tree.blockSignals(True)
         self.tree.clear()
         show_hidden = self.show_all.isChecked()
         rows = [(i, it) for i, it in enumerate(self.items) if show_hidden or not it.get("hidden")]
-        rows.sort(key=lambda r: (bool((r[1].get("parsed") or {}).get("batch")),
+        group_others = self.group_others.isChecked()
+
+        def other(it):   # a show you don't follow: not on your list, not in your library
+            facts = it.get("facts") or {}
+            return group_others and facts.get("my_status") == "Not in list" and not facts.get("in_library")
+        rows.sort(key=lambda r: (other(r[1]), bool((r[1].get("parsed") or {}).get("batch")),
                                  not r[1].get("suggested"), TORRENT_ORDER.index(r[1].get("state", "neutral")), r[0]))
         if self.fsort:   # a clicked column, within the single episodes and within the batches (the group stays below)
             col, desc = self.fsort
-            is_batch = lambda r: bool((r[1].get("parsed") or {}).get("batch"))
-            rows = [r for grp in (False, True) for r in sorted((r for r in rows if is_batch(r) == grp),
-                                                               key=lambda r: self.sort_key(r[1], col), reverse=desc)]
+            part = lambda r: (other(r[1]), bool((r[1].get("parsed") or {}).get("batch")))
+            rows = [r for grp in ((False, False), (False, True), (True, False), (True, True))
+                    for r in sorted((r for r in rows if part(r) == grp), key=lambda r: self.sort_key(r[1], col),
+                                    reverse=desc)]
         batches_open = self.settings.get("torrents_batches_open", True)
-        n_batches = sum(1 for _, it in rows if (it.get("parsed") or {}).get("batch"))
-        header_done = False
+        others_open = self.settings.get("torrents_others_open", True)
+        n_batches = sum(1 for _, it in rows if (it.get("parsed") or {}).get("batch") and not other(it))
+        n_others = sum(1 for _, it in rows if other(it))
+        header_done = others_done = False
         for i, it in rows:
             p = it.get("parsed") or {}
-            if p.get("batch") and not header_done:
+            if other(it):
+                if not others_done:
+                    others_done = True
+                    head = QTreeWidgetItem([f"{'▾' if others_open else '▸'}  Not on your list  ·  {n_others}"])
+                    head.setData(0, Qt.UserRole, -2)
+                    head.setFlags(Qt.ItemIsEnabled)
+                    head.setForeground(0, QColor(C["accent_hi"]))
+                    f = head.font(0)
+                    f.setWeight(QFont.DemiBold)
+                    head.setFont(0, f)
+                    head.setToolTip(0, "Releases of shows that aren't on your list or in your library. Click to show "
+                                       "or hide.")
+                    self.tree.addTopLevelItem(head)
+                    head.setFirstColumnSpanned(True)
+                if not others_open:
+                    continue
+            elif p.get("batch") and not header_done:
                 header_done = True
                 head = QTreeWidgetItem([f"{'▾' if batches_open else '▸'}  Batches  ·  {n_batches}"])
                 head.setData(0, Qt.UserRole, -1)
@@ -14921,7 +15186,7 @@ class TorrentPage(Page):
                 head.setToolTip(0, "Whole seasons in one torrent. Click to show or hide.")
                 self.tree.addTopLevelItem(head)
                 head.setFirstColumnSpanned(True)
-            if p.get("batch") and not batches_open:
+            if p.get("batch") and not batches_open and not other(it):
                 continue
             state = it.get("state", "neutral")
             name = self.titles.get(it.get("mid")) or p.get("name") or it["title"]
@@ -14979,7 +15244,21 @@ class TorrentPage(Page):
                 row.setToolTip(2, tip)
                 row.setToolTip(7, tip)
             self.tree.addTopLevelItem(row)
+        again = None
+        if keep is not None:
+            for n in range(self.tree.topLevelItemCount()):
+                r = self.tree.topLevelItem(n)
+                it = self.item_of(r)
+                if it is not None and self.pick_key(it) in chosen:
+                    r.setSelected(True)
+                    if self.pick_key(it) == keep:
+                        again = r
+        if again is not None:
+            self.tree.setCurrentItem(again, 0, QItemSelectionModel.NoUpdate)
         self.tree.blockSignals(False)
+        if again is not None:   # at the same height on screen, even when rows above it moved
+            self.tree.verticalScrollBar().setValue(max(0, self.tree.indexOfTopLevelItem(again) - offset))
+            self.update_files()   # the panel shows what's known now (a lookup just found the show)
         self.tree.setColumnHidden(9, not (self.query and len(getattr(self, "term_kinds", [])) > 1))
         sel = sum(1 for it in self.items if it.get("selected"))
         hidden = sum(1 for it in self.items if it.get("hidden"))
@@ -15042,7 +15321,23 @@ class TorrentPage(Page):
         return self.found_text(it).casefold()
 
     # ---- the Files panel
+    def panel_button(self):
+        b = QPushButton()
+        b.setCheckable(True)
+        b.setIcon(glyph_icon("right_panel_open", C["text"]))
+        b.setToolTip("Side panel: which anime the selected release is, and its files")
+        b.setChecked(bool(self.settings.get("torrent_files_panel", False)))
+        b.setStyleSheet(f"QPushButton:checked {{ background: rgba({accent_rgb()},0.30); "
+                        f"border-color: {C['accent']}; }}")   # the same "on" look as other toggles
+        b.toggled.connect(self.toggle_files)
+        return b
+
     def toggle_files(self, on):
+        for b in (self.files_btn, self.dl_panel_btn):   # the other view's button follows
+            if b.isChecked() != on:
+                b.blockSignals(True)
+                b.setChecked(on)
+                b.blockSignals(False)
         self.settings["torrent_files_panel"] = on
         save_settings(self.settings)
         self.files_panel.setVisible(on)
@@ -15053,6 +15348,7 @@ class TorrentPage(Page):
 
     def show_files_for(self, tree, row):
         tree.setCurrentItem(row)
+        self.files_panel.set_tab("files")
         self.files_btn.setChecked(True)
         self.update_files()
 
@@ -15060,11 +15356,191 @@ class TorrentPage(Page):
         if not self.files_panel.isVisible():
             return
         self.files_gen += 1
-        if self.stack.currentIndex() == 1:
-            row = self.dl_tree.currentItem()
-            self.show_download_files(self.download_of(row) if row is not None else None)
+        downloads = self.stack.currentIndex() == 1
+        row = self.dl_tree.currentItem() if downloads else self.tree.currentItem()
+        it, t = (None, self.download_of(row) if row is not None else None) if downloads else (self.item_of(row), None)
+        if self.files_panel.tab() == "show":
+            self.show_info_for(it, t)
+        elif downloads:
+            self.show_download_files(t)
         else:
-            self.show_feed_files(self.item_of(self.tree.currentItem()))
+            self.show_feed_files(it)
+
+    # ---- the panel's Show tab
+    def show_info_for(self, it=None, t=None):
+        panel = self.files_panel
+        if it is None and t is None:
+            return panel.show_info({"kind": "empty", "text": "Pick a release to see which anime it is." if
+                                    self.stack.currentIndex() == 0 else "Pick a download to see which anime it is."})
+        src = it if it is not None else t
+        p = (it.get("parsed") if it is not None else tor.parse_release(t.get("name", ""))) or {}
+        mid, group = src.get("mid"), p.get("group") or ""
+        name = p.get("name") or src.get("title") or src.get("name") or ""
+        if not mid:
+            if it is not None and tor.lookup_key(name, p.get("season")) in self.lookup_wait:
+                return panel.show_info({"kind": "looking", "title": name, "text": "Looking this up on AniList…"})
+            acts = []
+            if it is not None:
+                key = tor.title_key(name)
+                acts.append(("search", "This is…", lambda: self.this_is(it), True))
+                if group:
+                    acts.append(("filter_alt", f"Use [{group}] for “{name}”",
+                                 lambda: self.use_group_for(key, f"“{name}”", group), False))
+                acts.append(("visibility_off", f"Hide “{name}”", lambda: self.add_quick_filter(
+                    tor._f(f"Discard “{name}”", "discard", [], anime=[key], discard="hide")), False))
+            return panel.show_info({"kind": "unknown", "title": name or "Unknown release",
+                                    "text": "AniList has nothing called this. Releases sometimes use a nickname or a "
+                                            "fan title: pick the show with This is…, or set rules by this name.",
+                                    "actions": acts})
+        m = media_for(mid, self.account) or {}
+        d = (details_file().get(str(mid)) or {}).get("data") or {}
+        if not d.get("description") and mid not in self.info_calls:
+            self.fetch_info(mid)
+        full = {**d, **m}
+        title = media_title(full) if full.get("title") else self.titles.get(mid) or name
+        t_ = full.get("title") or {}
+        alt = next((x for x in (t_.get("romaji"), t_.get("native")) if x and x != title), "")
+        chips = [FORMAT_TEXT.get(full.get("format"), full.get("format") or ""),
+                 tor.AIRING_TEXT.get(full.get("status"), ""),
+                 f"{full['episodes']} episodes" if full.get("episodes") else "", *(full.get("genres") or [])[:3]]
+        text = clean_description(d.get("description") or "").split("\n")[0]
+        if len(text) > 360:   # the first sentences (the show page has the rest)
+            cut = text.rfind(". ", 0, 360)
+            text = text[:cut + 1] if cut > 120 else text[:360].rsplit(" ", 1)[0] + "…"
+        e = self.account.entry(mid) if self.account and self.account.connected else None
+        if e:
+            st = acct.STATUS_NAMES.get(e["status"], e["status"])
+            listed = ("visibility", "#9ccbff", f"{st} · episode {e['progress']} seen" if e.get("progress") else st)
+        else:
+            listed = ("playlist_add", C["muted"], "Not on your list")
+        acts = [("open_in_new", "Open show page", lambda: self.open_media.emit(mid, title, None), True)]
+        if self.account and self.account.connected and not e:
+            acts.append(("playlist_add", "Add to Planning",
+                         lambda: (self.account.set_status(mid, "PLANNING", full), QTimer.singleShot(800, self.update_files)),
+                         False))
+        if it is not None and group:
+            acts.append(("filter_alt", f"Use [{group}] for this anime", lambda: self.use_group_for(mid, title, group),
+                         False))
+        acts.append(("visibility_off", "Hide this anime", lambda: self.add_quick_filter(
+            tor._f(f"Discard {title}", "discard", [], anime=[mid], discard="hide")), False))
+        panel.show_info({"kind": "show", "mid": mid, "title": title, "alt": alt, "chips": [c for c in chips if c],
+                         "text": text, "list": listed, "cover": (full.get("coverImage") or {}).get("extraLarge"),
+                         "actions": acts})
+
+    def fetch_info(self, mid):
+        """A show's details (synopsis, genres...) for the Show tab, once; shown when they arrive."""
+        call = BgCall(lambda: fetch_details([mid]))
+
+        def done(_res, _err):
+            call.wait()
+            self.info_calls.pop(mid, None)
+            self.update_files()
+        call.done.connect(done)
+        self.info_calls[mid] = call
+        call.start()
+
+    # ---- release names Kura couldn't match
+    def queue_lookups(self):
+        now = time.time()
+        for it in self.items:
+            p = it.get("parsed") or {}
+            if it.get("mid") or not p.get("name"):
+                continue
+            key = tor.lookup_key(p["name"], p.get("season"))
+            old = self.lookups.get(key)
+            if old and (old.get("mid") or now - old.get("at", 0) < LOOKUP_MISS_DAYS * 86400):
+                continue
+            self.lookup_wait.setdefault(key, (p["name"], p.get("season")))
+        self.next_lookup()
+
+    def next_lookup(self):
+        n = len(self.lookup_wait)
+        self.lookup_note.setText(f"Looking up {n} release name{'s' if n != 1 else ''} on AniList…" if n else "")
+        self.lookup_note.setVisible(bool(n))
+        if self.lookup_call is not None or not self.lookup_wait:
+            return
+        batch = list(self.lookup_wait.items())[:5]
+
+        def work():
+            out = {}
+            for key, (name, season) in batch:
+                # "Romaji (English)", "English / 中文 / Pinyin": the whole name, then each part
+                halves = re.match(r"(.+?)\s*\((.+)\)\s*$", name)
+                parts = [x for x in re.split(r"\s+[/|]\s+", name) if x.strip()]
+                m = None
+                for q in dict.fromkeys([name, *(halves.groups() if halves else ()), *(parts if len(parts) > 1 else ())]):
+                    m = anilist_strict(f"{q} Season {season}" if season and season > 1 else q)
+                    if m:
+                        break
+                out[key] = m["id"] if m else None
+            found = [v for v in out.values() if v]
+            if found:
+                fetch_details(found)   # titles, covers and synopses for the table and the panel
+            return out
+        call = self.lookup_call = BgCall(work)
+
+        def done(res, err):
+            call.wait()
+            self.lookup_call = None
+            for key, _ in batch:
+                self.lookup_wait.pop(key, None)
+            if err:   # offline or AniList busy: tried again on the next feed check
+                self.lookup_wait.clear()
+                self.next_lookup()
+                return
+            now = time.time()
+            for key, mid in res.items():
+                self.lookups[key] = {"mid": mid, "at": now, "by": "anilist"}
+            save_lookups(self.lookups)
+            found = {tor.title_key(name): res[key] for key, (name, _) in batch if res.get(key)}
+            self.migrate_rules(found)
+            if found:
+                self.refilter()   # (queues nothing new: these names are known now)
+                self.update_files()
+            self.next_lookup()
+        call.done.connect(done)
+        call.start()
+
+    @staticmethod
+    def teach_organizer(name, mid):
+        """The organizer matches files by name on its own (it never saw Torrents' picks): a name Kura couldn't match
+        becomes one of its matches too, as Edit info would write it, so the download lands in the right show.
+        Only names without a season (its matches go by name alone, so "Name S2" would send every season there),
+        and never over a match that's already there (yours from Edit info wins)."""
+        data = org.load_user_overrides()
+        titles = data.setdefault("titles", {})
+        if name.lower() not in {k.lower() for k in titles}:
+            titles[name.lower()] = mid
+            org.save_user_overrides(data)
+            klog.info(f"Torrents: the organizer now knows “{name}” as AniList {mid}")
+
+    def migrate_rules(self, found):
+        """Rules set by a release's name apply to the show once Kura knows which one it is."""
+        if not found:
+            return
+        enabled, filters = torrent_filters(self.settings)
+        if tor.migrate_title_rules(filters, found):
+            tor.save_filters(enabled, filters)
+            self.update_filters_btn()
+
+    def this_is(self, it):
+        """You pick the show a release name is; remembered for every release with that name."""
+        p = it.get("parsed") or {}
+        name = p.get("name") or it["title"]
+        q = f"{name} Season {p['season']}" if p.get("season") and p["season"] > 1 else name
+        dlg = AniListPicker(self, "Which show is this?", q)
+        if dlg.exec() and dlg.chosen:
+            m = dlg.chosen
+            self.lookups[tor.lookup_key(name, p.get("season"))] = {"mid": m["id"], "at": time.time(), "by": "you"}
+            save_lookups(self.lookups)
+            if not it.get("mid") and not p.get("season"):
+                self.teach_organizer(name, m["id"])
+            self.migrate_rules({tor.title_key(name): m["id"]})
+            self.titles[m["id"]] = media_title(m)
+            self.notify.emit(f"“{name}” is {media_title(m)} from now on")
+            self.refilter()
+            self.fetch_info(m["id"])
+        dlg.deleteLater()
 
     def show_feed_files(self, it):
         panel = self.files_panel
@@ -15355,6 +15831,20 @@ class TorrentPage(Page):
             menu.addAction(dot_icon(ACTION_COLORS["discard"]), f"Discard [{group}] releases",
                            lambda: self.add_quick_filter(tor._f(f"Discard [{group}]", "discard",
                                                                 [("release_group", "is", group)])))
+        name = p.get("name") or ""
+        if not mid and name:   # a show Kura doesn't know: rules by its name (they follow the show once it's known)
+            key = tor.title_key(name)
+            if group:
+                menu.addAction(dot_icon(ACTION_COLORS["prefer"]), f"Use [{group}] for “{name}”",
+                               lambda: self.use_group_for(key, f"“{name}”", group))
+            menu.addAction(dot_icon(ACTION_COLORS["discard"]), f"Discard “{name}”",
+                           lambda: self.add_quick_filter(tor._f(f"Discard “{name}”", "discard", [], anime=[key],
+                                                                discard="hide")))
+            menu.addAction(dot_icon(ACTION_COLORS["select"]), f"Always select “{name}”",
+                           lambda: self.add_quick_filter(tor._f(f"Select “{name}”", "select", [], anime=[key])))
+        if name:
+            menu.addAction(glyph_icon(G["search"], C["text"]), "This is…" if not mid else "Not this show? Pick it…",
+                           lambda: self.this_is(it))
         if mid:
             menu.addAction(dot_icon(ACTION_COLORS["discard"]), f"Discard {title}",
                            lambda: self.add_quick_filter(tor._f(f"Discard {title}", "discard", [], anime=[mid],
@@ -15593,12 +16083,15 @@ class NowPlaying(QObject):
             mid, ep = mine["mid"], e["episode"]
         else:
             matcher = self.matcher()[0]
-            mid, ep = matcher.match(e["season_title"], None, e["episode"])
+            name = crunchy.season_name(e["series_title"], e["season_title"])   # never just "Season 2"
+            mid, ep = matcher.match(name, None, e["episode"])
             if not mid:
-                mid, ep = matcher.match(e["series_title"], e.get("season_number"), e["episode"])
+                mid, ep = matcher.match(e["series_title"], crunchy.season_number(e["season_title"],
+                                                                                 e.get("season_number")), e["episode"])
         if not mid or not ep:
             return None
-        return {"mid": mid, "ep": ep, "title": self.title_of(mid, e["season_title"]), "group": "",
+        return {"mid": mid, "ep": ep, "title": self.title_of(mid, crunchy.season_name(e["series_title"],
+                                                                                       e["season_title"])), "group": "",
                 "source": "Crunchyroll", "pos": e.get("playhead"), "duration": e.get("duration")}
 
     def poll(self):
@@ -17365,25 +17858,7 @@ class CrunchySync(QThread):
         return {}
 
     def search(self, title, movie):
-        """AniList's best result, only when one of its titles really is this title
-        (a near-miss goes to "Couldn't match" for you to pick, rather than a wrong guess)."""
-        import difflib
-        results = ((org.anilist(QUERY_PICK, {"s": title}) or {}).get("Page") or {}).get("media") or []
-        key = tor.norm(title)
-
-        def titles(m):
-            t = m.get("title") or {}
-            return [tor.norm(x) for x in (t.get("english"), t.get("romaji"), *(m.get("synonyms") or [])) if x]
-
-        def fits(m):
-            return (m.get("format") == "MOVIE") == bool(movie)
-        best, score = None, 0.0
-        for m in results:
-            ratio = max((1.0 if x == key else difflib.SequenceMatcher(None, x, key).ratio()) for x in titles(m) or [""])
-            ratio += 0.01 * fits(m)   # same score: the right kind (TV vs movie) wins
-            if ratio > score:
-                best, score = m, ratio
-        return best if score >= 0.92 else None
+        return anilist_strict(title, movie)
 
     def work(self):
         cr = crunchy.Crunchyroll()
@@ -17479,6 +17954,46 @@ class CrunchyApply(QThread):
 QUERY_PICK = ("query ($s: String) { Page(perPage: 15) { media(search: $s, type: ANIME, sort: SEARCH_MATCH) { "
               "id format status episodes season seasonYear siteUrl title { romaji english } synonyms "
               "coverImage { extraLarge } nextAiringEpisode { episode airingAt } } } }")
+
+
+def anilist_strict(title, movie=False):
+    """AniList's best result, only when one of its titles really is this title (a near-miss is None, for you to
+    pick, rather than a wrong guess). The Crunchyroll import and the Torrents lookups use it."""
+    import difflib
+    results = ((org.anilist(QUERY_PICK, {"s": title}) or {}).get("Page") or {}).get("media") or []
+    key = tor.norm(title)
+
+    def titles(m):
+        t = m.get("title") or {}
+        return [tor.norm(x) for x in (t.get("english"), t.get("romaji"), *(m.get("synonyms") or [])) if x]
+
+    def fits(m):
+        return (m.get("format") == "MOVIE") == bool(movie)
+    best, score = None, 0.0
+    for m in results:
+        ratio = max((1.0 if x == key else difflib.SequenceMatcher(None, x, key).ratio()) for x in titles(m) or [""])
+        ratio += 0.01 * fits(m)   # same score: the right kind (TV vs movie) wins
+        if ratio > score:
+            best, score = m, ratio
+    return best if score >= 0.92 else None
+
+
+LOOKUP_FILE = SCRIPT_DIR / "torrent_lookups.json"   # release names → AniList show (searched, or yours)
+LOOKUP_MISS_DAYS = 7   # a name AniList didn't know is searched again after a week
+
+
+def load_lookups():
+    data = _read_json(LOOKUP_FILE)
+    return data if isinstance(data, dict) else {}
+
+
+def save_lookups(data):
+    try:
+        tmp = LOOKUP_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, LOOKUP_FILE)
+    except OSError:
+        pass
 
 
 class AniListPicker(QDialog):
@@ -30072,6 +30587,8 @@ class MainWindow(QMainWindow):
         self.downloads.describe = self.describe_torrent
         self.downloads.pick_files = self.pick_missing_files
         self.downloads.finished.connect(self.on_download_finished)
+        self.library.updated.connect(self.downloads.library_updated)
+        self.downloads.arrived.connect(lambda mids: self.detail.on_arrived(mids, self.library.path_for_media))
         self.downloads.error.connect(self.notify)
         self.torrents.set_downloads(self.downloads)
         self.home.set_downloads(self.downloads)
@@ -30531,6 +31048,7 @@ class MainWindow(QMainWindow):
         if not self.settings.get("qbit_organize", True):
             self.notify_ready(t, organized=False)
             return
+        self.downloads.start_moving(t)   # "Moving to your library" until the library has it
         path = t.get("content_path") or str(Path(t.get("save_path", "")) / t.get("name", ""))
         # qBittorrent's own "run on finish" hook organizes too: give it a minute first
         wait = 60000 if self.downloads.hook else 0
@@ -30544,6 +31062,7 @@ class MainWindow(QMainWindow):
         if not Path(path).exists():   # already organized (the hook) or removed by hand
             if remove:
                 self.downloads.run(lambda: client.delete([h]), lambda *_: None)
+            self.downloads.end_moving(h)
             self.library.refresh()
             self.notify_ready(t)
             return
@@ -30579,6 +31098,7 @@ class MainWindow(QMainWindow):
     def after_organized(self, t, ok, path, targets, removed):
         library = Path(self.settings.get("library") or ".")
         left = list(org.collect([Path(p) for p in targets if Path(p).exists()], library))
+        self.downloads.end_moving(t["hash"], ok=not left)
         if left:
             n = len(left)
             self.notify(f"Couldn't organize {n} file{'s' if n != 1 else ''} of {self.download_name(t)}. "
@@ -31618,6 +32138,10 @@ class MainWindow(QMainWindow):
             t.shutdown()
         self.kickoff.shutdown()
         self.livetv.shutdown()
+        self.torrents.files_panel.stop()
+        for c in [self.torrents.lookup_call, *self.torrents.info_calls.values()]:
+            if c is not None:
+                c.wait(10000)
         if getattr(self, "tv", None) is not None:
             self.tv.shutdown()
         if getattr(self, "sequel_call", None) is not None:

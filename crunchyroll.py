@@ -319,6 +319,28 @@ def parse_item(item):
             "playhead": playhead, "duration": duration}
 
 
+GENERIC_SEASON = re.compile(r"(?i)^(?:season|part|cour)\s*\d")
+
+
+def season_name(series_title, season_title):
+    """The name a Crunchyroll season is matched by. Some are only "Season 2" / "Part 3" (the show's name is in
+    the series title): they get it in front, or they match any show with "Season 2" in its name (21 of the
+    user's seasons were matched to ULTRAMAN Season 2)."""
+    t = (season_title or "").strip()
+    if not t:
+        return series_title or ""
+    if GENERIC_SEASON.match(t) and series_title:
+        return f"{series_title} {t}"
+    return t
+
+
+def season_number(season_title, fallback=None):
+    """The season in a "Season 2…" title; Crunchyroll's own season_number counts other entries too
+    (Kaiju No. 8's "Season 2" is its season 3)."""
+    m = re.match(r"(?i)season\s*(\d+)", season_title or "")
+    return int(m[1]) if m else fallback
+
+
 def seasons(store):
     """The history grouped per Crunchyroll season: episodes watched and when.
     Dubs of the same season are separate seasons on Crunchyroll; their titles clean to the same."""
@@ -328,8 +350,9 @@ def seasons(store):
             continue
         key = e["season_id"] or e["series_id"]
         s = out.setdefault(key, {"season_id": key, "series_id": e["series_id"], "series_title": e["series_title"],
-                                 "season_title": e["season_title"] or e["series_title"],
-                                 "season_number": e.get("season_number"), "movie": e.get("movie"),
+                                 "season_title": season_name(e["series_title"], e["season_title"]),
+                                 "season_number": season_number(e["season_title"], e.get("season_number")),
+                                 "movie": e.get("movie"),
                                  "episodes": set(), "first": e["first_played"], "last": e["played"]})
         s["episodes"].add(e["episode"])
         s["first"] = min(filter(None, (s["first"], e["first_played"])), default="")

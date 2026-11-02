@@ -174,6 +174,50 @@ def norm(title):
     return " ".join(re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).split())
 
 
+TITLE_PREFIX = "title:"   # a filter's "applies to" entry for a show AniList doesn't know: its name
+
+
+def title_key(name):
+    """"title:<name>": a filter that applies to releases by their name (until Kura can match the show)."""
+    return TITLE_PREFIX + norm(name)
+
+
+def lookup_key(name, season):
+    """A release name + season, as remembered in torrent_lookups.json."""
+    return f"{norm(name)}|{season or 1}"
+
+
+class LookupMatcher:
+    """The Matcher, plus shows found for unknown release names: yours ("This is…") first, then the Matcher,
+    then what an AniList search found. lookups: {lookup_key: {"mid", "by"}}."""
+
+    def __init__(self, base, lookups):
+        self.base = base
+        self.mine = {k: v["mid"] for k, v in lookups.items() if v.get("mid") and v.get("by") == "you"}
+        self.auto = {k: v["mid"] for k, v in lookups.items() if v.get("mid") and v.get("by") != "you"}
+
+    def match(self, name, season, episode):
+        key = lookup_key(name, season)
+        if key in self.mine:
+            return self.mine[key], episode
+        mid, ep = self.base.match(name, season, episode)
+        if mid is None and key in self.auto:
+            return self.auto[key], episode
+        return mid, ep
+
+
+def migrate_title_rules(filters, found):
+    """found: {title key: AniList id}. Filters that applied to a name apply to the show now. True if changed."""
+    changed = False
+    for f in filters:
+        anime = f.get("anime") or []
+        new = [found.get(a, a) if isinstance(a, str) else a for a in anime]
+        if new != anime:
+            f["anime"] = list(dict.fromkeys(new))
+            changed = True
+    return changed
+
+
 def _ints(value):
     vals = value if isinstance(value, list) else [value]
     out = []
@@ -449,7 +493,7 @@ EXPORT_FORMAT = 1
 
 def export_profile(name, filters, titles):
     """titles: {anime id: title}, so whoever imports it can see which shows a filter is about."""
-    ids = {i for f in filters for i in f.get("anime") or []}
+    ids = {i for f in filters for i in f.get("anime") or [] if isinstance(i, int)}
     return {"kura_filters": EXPORT_FORMAT, "name": name, "filters": filters,
             "anime": {str(i): titles.get(i, "") for i in sorted(ids)}}
 
@@ -485,7 +529,8 @@ def import_profile(text):
             ops = [k for k, _ in OPERATORS[ELEMENTS[el][1]]]
             conds.append({"element": el, "op": c.get("op") if c.get("op") in ops else ops[0],
                           "value": str(c.get("value", ""))[:200]})
-        anime = [int(a) for a in raw.get("anime") or [] if str(a).isdigit()]
+        anime = [int(a) if str(a).isdigit() else str(a)[:200] for a in raw.get("anime") or []
+                 if str(a).isdigit() or str(a).startswith(TITLE_PREFIX)]
         filters.append({
             "name": name, "enabled": bool(raw.get("enabled", True)), "action": action,
             "match": raw.get("match") if raw.get("match") in ("all", "any") else "all",
@@ -523,7 +568,8 @@ def condition_true(cond, facts):
 
 def filter_matches(flt, it):
     if flt.get("anime"):
-        listed = it.get("mid") in flt["anime"]
+        listed = it.get("mid") in flt["anime"] or (
+            it.get("mid") is None and title_key((it.get("parsed") or {}).get("name") or "") in flt["anime"])
         if flt.get("anime_mode", "only") == "except" and listed:
             return False   # "all anime except these"
         if flt.get("anime_mode", "only") == "only" and not listed:

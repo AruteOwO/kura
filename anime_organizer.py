@@ -151,6 +151,32 @@ def save_user_overrides(data):
 
 load_user_overrides()
 
+# Which show a download is for, when Kura sent it (or recognized it) in Torrents: {torrent name, lowercase: AniList id}.
+# Kura writes it while qBittorrent downloads; used when the name finds nothing on AniList, so Kura's own run and
+# qBittorrent's run-on-finish hook both put the episode in the show you downloaded it for
+HINTS_FILE = SCRIPT_DIR / "organizer_hints.json"
+HINTS = {}
+
+
+def load_hints():
+    try:
+        data = json.loads(HINTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    HINTS.clear()
+    HINTS.update({k.lower(): v for k, v in data.items() if isinstance(v, int)})
+    return HINTS
+
+
+def hint_for(video):
+    """The show Kura downloaded this file for: by the file's name, or a folder it came in (a batch's torrent)."""
+    for name in (video.name, video.stem, *(p.name for p in list(video.parents)[:3])):
+        mid = HINTS.get(name.lower())
+        if mid:
+            return mid
+    return None
+
+
 log = logging.getLogger("organizer")
 
 try:
@@ -194,7 +220,21 @@ def anitopy_parse(text):
         if m:
             fixed = _anitopy_safe(text[:m.end()] + " - " + text[m.end():].lstrip("._ -"))
             if fixed.get("episode_number"):
-                return fixed
+                info = fixed
+    return _ordinal_season(info)
+
+
+ORDINAL_END = re.compile(r"^(.*\S)\s+(\d{1,2})(?:st|nd|rd|th)$", re.IGNORECASE)
+
+
+def _ordinal_season(info):
+    """"Hikari no Ou 2nd - 03": a bare ordinal ending the title is the season ("2nd" = 2nd season); anitopy only
+    knows "2nd Season" / "S2", so the title kept "2nd" and nothing matched it."""
+    title = info.get("anime_title")
+    if isinstance(title, str) and not info.get("anime_season"):
+        m = ORDINAL_END.match(title.strip())
+        if m and int(m.group(2)) >= 2:
+            info = {**info, "anime_title": m.group(1), "anime_season": m.group(2)}
     return info
 
 
@@ -410,6 +450,26 @@ def choose(results, search, want_movie):
 def plain_title(text):
     """A title with only letters and digits: "Kon'in Kankei!?" and "Konin Kankei" are the same."""
     return re.sub(r"[^0-9a-z]+", "", (text or "").lower())
+
+
+BRACKET = re.compile(r"\[([^\[\]]+)\]")
+TECH_WORD = re.compile(r"\b(?:\d{3,4}p|\d+x\d+|web(?:-?dl|rip)?|blu-?ray|bd(?:rip)?|hevc|avc|[hx]\.?26[45]|aac|flac|"
+                       r"opus|dual|multi|dub|sub(?:s|bed)?|eng|batch|v\d|hdr|10.?bit|[0-9a-f]{8})\b", re.IGNORECASE)
+
+
+def bracket_titles(filename):
+    """Some groups add the show's other title in brackets ("[Doomdos] - Mouse Cursor de ... - S01E04 [Dub]
+    [720p OV WEB-DL] [Now That I Can Control Reality with a Mouse Cursor...]"): when the parsed (romaji) title,
+    spelled a little differently than AniList's, finds nothing, these are tried. Only groups after the start
+    (not the release group) that read like a title: 3+ words and no quality / codec tags."""
+    stem = re.sub(r"\.\w{2,4}$", "", filename)
+    out = []
+    for m in BRACKET.finditer(stem):
+        text = m.group(1).strip()
+        if m.start() == 0 or TECH_WORD.search(text) or len(re.findall(r"[^\W\d_]{2,}", text)) < 3:
+            continue
+        out.append(text)
+    return out
 
 
 def search_shorter(title):
@@ -1613,6 +1673,20 @@ def sort_file(video, library, cache, dry):
                 log.info(f"  ('{title}' doesn't look like the show's name: the batch folder says '{btitle}')")
                 entry, forced_season, title = bentry, bseason, btitle
                 generic = False
+    if entry is None and not generic:
+        for alt in bracket_titles(video.name):
+            aentry, aseason = lookup(alt, want_movie, cache)
+            if aentry and title_fits(alt, aentry):
+                log.info(f"  ('{title}' isn't on AniList as written: the name's other title '{alt}' is)")
+                entry, forced_season = aentry, aseason or forced_season
+                break
+    if entry is None and not generic:
+        hid = hint_for(video)
+        hentry = fetch_by_id(hid, cache) if hid else None
+        if hentry:
+            log.info(f"  ('{title}' isn't on AniList as written: Kura downloaded it for #{hid} "
+                     f"'{preferred_name(hentry)}')")
+            entry = hentry
     if generic:   # "OP.mkv" with nothing around it that says which show: better left than sorted into a random one
         log.info(f"{video.name}\n  '{title}' doesn't say which show and no batch folder does either: left where it is")
         if PLAN is not None:
@@ -2320,6 +2394,7 @@ def main():
             return
 
     cache = load_cache()
+    load_hints()
     touched = {}  # show folder -> AniList entry
     folders_before = {p.name for p in library.iterdir() if p.is_dir()}
 

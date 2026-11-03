@@ -63,6 +63,71 @@ def stale(saved):
     return not saved or time.time() - saved.get("fetched", 0) > MAX_AGE
 
 
+
+# ---------------------------------------------------------------- your AniList favorites
+
+FAVORITES_FILE = org.SCRIPT_DIR / "anilist_favorites.json"
+FAV_KINDS = ("anime", "characters", "staff", "studios")
+FAV_VERSION = 3   # 2: characters' gender, birthday, blood type, other names, favorites; 3: spoiler names
+_FAV_NODES = {
+    "anime": "id title { romaji english native } coverImage { large color } siteUrl format seasonYear episodes "
+             "averageScore isAdult",
+    "characters": "id name { full native alternative alternativeSpoiler } image { large } siteUrl description age gender "
+                  "dateOfBirth { month day } bloodType favourites "
+                  "media(perPage: 1, sort: [POPULARITY_DESC]) { edges { characterRole "
+                  "voiceActors(language: JAPANESE, sort: [RELEVANCE, ID]) { id name { full native } image { large } "
+                  "siteUrl } node { id title { romaji english } isAdult } } }",
+    "staff": "id name { full native } image { large } siteUrl primaryOccupations "
+             "characters(perPage: 3, sort: [FAVOURITES_DESC]) { nodes { name { full } } }",
+    "studios": "id name siteUrl",
+}
+QUERY_FAVORITES = ("query ($page: Int) { Viewer { favourites { " + " ".join(
+    f"{k}(page: $page, perPage: 25) {{ pageInfo {{ total hasNextPage }} nodes {{ {v} }} }}"
+    for k, v in _FAV_NODES.items()) + " } } }")
+_FAV_ARG = {"anime": ("animeId", "Media"), "characters": ("characterId", "Character")}
+
+
+def fetch_favorites(token, pages=4):
+    """Your favorites (anime, characters, staff, studios) in your order on AniList, up to 100 of each;
+    saved to anilist_favorites.json."""
+    from anilist_account import gql
+    data = {"fetched": time.time(), "v": FAV_VERSION, **{k: [] for k in FAV_KINDS}, "total": {}}
+    for page in range(1, pages + 1):
+        fav = (gql(QUERY_FAVORITES, {"page": page}, token=token).get("Viewer") or {}).get("favourites") or {}
+        more = False
+        for k in FAV_KINDS:
+            got = fav.get(k) or {}
+            data[k] += [n for n in got.get("nodes") or [] if n and n.get("id")]
+            data["total"][k] = (got.get("pageInfo") or {}).get("total") or len(data[k])
+            more = more or (got.get("pageInfo") or {}).get("hasNextPage")
+        if not more:
+            break
+    tmp = FAVORITES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, FAVORITES_FILE)
+    return data
+
+
+def set_favorite(token, kind, item_id, on):
+    """Make an anime or character a favorite on AniList (on=True) or not. AniList only has a toggle, so it asks
+    first whether it is one already. Returns your favorites, fetched again."""
+    from anilist_account import gql
+    arg, typ = _FAV_ARG[kind]
+    now = (gql(f"query ($id: Int) {{ {typ}(id: $id) {{ isFavourite }} }}", {"id": item_id}, token=token)
+           .get(typ) or {}).get("isFavourite")
+    if bool(now) != bool(on):
+        gql(f"mutation ($id: Int) {{ ToggleFavourite({arg}: $id) {{ anime(perPage: 1) {{ pageInfo {{ total }} }} }} }}",
+            {"id": item_id}, token=token)
+    return fetch_favorites(token)
+
+
+def load_favorites():
+    try:
+        return json.loads(FAVORITES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def bucket(score, fmt):
     """A score in your format → 1..10 (for the score chart)."""
     top = SCORE_MAX.get(fmt, 10)

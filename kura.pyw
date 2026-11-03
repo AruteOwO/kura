@@ -38,7 +38,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import (QByteArray, QEasingCurve, QElapsedTimer, QEvent, QItemSelectionModel, QObject, QPoint, QPointF, QPropertyAnimation, QRect,
+from PySide6.QtCore import (QByteArray, QEasingCurve, QElapsedTimer, QEvent, QEventLoop, QItemSelectionModel, QObject, QPoint, QPointF, QPropertyAnimation, QRect,
                             QRectF, QSize,
                             QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal, Property)
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence, QPolygonF,
@@ -122,6 +122,18 @@ def setup_kura_log():
     klog.addHandler(h)
     klog.setLevel(logging.INFO)
     klog.propagate = False   # the organizer's logging setup stays as it was
+    # A hard crash (Qt access violation) used to leave nothing: Windows only logged "Qt6Widgets.dll". crash.log
+    # gets every thread's Python stack at that moment (it starts each run with "Kura started" so old ones stay)
+    try:
+        import faulthandler
+        global CRASH_FILE
+        f = SCRIPT_DIR / "crash.log"
+        CRASH_FILE = open(f, "a" if not f.exists() or f.stat().st_size < 500_000 else "w", encoding="utf-8")
+        CRASH_FILE.write(f"\n===== Kura started {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        CRASH_FILE.flush()
+        faulthandler.enable(CRASH_FILE, all_threads=True)
+    except Exception:
+        pass
 
     old_hook = sys.excepthook
 
@@ -326,6 +338,11 @@ QMenu::item { padding: 7px 18px; border-radius: 5px; }
 QMenu::item:selected { background: rgba(124, 108, 255, 0.22); }
 QMessageBox { background: @surface; }
 QDialog[kuraframe="true"], QMessageBox[kuraframe="true"], QInputDialog[kuraframe="true"] { background: transparent; }
+QDialog[kura_inapp="true"] { background: transparent; }
+QPushButton#danger { background: @bad; border: 1px solid transparent; border-radius: 10px; color: #1a0b0f;
+                     font-weight: 600; padding: 9px 18px; }
+QPushButton#danger:hover { background: #ff7a8c; }
+QPushButton#danger:pressed { background: #e8475e; }
 QPushButton#dlgclose { background: transparent; border: none; border-radius: 8px; padding: 0; }
 QPushButton#dlgclose:hover { background: #c42b1c; }
 QPushButton#dlgclose:pressed { background: #a8261a; }
@@ -2020,9 +2037,11 @@ def fetch_details(ids, force=False):
 # ---- characters (show pages; cached like details, in their own file: descriptions are long)
 CHAR_FILE = SCRIPT_DIR / "anilist_characters.json"
 CHAR_DAYS = 30
+CHAR_VERSION = 3   # 2: birthday, blood type, other names, favorites; 3: spoiler names (asked again once)
 QUERY_CHARS = """query ($ids: [Int]) { Page(perPage: 10) { media(id_in: $ids) { id
   characters(sort: [ROLE, RELEVANCE, ID], perPage: 25) { pageInfo { total }
-    edges { role node { id name { full native } image { large } description(asHtml: false) age gender siteUrl }
+    edges { role node { id name { full native alternative alternativeSpoiler } image { large } description(asHtml: false) age gender
+      dateOfBirth { month day } bloodType favourites siteUrl }
       voiceActors(language: JAPANESE, sort: [RELEVANCE, ID]) { id name { full native } image { large } siteUrl } } } } } }"""
 _char_lock = threading.Lock()
 _char_mem = {}
@@ -2045,16 +2064,17 @@ def fetch_characters(ids, force=False, offline=False):
     ids = [i for i in dict.fromkeys(ids) if i]
     store = characters_store()
     need = [] if offline else [i for i in ids if force or not store.get(str(i))
-                               or time.time() - store[str(i)].get("t", 0) > CHAR_DAYS * 86400]
+                               or time.time() - store[str(i)].get("t", 0) > CHAR_DAYS * 86400
+                               or store[str(i)].get("v") != CHAR_VERSION]
     fetched = {}
     for start in range(0, len(need), 10):
         data = org.anilist(QUERY_CHARS, {"ids": need[start:start + 10]})
         for m in ((data or {}).get("Page") or {}).get("media") or []:
             c = m.get("characters") or {}
-            fetched[str(m["id"])] = {"t": time.time(), "total": (c.get("pageInfo") or {}).get("total"),
+            fetched[str(m["id"])] = {"t": time.time(), "v": CHAR_VERSION, "total": (c.get("pageInfo") or {}).get("total"),
                                      "edges": c.get("edges") or []}
         for i in need[start:start + 10]:   # nothing on AniList: remembered too
-            fetched.setdefault(str(i), {"t": time.time(), "total": 0, "edges": []})
+            fetched.setdefault(str(i), {"t": time.time(), "v": CHAR_VERSION, "total": 0, "edges": []})
     if fetched:
         with _char_lock:
             disk = _read_json(CHAR_FILE)
@@ -2062,6 +2082,46 @@ def fetch_characters(ids, force=False, offline=False):
             _write_json(CHAR_FILE, disk)
         store = characters_store()
     return {i: store[str(i)] for i in ids if str(i) in store}
+
+
+CHAR_FIXES = {   # Kura's corrections to AniList's character data, by character id (user's calls)
+    176840: {"gender": "Female", "pronouns": "she",   # Yamato (ONE PIECE): AniList says Male / son / himself
+             "desc_replace": [("proclaiming to be a man as well, and hence Yamato is widely referred to as Kaidou's son.",
+                               "proclaiming to be Oden as well, despite being Kaidou's daughter.")]},   # user's words
+}
+_SHE = {"he": "she", "him": "her", "his": "her", "himself": "herself", "son": "daughter", "sons": "daughters"}
+
+
+def as_she(text):
+    """A description with she / her / herself / daughter in place of he / him / his / himself / son (CHAR_FIXES)."""
+    def swap(m):
+        w = m.group(0)
+        new = _SHE[w.lower()]
+        return new.capitalize() if w[0].isupper() else new
+    return re.sub(r"\b(?:" + "|".join(_SHE) + r")\b", swap, text or "", flags=re.I)
+
+
+def char_facts(n):
+    """A character's birthday ("March 14"), blood type, other names and how many AniList users favorited them."""
+    dob = n.get("dateOfBirth") or {}
+    birthday = ""
+    if dob.get("month"):
+        birthday = datetime(2000, dob["month"], 1).strftime("%B") + (f" {dob['day']}" if dob.get("day") else "")
+    fix = CHAR_FIXES.get(n.get("id"), {})
+    names = n.get("name") or {}
+    alt = [a for a in names.get("alternative") or [] if a and a.strip()]
+    alt_spoiler = [a for a in names.get("alternativeSpoiler") or [] if a and a.strip() and a not in alt]
+    return {"birthday": birthday, "blood": n.get("bloodType") or "", "alt": alt, "alt_spoiler": alt_spoiler,
+            "favs": n.get("favourites") or 0, **fix,
+            **({"desc": fixed_desc(n.get("description"), fix)} if fix.get("pronouns") or fix.get("desc_replace") else {})}
+
+
+def fixed_desc(text, fix):
+    """A description with CHAR_FIXES' own wording: its replacements, then she / her / daughter."""
+    text = text or ""
+    for old, new in fix.get("desc_replace") or []:
+        text = text.replace(old, new)
+    return as_she(text) if fix.get("pronouns") == "she" else text
 
 
 def show_characters(seasons, offline=False):
@@ -2083,6 +2143,7 @@ def show_characters(seasons, offline=False):
                                     "native": (n.get("name") or {}).get("native") or "",
                                     "image": (n.get("image") or {}).get("large"), "desc": n.get("description") or "",
                                     "age": n.get("age"), "gender": n.get("gender"), "url": n.get("siteUrl"),
+                                    **char_facts(n),
                                     "main": False, "seasons": [], "order": len(out),
                                     "va": {"id": va.get("id"), "name": (va.get("name") or {}).get("full") or "",
                                            "native": (va.get("name") or {}).get("native") or "",
@@ -2820,6 +2881,7 @@ PATH_ROLE, COVER_ROLE, SUB_ROLE = Qt.UserRole + 1, Qt.UserRole + 2, Qt.UserRole 
 INDEX_ROLE, STATUS_ROLE, NEW_ROLE, PROG_ROLE = Qt.UserRole + 4, Qt.UserRole + 5, Qt.UserRole + 6, Qt.UserRole + 7
 MID_ROLE, NOTDL_ROLE, MEDIA_ROLE = Qt.UserRole + 8, Qt.UserRole + 9, Qt.UserRole + 10
 ADDED_ROLE, LATEST_ROLE, META_ROLE = Qt.UserRole + 11, Qt.UserRole + 12, Qt.UserRole + 13   # Library filters / sort
+FAV_ROLE = Qt.UserRole + 14   # one of your AniList favorites (Library "Favorites" chip, heart on the cover)
 
 
 def show_all_toggle(settings, key, on_change):
@@ -2933,6 +2995,13 @@ class CoverDelegate(QStyledItemDelegate):
             p.drawRoundedRect(pill, 10, 10)
             p.setPen(QColor("white" if new else "#08130d"))
             p.drawText(pill, Qt.AlignCenter, text)
+        if index.data(FAV_ROLE):   # one of your AniList favorites
+            heart = QRectF(poster.left() + 8, poster.top() + 8, 24, 24)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(15, 17, 21, 210))
+            p.drawEllipse(heart)
+            pm = _HEART.get("pm") or _HEART.setdefault("pm", glyph_pixmap("favorite", C["bad"], 14, fill=True))
+            p.drawPixmap(heart.adjusted(5, 5, -5, -5), pm, QRectF(pm.rect()))
 
         p.setBrush(Qt.NoBrush)
         if hover or selected:
@@ -3001,6 +3070,7 @@ def show_state(index, account):
 
 
 RECENT_DAYS = 14   # Library "Recently added": the show's first file arrived within this many days
+_HEART = {}   # the Library's heart glyph, drawn once
 LIB_FORMATS = {"TV": ("TV", "TV_SHORT", "ONA"), "MOVIE": ("MOVIE",), "OVA": ("OVA", "SPECIAL", "MUSIC")}
 LIB_FORMAT_TEXT = {"TV": "TV", "MOVIE": "Movies", "OVA": "OVAs and specials"}
 LIB_STATUS_TEXT = {"CURRENT": "Watching", "PLANNING": "Planning", "COMPLETED": "Completed", "PAUSED": "Paused",
@@ -3018,6 +3088,8 @@ def lib_view_match(view, it_data):
         return it_data(STATUS_ROLE) in (None, "PLANNING") and not it_data(NOTDL_ROLE) or bool(prog and not prog[0])
     if view == "FINISHED":
         return it_data(STATUS_ROLE) == "COMPLETED"
+    if view == "FAV":
+        return bool(it_data(FAV_ROLE))
     return True
 
 
@@ -3207,7 +3279,7 @@ class LibraryPage(Page):
     open_media = Signal(int, str, object)    # not downloaded: AniList id, title, cover
 
     VIEWS = [("ALL", "All"), ("NEW", "New episodes"), ("ADDED", "Recently added"), ("NOTSTARTED", "Not started"),
-             ("FINISHED", "Finished")]
+             ("FINISHED", "Finished"), ("FAV", "Favorites")]
     SORTS = [("title", "Title A–Z"), ("latest", "Newest episode first"), ("added", "Recently added")]
 
     def __init__(self, settings, account):
@@ -3593,21 +3665,35 @@ class LibraryPage(Page):
             times = self.file_times.get(path) if isinstance(path, str) else None
             it.setData(times[0] if times else None, ADDED_ROLE)
             it.setData(times[1] if times else None, LATEST_ROLE)
+        self.mark_favorites(refilter=False)
         if self.settings.get("library") and Path(self.settings["library"]).is_dir():
             sub = f"{len(self.items)} shows  ·  {getattr(self, 'episode_total', 0):,} episodes"
             if self.extra:
                 sub += f"  ·  {len(self.extra)} on your list not downloaded"
             self.subtitle.setText(sub)
             self.stack.setCurrentIndex(1 if (self.items or self.extra) else 2)
-        for key in ("NOTSTARTED", "FINISHED"):   # they read your AniList list
+        for key in ("NOTSTARTED", "FINISHED", "FAV"):   # they read your AniList list
             self.view_btns[key].setVisible(connected)
         if not connected:
             self.proxy.statuses.clear()
-            if self.proxy.view in ("NOTSTARTED", "FINISHED"):
+            if self.proxy.view in ("NOTSTARTED", "FINISHED", "FAV"):
                 self.set_view("ALL")
         self.update_counts()
         self.refilter()
         self.updated.emit()
+
+    def mark_favorites(self, refilter=True):
+        """FAV_ROLE on each show: a season (or the show) is one of your AniList favorites."""
+        favs = APP.get("favorites")
+        ids = favs.anime_ids() if favs and self.account and self.account.connected else set()
+        for it in list(self.items.values()) + list(self.extra.values()):
+            idx = it.data(INDEX_ROLE) or {}
+            mine = set(idx.get("chain") or []) | {x for x in idx.get("seasons") or [] if x} | {idx.get("mid"),
+                                                                                           it.data(MID_ROLE)}
+            it.setData(bool(ids & mine), FAV_ROLE)
+        if refilter:
+            self.update_counts()
+            self.refilter()
 
     def update_counts(self):
         """Each quick chip's count (All has none)."""
@@ -3880,7 +3966,7 @@ class OrganizePage(Page):
         tools = QGridLayout()
         tools.setSpacing(12)
         self.tools = []
-        for i, (glyph, title, desc, flag, confirm) in enumerate([
+        for i, (glyph, title, desc, flag, question) in enumerate([
             (G["photo"], "Add missing icons", "Give show and season folders without one an AniList cover.", "--icons", None),
             (G["sync"], "Redo all icons", "Re-download every folder icon in the library.", "--force-icons",
              "Re-download the icon for every show and season folder? This can take a while on a big library."),
@@ -3896,7 +3982,7 @@ class OrganizePage(Page):
              "(and season). You see every move first.", "--sort-extras", None),
         ]):
             tc = ToolCard(glyph, title, desc)
-            tc.clicked.connect(lambda f=flag, t=title, c=confirm: self.run_tool(f, t, c))
+            tc.clicked.connect(lambda f=flag, t=title, c=question: self.run_tool(f, t, c))
             tools.addWidget(tc, i // 2, i % 2)
             self.tools.append(tc)
         left.addLayout(tools)
@@ -4036,7 +4122,7 @@ class OrganizePage(Page):
         self.queue = [p for p in self.queue if Path(p).exists()]
         self.update_queue()
 
-    def run_tool(self, flag, title, confirm):
+    def run_tool(self, flag, title, question):
         if flag in ("--fix-seasons", "--rename-seasons", "--sort-extras"):
             lib = self.settings.get("library")
             if lib:
@@ -4051,12 +4137,9 @@ class OrganizePage(Page):
                         argv += ["--only", show]
                     self.run_requested.emit(argv, title, False)
             return
-        if confirm:
+        if question:
             lang = "English" if self.settings["language"] == "english" else "romaji"
-            box = QMessageBox(QMessageBox.Question, title, confirm.format(lang=lang),
-                              QMessageBox.Yes | QMessageBox.Cancel, self)
-            box.setDefaultButton(QMessageBox.Cancel)
-            if box.exec() != QMessageBox.Yes:
+            if not confirm(self, title, question.format(lang=lang), ok="Run", default_ok=False):
                 return
         self.run_requested.emit([flag], title, False)
 
@@ -4105,8 +4188,372 @@ class OrganizePage(Page):
         sb.setValue(sb.maximum())
 
 
+# ---------------------------------------------------------------- pop-ups inside Kura's window (Nov 2026)
+# User's pick (canvas WTHf4eQk5zHpuzqB51zZjY): dialogs and one-question boxes = a card in the middle of the dimmed
+# window; a yes / no (confirm / tell) right after a button click = a small bar by that button, nothing dimmed.
+# Kura hidden in the tray or minimized: their own windows, as before.
+INAPP = {"win": None, "stack": [], "click": (None, 0.0)}   # MainWindow sets win; stack: open layers, top last
 
-class SeasonFixDialog(QDialog):
+
+def inapp_host(parent):
+    """Kura's window when a pop-up from `parent` can show inside it: the window is on screen and `parent` is in it,
+    or in nothing on screen (Settings' pages moved out of their hidden dialogs)."""
+    win = INAPP["win"]
+    if win is None or not win.isVisible() or win.isMinimized():
+        return None
+    try:
+        top = parent.window() if isinstance(parent, QWidget) else None
+    except RuntimeError:
+        top = None
+    return win if top is None or top is win or not top.isVisible() else None
+
+
+def modal_widget():
+    """The pop-up that has the keyboard and the controller: a modal window of its own, else the top one inside
+    Kura's window."""
+    return QApplication.activeModalWidget() or (INAPP["stack"][-1].body if INAPP["stack"] else None)
+
+
+def inapp_event(obj, t):
+    """From the app-wide filter (WheelDebounce): remembers the button you just clicked (a confirm opens by it) and,
+    while a pop-up is open inside the window, stops the window's own shortcuts (Ctrl+K...). True = swallow."""
+    if t == QEvent.MouseButtonRelease:
+        if isinstance(obj, QAbstractButton):
+            INAPP["click"] = (obj, time.monotonic())
+        return False
+    owner = obj if isinstance(obj, QWidget) else obj.parent()
+    return not (isinstance(owner, QWidget) and INAPP["stack"][-1].isAncestorOf(owner))
+
+
+def clicked_button(win):
+    """The button clicked in Kura's window a moment ago (a confirm right after it opens by it), once."""
+    b, at = INAPP["click"]
+    INAPP["click"] = (None, 0.0)
+    if b is None or time.monotonic() - at > 1.0 or not shiboken6.isValid(b):
+        return None
+    return b if b.isVisible() and b.window() is win else None
+
+
+class InAppHead(QWidget):
+    """A dialog card's top line: its title and a close button (= Cancel)."""
+
+    def __init__(self, dlg):
+        super().__init__()
+        self.setFixedHeight(46)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(22, 0, 8, 0)
+        t = QLabel(dlg.windowTitle())
+        t.setStyleSheet("font-size: 11pt; font-weight: 600; background: transparent;")
+        dlg.windowTitleChanged.connect(t.setText)
+        h.addWidget(t, 1)
+        close = QPushButton()
+        close.setObjectName("dlgclose")
+        close.setFixedSize(38, 30)
+        close.setIcon(glyph_icon("close", C["text"], "#ffffff", px=16))
+        close.setFocusPolicy(Qt.NoFocus)
+        close.setToolTip("Close")
+        close.clicked.connect(dlg.reject)
+        h.addWidget(close)
+
+
+class InAppLayer(QWidget):
+    """One pop-up inside Kura's window, over everything in it (TV mode and the lock screen too). A card: the window
+    dimmed, the pop-up in the middle, as big as it asked for (never past the window). A bar (`anchor` = the button
+    it answers): by that button, below it or above when there's no room, the window not dimmed; a click beside it =
+    Cancel. Beside a card a click does nothing (an editor's changes aren't lost to a stray click). Clicks, the
+    wheel and keys stop here, so the window behind can't be used meanwhile."""
+    MARGIN, GAP = 24, 10
+
+    def __init__(self, win, body, title, anchor=None):
+        super().__init__(win)
+        self.win, self.body, self.anchor = win, body, anchor
+        self.want = body.size() if body.testAttribute(Qt.WA_Resized) else body.sizeHint()
+        self.panel = QWidget(self)
+        v = QVBoxLayout(self.panel)
+        v.setContentsMargins(1, 1, 1, 1)
+        v.setSpacing(0)
+        self.head = InAppHead(body) if title else None
+        if self.head is not None:
+            v.addWidget(self.head)
+        body.setParent(self.panel, Qt.Widget)
+        v.addWidget(body, 1)
+        self.up, self.arrow_x, self.fade = True, 0, None
+        self.panel.installEventFilter(self)
+        win.installEventFilter(self)
+        self.setGeometry(win.rect())
+
+    def eventFilter(self, obj, e):
+        if obj is self.win and e.type() == QEvent.Resize:
+            self.setGeometry(self.win.rect())
+            self.place()
+        elif obj is self.panel and e.type() == QEvent.LayoutRequest:
+            QTimer.singleShot(0, self.place)   # the pop-up grew (a section opened): room for it
+        return False
+
+    def place(self):
+        if not shiboken6.isValid(self.body):
+            return
+        r, m = self.rect(), self.MARGIN
+        head = self.head.height() if self.head is not None else 0
+        b = self.body
+        w = min(max(self.want.width(), b.minimumSizeHint().width(), b.minimumWidth()) + 2, r.width() - 2 * m)
+        hfw = b.heightForWidth(w - 2) if b.hasHeightForWidth() else -1
+        h = max(self.want.height(), b.minimumSizeHint().height(), b.minimumHeight(), hfw) + head + 2
+        if self.anchor is not None and shiboken6.isValid(self.anchor) and self.anchor.isVisible():
+            a = QRect(self.anchor.mapTo(self.win, QPoint(0, 0)), self.anchor.size())
+            x = a.right() + 1 - w if a.center().x() > r.width() / 2 else a.left()
+            x = max(12, min(x, r.width() - w - 12))
+            if a.bottom() + self.GAP + h <= r.height() - 12:
+                self.up, y = True, a.bottom() + self.GAP
+            elif a.top() - self.GAP - h >= 12:
+                self.up, y = False, a.top() - self.GAP - h
+            else:
+                self.anchor = None   # no room by the button: a card in the middle
+                return self.place()
+            self.arrow_x = max(x + 20, min(a.center().x(), x + w - 20))
+            self.panel.setGeometry(x, y, w, h)
+        else:
+            h = min(h, r.height() - 2 * m)
+            self.panel.setGeometry((r.width() - w) // 2, (r.height() - h) // 2, w, h)
+        self.update()
+
+    def open(self):
+        self.place()
+        self.show()
+        self.raise_()
+        self.body.show()
+        eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(eff)
+        self.fade = QPropertyAnimation(eff, b"opacity", self)
+        self.fade.setDuration(120 if self.anchor is not None else 150)
+        self.fade.setStartValue(0.0)
+        self.fade.setEndValue(1.0)
+        self.fade.finished.connect(lambda: self.setGraphicsEffect(None))
+        self.fade.start()
+
+    def finish(self):
+        self.win.removeEventFilter(self)
+        self.panel.removeEventFilter(self)
+        if self.fade is not None:
+            self.fade.stop()
+        self.hide()
+        self.deleteLater()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        bar = self.anchor is not None
+        if not bar:
+            p.fillRect(self.rect(), QColor(5, 6, 10, 150))
+        g = QRectF(self.panel.geometry())
+        rad = 12 if bar else 16
+        p.setPen(Qt.NoPen)
+        for i in range(14, 0, -1):   # a soft shadow, a little lower than the panel
+            p.setBrush(QColor(0, 0, 0, 9))
+            p.drawRoundedRect(g.adjusted(-i, -i + 4, i, i + 4), rad + i, rad + i)
+        shape = QPainterPath()
+        shape.addRoundedRect(g.adjusted(0.5, 0.5, -0.5, -0.5), rad, rad)
+        if bar:   # the point toward the button
+            y = g.top() + 0.5 if self.up else g.bottom() - 0.5
+            tip = QPainterPath()
+            tip.addPolygon(QPolygonF([QPointF(self.arrow_x - 8, y), QPointF(self.arrow_x, y + (-8 if self.up else 8)),
+                                      QPointF(self.arrow_x + 8, y)]))
+            shape = shape.united(tip)
+        p.setBrush(QColor(C["surface2"] if bar else C["surface"]))
+        p.setPen(QPen(QColor(C["border_hi"]), 1))
+        p.drawPath(shape)
+        if self.head is not None:
+            p.setPen(QPen(QColor(C["border"]), 1))
+            y = g.top() + 1 + self.head.height() + 0.5
+            p.drawLine(QPointF(g.left() + 1, y), QPointF(g.right() - 1, y))
+
+    def mousePressEvent(self, e):
+        if self.anchor is not None and not self.panel.geometry().contains(e.position().toPoint()):
+            self.body.reject()
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        e.accept()
+
+    def mouseDoubleClickEvent(self, e):
+        e.accept()
+
+    def wheelEvent(self, e):
+        e.accept()
+
+    def keyPressEvent(self, e):
+        e.accept()   # keys the pop-up didn't use don't reach the window behind
+
+
+def run_inapp(dlg, win, title=True, anchor=None):
+    """exec() inside Kura's window: the pop-up moves into an InAppLayer, a local event loop waits for its answer,
+    then it goes back to its parent (hidden), so callers keep using it (its values, deleteLater) as before."""
+    parent, flags = dlg.parentWidget(), dlg.windowFlags()
+    before, focus = QApplication.focusWidget(), dlg.focusWidget()
+    dlg.setProperty("kura_inapp", True)
+    dlg.style().unpolish(dlg)
+    dlg.style().polish(dlg)   # see-through: the layer paints the card
+    layer = InAppLayer(win, dlg, title, anchor)
+    INAPP["stack"].append(layer)
+    loop = QEventLoop()
+    dlg.finished.connect(loop.quit)
+    dlg.setResult(0)
+    layer.open()
+    if focus is None or not dlg.isAncestorOf(focus):
+        dlg.focusNextPrevChild(True)
+    else:
+        focus.setFocus(Qt.OtherFocusReason)
+    if not win.isActiveWindow():
+        QApplication.alert(win)   # (an automatic one while you're elsewhere: the taskbar button flashes)
+    loop.exec()
+    dlg.finished.disconnect(loop.quit)
+    INAPP["stack"].remove(layer)
+    layer.finish()
+    if shiboken6.isValid(dlg):
+        dlg.setProperty("kura_inapp", False)
+        dlg.setParent(parent, flags)
+    if before is not None and shiboken6.isValid(before) and before.isVisible():
+        before.setFocus(Qt.OtherFocusReason)
+    return dlg.result() if shiboken6.isValid(dlg) else 0
+
+
+class InAppDialog(QDialog):
+    """A pop-up that opens inside Kura's window (run_inapp) when it can; exec() still waits and returns the result,
+    so callers don't change. Otherwise its own window with Kura's frame."""
+
+    def exec(self):
+        win = inapp_host(self.parentWidget())
+        if win is not None and not self.property("kuraframe"):
+            return run_inapp(self, win)
+        if DIALOG_FRAME["on"] and not self.property("kuraframe") and not self.property("kura_native"):
+            frame_dialog(self)
+        return super().exec()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self.isWindow():
+            dark_title_bar(self)
+
+    def focusNextPrevChild(self, nxt):
+        """Inside the window, Tab goes round this pop-up's own fields, never to the page behind it."""
+        if self.isWindow():
+            return super().focusNextPrevChild(nxt)
+        w = QApplication.focusWidget()
+        w = w if w is not None and self.isAncestorOf(w) else self
+        for _ in range(2000):
+            w = w.nextInFocusChain() if nxt else w.previousInFocusChain()
+            if w is self or not self.isAncestorOf(w):
+                continue
+            if w.isVisible() and w.isEnabled() and w.focusPolicy() & Qt.TabFocus == Qt.TabFocus:
+                w.setFocus(Qt.TabFocusReason if nxt else Qt.BacktabFocusReason)
+                return True
+        return False
+
+
+class AskBox(InAppDialog):
+    """confirm() / tell() inside the window: the question in bold, the rest muted under it, then the buttons. As a
+    bar (by the button you clicked) it's narrow and plain; as a card it has a small icon."""
+    ICONS = {"ask": ("help", "accent"), "danger": ("warning", "bad"), "warn": ("error", "warn"), "info": ("info", "accent")}
+
+    def __init__(self, parent, text, ok, cancel, kind, default_ok, bar):
+        super().__init__(parent)
+        self.setFixedWidth(380 if bar else 440)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(*((16, 14, 16, 12) if bar else (22, 20, 22, 18)))
+        v.setSpacing(12 if bar else 16)
+        head, rest = split_question(text)
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        if not bar:
+            glyph, tone = self.ICONS[kind]
+            chip = QLabel()
+            chip.setFixedSize(36, 36)
+            chip.setAlignment(Qt.AlignCenter)
+            col = QColor(C[tone])
+            chip.setPixmap(glyph_pixmap(glyph, mix_color(C[tone], "#ffffff", 0.55).name(), 18))
+            chip.setStyleSheet(f"background: rgba({col.red()},{col.green()},{col.blue()},0.18); border-radius: 10px;")
+            top.addWidget(chip, 0, Qt.AlignTop)
+        words = QVBoxLayout()
+        words.setSpacing(4)
+        for text_, style in ((head, f"font-size: {'10.5' if bar else '12'}pt; font-weight: 600;"),
+                             (rest, f"color: {C['muted']};")):
+            if text_:
+                t = QLabel(text_)
+                t.setTextFormat(Qt.PlainText)
+                t.setWordWrap(True)
+                t.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                t.setStyleSheet(style + " background: transparent;")
+                words.addWidget(t)
+        top.addLayout(words, 1)
+        v.addLayout(top)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch(1)
+        buttons = []
+        if cancel:
+            no = QPushButton(cancel)
+            no.setObjectName("ghost")
+            no.clicked.connect(self.reject)
+            buttons.append(no)
+        yes = QPushButton(ok)
+        yes.setObjectName("danger" if kind == "danger" else "primary")
+        yes.clicked.connect(self.accept)
+        buttons.append(yes)
+        for b in buttons:
+            b.setCursor(Qt.PointingHandCursor)
+            if bar:
+                b.setStyleSheet("padding: 6px 14px;")
+            row.addWidget(b)
+        v.addLayout(row)
+        pick = yes if default_ok or not cancel else buttons[0]
+        pick.setDefault(True)
+        pick.setFocus()
+
+
+def split_question(text):
+    """("Send 3 shows to the Recycle Bin?", the rest): the first paragraph, or the first question in it."""
+    text = (text or "").strip()
+    head, sep, rest = text.partition("\n\n")
+    if not sep:
+        q = head.find("? ")
+        if 0 < q < len(head) - 2:
+            head, rest = head[:q + 1], head[q + 2:]
+    return head.strip(), rest.strip()
+
+
+def ask_box(parent, title, text, ok, cancel, kind, default_ok=True):
+    win = inapp_host(parent)
+    if win is None:   # Kura is in the tray or minimized: a message box of its own
+        icon = {"warn": QMessageBox.Warning, "info": QMessageBox.Information}.get(kind, QMessageBox.Question)
+        box = QMessageBox(icon, title, text, QMessageBox.NoButton, parent if isinstance(parent, QWidget) else None)
+        yes = box.addButton(ok, QMessageBox.AcceptRole)
+        no = box.addButton(cancel, QMessageBox.RejectRole) if cancel else None
+        box.setDefaultButton(yes if default_ok or no is None else no)
+        if no is not None:
+            box.setEscapeButton(no)
+        box.exec()
+        return box.clickedButton() is yes
+    anchor = clicked_button(win)
+    box = AskBox(parent, text, ok, cancel, kind, default_ok, anchor is not None)
+    box.setWindowTitle(title)
+    answer = run_inapp(box, win, title=False, anchor=anchor) == QDialog.Accepted
+    box.deleteLater()
+    return answer
+
+
+def confirm(parent, title, text, ok="OK", cancel="Cancel", danger=False, default_ok=True):
+    """A yes / no question (instead of QMessageBox.question): True = `ok` was pressed. Right after a button click it
+    opens as a small bar by that button; else (a menu, the keyboard, the controller, an automatic check) as a small
+    card in the middle. `danger`: the answer button is red (deleting, signing out...)."""
+    return ask_box(parent, title, text, ok, cancel, "danger" if danger else "ask", default_ok)
+
+
+def tell(parent, title, text, warn=False):
+    """A message with OK (instead of QMessageBox.information / warning), shown the same way as confirm()."""
+    ask_box(parent, title, text, "OK", None, "warn" if warn else "info")
+
+
+class SeasonFixDialog(InAppDialog):
     """Preview of "Fix season folders": every planned move, grouped by show, each show tickable."""
     TITLE = "Fix season folders"
     COLUMNS = ["Show / episode", "From", "To", "Becomes"]
@@ -4539,7 +4986,7 @@ class SettingsPage(Page):
             try:
                 set_startup(on)
             except OSError as e:
-                QMessageBox.warning(self, APP_NAME, f"Couldn't change the startup setting ({e}).")
+                tell(self, APP_NAME, f"Couldn't change the startup setting ({e}).", warn=True)
         boot.toggled.connect(startup)
         self.row(al, "Open on startup", label("Start Kura when you sign in to Windows.", "faint", wrap=True), boot)
         self.divider(al)
@@ -4764,13 +5211,13 @@ class SettingsPage(Page):
                     res["ok"] = True
                     d.accept()
                 elif ok is None:
-                    QMessageBox.information(d, APP_NAME, "Windows Hello isn't set up on this PC. Use your PIN.")
+                    tell(d, APP_NAME, "Windows Hello isn't set up on this PC. Use your PIN.")
             d.hello.clicked.connect(hello)
             if d.exec() != QDialog.Accepted:
                 return False
             if res.get("ok") or pin_hash(d.pin.text(), pin.get("salt", "")) == pin.get("hash"):
                 return True
-            QMessageBox.warning(self, APP_NAME, "That PIN isn't right.")
+            tell(self, APP_NAME, "That PIN isn't right.", warn=True)
             return False
 
         def set_lock(v):
@@ -4795,18 +5242,18 @@ class SettingsPage(Page):
 
         def change_pin():
             if ask_current("Change your PIN") and choose_pin():
-                QMessageBox.information(self, APP_NAME, "Your PIN is changed.")
+                tell(self, APP_NAME, "Your PIN is changed.")
         change.clicked.connect(change_pin)
         forgot = QPushButton("Forgot PIN")
 
         def forgot_pin():
             ok = windows_hello("Reset your Kura PIN")
             if ok is None:
-                QMessageBox.information(self, APP_NAME, "Windows Hello isn't set up on this PC, so Kura can't check it's "
+                tell(self, APP_NAME, "Windows Hello isn't set up on this PC, so Kura can't check it's "
                                         "you. Set up Windows Hello (Settings → Accounts → Sign-in options), then try "
                                         "again.")
             elif ok and choose_pin():
-                QMessageBox.information(self, APP_NAME, "Your PIN is reset.")
+                tell(self, APP_NAME, "Your PIN is reset.")
         forgot.clicked.connect(forgot_pin)
         ph.addWidget(change)
         ph.addWidget(forgot)
@@ -5128,7 +5575,7 @@ class SettingsPage(Page):
         self.save_timer.start()
 
     def save_dirty(self, from_timer=False):
-        if from_timer and QApplication.activeModalWidget() is not None:
+        if from_timer and modal_widget() is not None:
             self.save_timer.start()   # a filter editor is open: save once it's closed
             return
         self.save_timer.stop()
@@ -5289,15 +5736,13 @@ class SettingsPage(Page):
         def finished(err):
             waiting(False)
             if err:
-                QMessageBox.warning(self, "AniList", err)
+                tell(self, "AniList", err, warn=True)
         if anilist_connect(self, finished):
             waiting(True)
 
     def disconnect_account(self):
-        box = QMessageBox(QMessageBox.Question, "Disconnect AniList",
-                          "Disconnect your AniList account from this app? Your list on AniList isn't affected.",
-                          QMessageBox.Yes | QMessageBox.Cancel, self)
-        if box.exec() == QMessageBox.Yes:
+        if confirm(self, "Disconnect AniList", "Disconnect your AniList account from this app? Your list on AniList "
+                   "isn't affected.", ok="Disconnect", danger=True):
             self.account.sign_out()
 
     @staticmethod
@@ -5454,10 +5899,8 @@ class SettingsPage(Page):
         self.crunchy_changed.emit()
 
     def crunchy_sign_out(self):
-        box = QMessageBox(QMessageBox.Question, "Sign out of Crunchyroll",
-                          "Sign Kura out of Crunchyroll? Kura's copy of your history and your matching choices are "
-                          "kept.", QMessageBox.Yes | QMessageBox.Cancel, self)
-        if box.exec() == QMessageBox.Yes:
+        if confirm(self, "Sign out of Crunchyroll", "Sign Kura out of Crunchyroll? Kura's copy of your history and "
+                   "your matching choices are kept.", ok="Sign out", danger=True):
             crunchy.forget()
             self.build_crunchy_card(note="")
             self.crunchy_changed.emit()
@@ -5763,6 +6206,22 @@ class EpisodeGrid(QWidget):
         return super().event(e)
 
 
+def file_durations():
+    """The one cache of real episode lengths (ffprobe, livetv_durations.json): Live TV and the episode cards."""
+    if "durations" not in APP:
+        APP["durations"] = livetv_mod.Durations(SCRIPT_DIR / "livetv_durations.json", lambda: subs_mod.FFPROBE)
+    return APP["durations"]
+
+
+def read_lengths(paths):
+    """{path: seconds} for these files, probing the ones not known yet (on a worker thread)."""
+    d = file_durations()
+    todo = [p for p in paths if p and d.get(p) is None and Path(p).exists()]
+    if todo and subs_mod.FFPROBE.exists():
+        d.fill(todo, workers=2)
+    return {p: d.get(p) for p in paths if p}
+
+
 class EpisodeCards(QWidget):
     """A season's episodes as cards: AniList's still (or a frame from your file) with the episode's title.
     Watched ones are dimmed with a check, the next one glows, a half-watched one shows its resume bar,
@@ -5782,6 +6241,7 @@ class EpisodeCards(QWidget):
         self.trackable, self.mid = False, None
         self.downloading = {}
         self.images, self.scaled = {}, {}
+        self.lengths = {}   # {path: seconds}: the file's real length, read in the background
         self.titles = {}
         self.kinds = {}
         mid = self.media.get("id")
@@ -5818,6 +6278,20 @@ class EpisodeCards(QWidget):
     def set_image(self, text, img):
         self.images[text] = img
         self.scaled = {k: v for k, v in self.scaled.items() if k[0] != text}
+        self.update()
+
+    def read_lengths(self):
+        paths = [path for _, state, _, path in self.chips if path and state == HAVE]
+        if not paths:
+            return
+        call = BgCall(lambda: read_lengths(paths))
+        call.done.connect(lambda res, _err, c=call: (c.wait(), shiboken6.isValid(self) and res
+                                                      and self.set_lengths(res)))
+        self._len_call = call
+        call.start()
+
+    def set_lengths(self, lengths):
+        self.lengths.update({k: v for k, v in lengths.items() if v})
         self.update()
 
     # ---- layout
@@ -5888,6 +6362,9 @@ class EpisodeCards(QWidget):
         r = self.resume.get(path) if path else None
         if r and r.get("pos", 0) > 30 and r.get("dur") and r["pos"] < r["dur"] * 0.92 and not self.watched(text):
             return f"Resume · {int((r['dur'] - r['pos']) // 60) or 1} min left"
+        secs = self.lengths.get(path) or (r or {}).get("dur")
+        if secs:   # the file's own length (a double-length premiere is 48 min, not AniList's 24)
+            dur = max(1, round(secs / 60))
         bits = [f"{dur} min" if dur else ""]
         if self.watched(text):
             bits.append("watched")
@@ -6358,7 +6835,7 @@ class ListBar(QFrame):
     def set_count(self):
         """AniList's episode count is wrong for this season (recaps counted, a split...): use yours."""
         orig = self.media.get("episodes_anilist", self.media.get("episodes")) or 0
-        n, ok = QInputDialog.getInt(self, "Episode count", f"How many episodes does this season really have?\n"
+        n, ok = ask_int(self, "Episode count", f"How many episodes does this season really have?\n"
                                     f"AniList says {orig or 'nothing'}. 0 = use AniList's again.",
                                     self.media.get("episodes") or orig, 0, 5000)
         if not ok:
@@ -6378,10 +6855,8 @@ class ListBar(QFrame):
 
     def remove(self):
         title = (self.media.get("title") or {}).get("romaji") or "this entry"
-        box = QMessageBox(QMessageBox.Question, "Remove from list",
-                          f"Remove {title} from your AniList list? Your progress and score for it are deleted.",
-                          QMessageBox.Yes | QMessageBox.Cancel, self)
-        if box.exec() == QMessageBox.Yes:
+        if confirm(self, "Remove from list", f"Remove {title} from your AniList list? Your progress and score for "
+                   "it are deleted.", ok="Remove", danger=True):
             self.account.remove(self.mid)
 
 
@@ -7411,7 +7886,7 @@ class CharCard(QFrame):
     """Option A: a portrait (role tag on it), the name, the voice actor's small photo and name. Click: details."""
     clicked = Signal(object)
 
-    def __init__(self, c):
+    def __init__(self, c, sub=None):
         super().__init__()
         self.c = c
         self.setCursor(Qt.PointingHandCursor)
@@ -7422,6 +7897,7 @@ class CharCard(QFrame):
         self.img = RoundedImage(150, 200, 12, c["name"])
         v.addWidget(self.img)
         tag = QLabel("MAIN" if c["main"] else "SUPPORTING", self.img)
+        tag.setVisible(c["main"] is not None)
         tag.setStyleSheet(f"background: {C['accent'] if c['main'] else 'rgba(20,22,30,0.85)'}; color: white;"
                           " border-radius: 8px; padding: 1px 8px; font-size: 7.5pt; font-weight: 700;")
         tag.adjustSize()
@@ -7431,7 +7907,11 @@ class CharCard(QFrame):
         name.setToolTip(c["name"] + (f"\n{c['native']}" if c["native"] else ""))
         v.addWidget(name)
         self.va_img = None
-        if c.get("va"):
+        if sub is not None:   # the show they're from, in place of the voice actor
+            line = label(QFontMetrics(self.font()).elidedText(sub, Qt.ElideRight, 148), "faint")
+            line.setToolTip(sub)
+            v.addWidget(line)
+        elif c.get("va"):
             row = QHBoxLayout()
             row.setSpacing(6)
             self.va_img = RoundedImage(22, 22, 11, c["va"]["name"])
@@ -7588,7 +8068,7 @@ class ExtrasPanel(QWidget):
             dest_dir = dest_dir.joinpath(*season.split(" / "))
         dest = dest_dir / Path(path).name
         if dest.exists():
-            QMessageBox.information(self, APP_NAME, f"{dest_dir.name} already has a file called {dest.name}.")
+            tell(self, APP_NAME, f"{dest_dir.name} already has a file called {dest.name}.")
             return
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
@@ -7598,7 +8078,7 @@ class ExtrasPanel(QWidget):
                 src_dir.rmdir()
                 src_dir = src_dir.parent
         except OSError as e:
-            QMessageBox.warning(self, APP_NAME, f"Couldn't move it: {e}")
+            tell(self, APP_NAME, f"Couldn't move it: {e}", warn=True)
             return
         s = APP["settings"]   # a "not this one" follows the file
         key, new = os.path.normcase(str(path)), os.path.normcase(str(dest))
@@ -7737,9 +8217,23 @@ class DetailPage(QWidget):
         if self.trailer is not None and not self.isVisibleTo(self.window()):
             self.trailer.stop()
 
+    def set_content(self, content):
+        """The page's new contents. The old ones are deleted later, not at once (setWidget would): a rebuild while
+        one of its buttons is still handling a click (Edit info → the title's text box open, then the download
+        arrived and the page re-read itself) crashed Kura in Qt6Widgets."""
+        old = self.scroll.takeWidget()
+        self.scroll.setWidget(content)
+        if old is not None:
+            old.hide()
+            old.deleteLater()
+
     def on_arrived(self, mids, path_for_media):
         """Downloads of this show were organized into the library: read its episodes again (the page said
-        "Moving…" and then "Not downloaded" until you reopened it)."""
+        "Moving…" and then "Not downloaded" until you reopened it). Not while a dialog or menu is open (yours,
+        from this page): it waits for it to close."""
+        if modal_widget() is not None or QApplication.activePopupWidget() is not None:
+            QTimer.singleShot(1000, lambda: self.on_arrived(mids, path_for_media))
+            return
         r = self.result
         if r is None:
             return
@@ -7958,6 +8452,8 @@ class DetailPage(QWidget):
             al.setIcon(glyph_icon(G["globe"], C["text"]))
             al.clicked.connect(lambda: webbrowser.open(hero_d["siteUrl"]))
             buttons.addWidget(al)
+        if self.tracking() and hero_d.get("id") and APP.get("favorites"):   # the season you're looking at
+            buttons.addWidget(FavButton("anime", hero_d["id"]))
         if not r.get("loading"):
             find = QPushButton(" Find torrents")
             find.setIcon(glyph_icon(G["download"], C["text"]))
@@ -7992,7 +8488,7 @@ class DetailPage(QWidget):
             bv.addWidget(bar)
             bv.addWidget(label("Loading from AniList…", "muted"))
             bv.addStretch(1)
-            self.scroll.setWidget(content)
+            self.set_content(content)
             self.restore_images()
             return
 
@@ -8107,7 +8603,7 @@ class DetailPage(QWidget):
             bv.addLayout(self.recs_header(r["recs"]))
             bv.addWidget(self.recs_grid(r["recs"]))
         bv.addStretch(1)
-        self.scroll.setWidget(content)
+        self.set_content(content)
         self.update_progress()
         self.on_downloads_changed()
         self.restore_images()
@@ -8206,8 +8702,7 @@ class DetailPage(QWidget):
             return
         t = hero.get("title") or {}
         anilist = (t.get("english") if org.TITLE_LANGUAGE == "english" else t.get("romaji")) or t.get("romaji") or ""
-        text, ok = QInputDialog.getText(self, "Title", f"The title Kura shows (empty = AniList's: {anilist}):",
-                                        text=shown)
+        text, ok = ask_text(self, "Title", f"The title Kura shows (empty = AniList's: {anilist}):", shown)
         if not ok:
             return
         text, hid = text.strip(), str(hero["id"])
@@ -8251,7 +8746,7 @@ class DetailPage(QWidget):
     def edit_count(self, s):
         m = s.get("media") or {}
         orig = m.get("episodes_anilist", m.get("episodes")) or 0
-        n, ok = QInputDialog.getInt(self, "Episodes", f"How many episodes does {s['title']} have?\nAniList says "
+        n, ok = ask_int(self, "Episodes", f"How many episodes does {s['title']} have?\nAniList says "
                                     f"{orig or 'nothing'}. 0 = use AniList's again.", m.get("episodes") or orig, 0, 5000)
         if not ok:
             return
@@ -8317,10 +8812,8 @@ class DetailPage(QWidget):
         self.saved(change)
 
     def reset_edits(self, r):
-        box = QMessageBox(QMessageBox.Question, APP_NAME, "Forget every change you made to this show and use "
-                          "AniList's info again?", QMessageBox.Yes | QMessageBox.Cancel, self)
-        box.button(QMessageBox.Yes).setText("Use AniList's")
-        if box.exec() != QMessageBox.Yes:
+        if not confirm(self, APP_NAME, "Forget every change you made to this show and use AniList's info again?",
+                       ok="Use AniList's", danger=True):
             return
         key = self.folder_key()
         ids = {str(x["id"]) for x in r.get("sections") or [] if x.get("id")} | {str((r.get("hero") or {}).get("id"))}
@@ -8664,6 +9157,7 @@ class DetailPage(QWidget):
                 grid = EpisodeGrid(s["chips"])
             else:
                 grid = EpisodeCards(s["chips"], s["media"], _read_json(PLAYBACK_STATE_FILE))
+                grid.read_lengths()
                 t = (s["media"] or {}).get("title") or {}
                 base = t.get("romaji") or t.get("english") or seed
                 grid.find.connect(lambda n, b=base: self.find_torrents.emit(f"{b} {n:02d}"))
@@ -10991,7 +11485,8 @@ def place_frame(dlg):
 def frame_event(obj, t):
     """From the app-wide filter (WheelDebounce): pop-ups get the frame as they're polished, then keep it in place."""
     if t == QEvent.Polish:
-        if (DIALOG_FRAME["on"] and isinstance(obj, QDialog) and obj.isWindow() and not isinstance(obj, QFileDialog)
+        if (DIALOG_FRAME["on"] and isinstance(obj, QDialog) and obj.isWindow()
+                and not isinstance(obj, (QFileDialog, QInputDialog, InAppDialog))   # InAppDialog: framed in exec()
                 and not obj.property("kuraframe") and not obj.property("kura_native")):
             frame_dialog(obj)
     elif obj.property("kuraframe"):
@@ -11003,8 +11498,8 @@ def frame_event(obj, t):
                 title.setText(obj.windowTitle())
 
 
-class KuraDialog(QDialog):
-    """Dialog with Kura's look (dark title bar, padding)."""
+class KuraDialog(InAppDialog):
+    """Dialog with Kura's look (padding); opens inside Kura's window (InAppDialog)."""
 
     def __init__(self, parent, title, width=720, height=560):
         super().__init__(parent)
@@ -11013,10 +11508,6 @@ class KuraDialog(QDialog):
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(24, 20, 24, 18)
         self.body.setSpacing(12)
-
-    def showEvent(self, e):
-        super().showEvent(e)
-        dark_title_bar(self)
 
     def add_buttons(self, ok_text="OK"):
         row = QHBoxLayout()
@@ -11031,6 +11522,40 @@ class KuraDialog(QDialog):
         row.addWidget(ok)
         self.body.addLayout(row)
         return ok
+
+
+def ask_value(parent, title, text, field):
+    """A one-question pop-up (Kura's frame) instead of QInputDialog: Qt's polishes itself while it builds its own
+    layout, and Kura's frame (rebuilding its native window right then) crashed Kura in Qt6Widgets (Edit info →
+    title, Torrents → + Another name). Returns True when OK was pressed."""
+    dlg = KuraDialog(parent, title, 480, 0)
+    dlg.body.addWidget(label(text, None, wrap=True))
+    field.setMinimumWidth(420)   # adjustSize below would shrink the pop-up to its widest label
+    dlg.body.addWidget(field)
+    dlg.add_buttons()
+    field.setFocus()
+    dlg.adjustSize()
+    ok = dlg.exec() == QDialog.Accepted
+    dlg.deleteLater()
+    return ok
+
+
+def ask_text(parent, title, text, value=""):
+    """(text, ok), like QInputDialog.getText."""
+    field = QLineEdit(value)
+    field.selectAll()
+    ok = ask_value(parent, title, text, field)
+    return field.text(), ok
+
+
+def ask_int(parent, title, text, value, low, high):
+    """(number, ok), like QInputDialog.getInt."""
+    field = QSpinBox()
+    field.setRange(low, high)
+    field.setValue(value)
+    field.selectAll()
+    ok = ask_value(parent, title, text, field)
+    return field.value(), ok
 
 
 PICK_FIELDS = "id format episodes seasonYear isAdult title { romaji english }"
@@ -11344,6 +11869,98 @@ class FixAllDialog(KuraDialog):
         return [e for cb, e in self.rows if cb.isChecked()]
 
 
+_FACT_LINE = re.compile(r"^__\s*([^_]+?)\s*:?\s*__\s*:?\s*(.*)$")   # "__Height:__ 153 cm" / "__Height__: 153 cm"
+_WHOLE_SPOILER = re.compile(r"^~!(.*)!~$", re.S)
+
+
+def char_desc_facts(text):
+    """The "__Height:__ 153 cm" lines AniList puts at the top of a character's description →
+    ([(key, value, spoiler)], the rest of the description). A value in ~!...!~ (or lines inside a ~!...!~ block)
+    is a spoiler; "> item" / "- item" lines under an empty key are its value."""
+    lines = (text or "").replace("\r", "").replace("<br>", "\n").split("\n")
+    facts, block, i = [], False, 0
+    while i < len(lines):
+        t = lines[i].strip()
+        if not t:
+            if not facts:
+                i += 1
+                continue
+            j = i
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and _FACT_LINE.match(lines[j].strip().removeprefix("~!").strip()):
+                i = j   # a gap between facts
+                continue
+            break
+        spoiler = block
+        whole = _WHOLE_SPOILER.match(t)
+        if whole and _FACT_LINE.match(whole.group(1).strip()):
+            t, spoiler = whole.group(1).strip(), True
+        elif t.startswith("~!"):
+            t, block, spoiler = t[2:].strip(), True, True
+        ends = block and t.endswith("!~") and t.count("!~") > t.count("~!")
+        if ends:
+            t = t[:-2].strip()
+        m = _FACT_LINE.match(t)
+        if m:
+            key, value = m.group(1).strip(), m.group(2).strip()
+            v = _WHOLE_SPOILER.match(value)
+            if v:
+                value, spoiler = v.group(1).strip(), True
+            elif value.startswith("~!") and "!~" not in value:   # a spoiler going on over the next lines
+                parts, spoiler = [value[2:].strip()], True
+                while i + 1 < len(lines):
+                    i += 1
+                    nxt = lines[i].strip()
+                    done = "!~" in nxt
+                    parts.append(nxt.split("!~")[0].strip())
+                    if done:
+                        break
+                value = ", ".join(x for x in parts if x)
+            facts.append([key, clean_char_desc(value, True), spoiler])
+        elif facts and t[:1] in (">", "-", "*", "•"):   # a list under the last key
+            item = clean_char_desc(t.lstrip(">-*• ").strip(), True)
+            if item:
+                facts[-1][1] = f"{facts[-1][1]}, {item}" if facts[-1][1] else item
+                facts[-1][2] = facts[-1][2] or spoiler
+        else:
+            if block and not lines[i].strip().startswith("~!"):
+                lines[i] = "~!" + lines[i]   # the rest starts inside a spoiler block
+            break
+        if ends:
+            block = False
+        i += 1
+    rest = "\n".join(lines[i:]).strip()
+    return [tuple(f) for f in facts if f[0] and f[1]], rest
+
+
+class FactChip(QLabel):
+    """One fact on a character's card ("Height  153 cm"); a spoiler says so until clicked (or Show spoilers)."""
+
+    def __init__(self, key, value, spoiler=False):
+        super().__init__()
+        self.key, self.value, self.spoiler = key, value, spoiler
+        self.setStyleSheet(f"background: {C['surface2']}; border-radius: 10px; padding: 4px 10px; color: {C['text']};")
+        self.setTextFormat(Qt.RichText)
+        self.show_value(not spoiler)
+
+    def show_value(self, on):
+        self.shown = on
+        long = on and len(self.value) > 60   # a long value wraps (never cut off); "Spoiler · click to view" doesn't
+        self.setWordWrap(long)
+        self.setMaximumWidth(520 if long else 16777215)
+        shown = html.escape(self.value) if on else f"<span style='color:{C['accent_hi']}'>Spoiler · click to view</span>"
+        self.setText(f"<span style='color:{C['muted']}'>{html.escape(self.key)}</span>&nbsp; {shown}")
+        self.setCursor(Qt.PointingHandCursor if self.spoiler else Qt.ArrowCursor)
+        self.setToolTip("Click to hide" if self.spoiler and on else "")
+        self.updateGeometry()   # its row is laid out again for the new width
+
+    def mouseReleaseEvent(self, e):
+        if self.spoiler and e.button() == Qt.LeftButton:
+            self.show_value(not self.shown)
+        super().mouseReleaseEvent(e)
+
+
 class CharacterDialog(KuraDialog):
     """A character: art, names, role, description (spoilers hidden until asked), the seasons they're in, the voice
     actor and their other roles in your library (click one: that show)."""
@@ -11361,32 +11978,75 @@ class CharacterDialog(KuraDialog):
         col.setSpacing(10)
         row.addLayout(col, 1)
         col.addWidget(label(c["name"], "h1"))
-        col.addWidget(label("  ·  ".join(x for x in (c["native"], "Main character" if c["main"] else "Supporting") if x),
-                            "muted"))
-        desc = clean_char_desc(c["desc"])
-        self.desc = QLabel(desc or "AniList has no description for this character.")
+        role = None if c.get("main") is None else "Main character" if c["main"] else "Supporting"
+        col.addWidget(label("  ·  ".join(x for x in (c["native"], role) if x), "muted"))
+        # facts as badges: AniList's fields, then the "__Height:__ 153 cm" lines from the top of the description
+        # (user's examples: Clara Valac, Yamato, Alice Zuberg, Fran on AniList), then the seasons and favorites
+        listed, rest = char_desc_facts(c["desc"])
+        facts = [(k, str(v), False) for k, v in (("Gender", c.get("gender")), ("Age", c.get("age")),
+                                                  ("Birthday", c.get("birthday")), ("Blood type", c.get("blood"))) if v]
+        known = {k.lower() for k, _, _ in facts} | {"blood", "birth date", "date of birth"}
+        facts += [f for f in listed if f[0].lower() not in known]
+        facts += [(k, v, False) for k, v in (("Appears in", " · ".join(x for x in c.get("seasons") or [] if x)),
+                                             ("Favorited by", f"{c['favs']:,} on AniList" if c.get("favs") else "")) if v]
+        inner = QWidget()
+        iv = QVBoxLayout(inner)
+        iv.setContentsMargins(0, 0, 6, 0)
+        iv.setSpacing(12)
+        hidden_names = c.get("alt_spoiler") or []
+        self.names = QLabel()
+        self.names.setWordWrap(True)
+        self.names.setTextFormat(Qt.RichText)
+        self.names.setStyleSheet(f"color: {C['faint']};")
+        self.names.linkActivated.connect(lambda _: self.show_names(not self.names_shown))
+
+        def show_names(on):
+            self.names_shown = on
+            alt = [html.escape(a) for a in c.get("alt", [])[:6]]
+            bits = (["Also called " + ", ".join(alt)] if alt else [])
+            if hidden_names:
+                n = len(hidden_names)
+                spoil = (", ".join(f"<span style='color:{C['text']}'>{html.escape(a)}</span>" for a in hidden_names)
+                         + f"  <a href='hide' style='color:{C['accent_hi']}; text-decoration:none'>hide</a>") if on else \
+                    (f"<a href='show' style='color:{C['accent_hi']}; text-decoration:none'>{n} spoiler name"
+                     f"{'s' if n != 1 else ''} · click to view</a>")
+                bits.append(("Spoiler names: " if alt else "Also called (spoilers): ") + spoil)
+            self.names.setText("<br>".join(bits))
+            self.names.setVisible(bool(bits))
+        self.show_names = show_names
+        iv.addWidget(self.names)   # in the card first: a widget made visible with no parent flashes as a window
+        show_names(False)
+        chips_w = QWidget()
+        chips = FlowLayout(chips_w, spacing=8)
+        self.fact_chips = [FactChip(k, v, spo) for k, v, spo in facts]
+        for ch in self.fact_chips:
+            chips.addWidget(ch)
+        iv.addWidget(chips_w)
+        desc = clean_char_desc(rest)
+        self.desc = QLabel(desc or ("" if listed else "AniList has no description for this character."))
         self.desc.setWordWrap(True)
         self.desc.setStyleSheet(f"color: {C['text'] if desc else C['muted']}; line-height: 140%;")
+        iv.addWidget(self.desc)
+        self.desc.setVisible(bool(self.desc.text()))
+        iv.addStretch(1)
         area = QScrollArea()
         area.setWidgetResizable(True)
         area.setFrameShape(QFrame.NoFrame)
-        area.setWidget(self.desc)
-        area.setMaximumHeight(170)
+        area.setWidget(inner)
+        area.setMaximumHeight(230)
         col.addWidget(area)
-        if "~!" in (c["desc"] or ""):
+        if "~!" in (c["desc"] or "") or hidden_names:   # the box keeps its height: revealing can't resize the card
+            area.setFixedHeight(230)
+        if "~!" in rest:   # the description's spoilers (spoiler names and badges are clicked one by one)
             spo = QPushButton("Show spoilers")
             spo.setObjectName("ghost")
-            spo.clicked.connect(lambda: (self.desc.setText(clean_char_desc(c["desc"], True)), spo.hide()))
+            spo.setCheckable(True)
+
+            def spoilers(on):
+                self.desc.setText(clean_char_desc(rest, on))
+                spo.setText("Hide spoilers" if on else "Show spoilers")
+            spo.toggled.connect(spoilers)
             col.addWidget(spo, 0, Qt.AlignLeft)
-        chips = QHBoxLayout()
-        chips.setSpacing(8)
-        for text in ([f"Age: {c['age']}"] if c.get("age") else []) + (
-                [f"Appears in {' · '.join(x for x in c['seasons'] if x)}"] if any(c["seasons"]) else []):
-            ch = QLabel(text)
-            ch.setStyleSheet(f"background: {C['surface2']}; border-radius: 10px; padding: 4px 10px; color: {C['text']};")
-            chips.addWidget(ch)
-        chips.addStretch(1)
-        col.addLayout(chips)
         va = c.get("va")
         if va:
             col.addWidget(label("VOICED BY", "navgroup"))
@@ -11415,6 +12075,9 @@ class CharacterDialog(KuraDialog):
         col.addStretch(1)
         links = QHBoxLayout()
         links.addStretch(1)
+        favs = APP.get("favorites")
+        if favs and favs.account.connected and c.get("id"):
+            links.addWidget(FavButton("characters", c["id"]))
         if c.get("url"):
             ani = QPushButton(" Open on AniList")
             ani.setIcon(glyph_icon(G["globe"], C["text"], px=14))
@@ -12720,8 +13383,8 @@ def anilist_connect(parent, done, account=None):
     catcher.got.connect(got)
     catcher.failed.connect(failed)
     if not catcher.start():
-        QMessageBox.warning(parent, "AniList", f"Kura couldn't wait for AniList's answer: another program is using "
-                            f"port {acct.REDIRECT_PORT} on this PC. Close it and try again.")
+        tell(parent, "AniList", f"Kura couldn't wait for AniList's answer: another program is using "
+                            f"port {acct.REDIRECT_PORT} on this PC. Close it and try again.", warn=True)
         return False
     webbrowser.open(acct.authorize_url(ANILIST_CLIENT_ID))
     return True
@@ -13283,9 +13946,7 @@ class TorrentSettingsDialog(KuraDialog):
             self.fill_filters(i + 1)
 
     def reset_filters(self):
-        box = QMessageBox(QMessageBox.Question, "Reset filters", "Replace your filters with the defaults?",
-                          QMessageBox.Yes | QMessageBox.Cancel, self)
-        if box.exec() == QMessageBox.Yes:
+        if confirm(self, "Reset filters", "Replace your filters with the defaults?", ok="Reset", danger=True):
             self.filters[:] = tor.default_filters()
             self.fill_filters()
 
@@ -13306,12 +13967,12 @@ class TorrentSettingsDialog(KuraDialog):
             self.fill_filters()
 
     def ask_name(self, title, text, current=""):
-        name, ok = QInputDialog.getText(self, title, text, text=current)
+        name, ok = ask_text(self, title, text, current)
         name = name.strip()
         if not ok or not name:
             return None
         if name in self.profiles and name != current:
-            QMessageBox.information(self, title, f"There's already a profile called “{name}”.")
+            tell(self, title, f"There's already a profile called “{name}”.")
             return None
         return name
 
@@ -13332,9 +13993,7 @@ class TorrentSettingsDialog(KuraDialog):
     def delete_profile(self):
         if len(self.profiles) < 2:
             return
-        box = QMessageBox(QMessageBox.Question, "Delete profile", f"Delete the profile “{self.active}”?",
-                          QMessageBox.Yes | QMessageBox.Cancel, self)
-        if box.exec() == QMessageBox.Yes:
+        if confirm(self, "Delete profile", f"Delete the profile “{self.active}”?", ok="Delete", danger=True):
             del self.profiles[self.active]
             self.switch_profile(next(iter(self.profiles)))
             self.fill_profiles()
@@ -13351,7 +14010,7 @@ class TorrentSettingsDialog(KuraDialog):
 
     def export_clipboard(self):
         QApplication.clipboard().setText(json.dumps(self.export_data(), ensure_ascii=False))
-        QMessageBox.information(self, "Copied", f"“{self.active}” is on the clipboard. Paste it anywhere to share; "
+        tell(self, "Copied", f"“{self.active}” is on the clipboard. Paste it anywhere to share; "
                                 "others can use Import → From clipboard.")
 
     def import_file(self):
@@ -13361,13 +14020,13 @@ class TorrentSettingsDialog(KuraDialog):
             try:
                 self.import_text(Path(path).read_text(encoding="utf-8"))
             except OSError as e:
-                QMessageBox.warning(self, "Import", f"Couldn't read that file ({e}).")
+                tell(self, "Import", f"Couldn't read that file ({e}).", warn=True)
 
     def import_text(self, text):
         try:
             name, filters, notes = tor.import_profile(text)
         except ValueError as e:
-            QMessageBox.warning(self, "Import", str(e))
+            tell(self, "Import", str(e), warn=True)
             return
         name = tor.unique_name(name, self.profiles)
         self.profiles[name] = filters
@@ -13376,7 +14035,7 @@ class TorrentSettingsDialog(KuraDialog):
         msg = f"Imported “{name}” with {len(filters)} filters. It's now the active profile (press Save to keep it)."
         if notes:
             msg += "\n\nSome parts were left out:\n• " + "\n• ".join(notes[:8])
-        QMessageBox.information(self, "Import", msg)
+        tell(self, "Import", msg)
 
     def save(self):
         s = self.s
@@ -14506,7 +15165,7 @@ class TorrentPage(Page):
     def add_name(self):
         ctx = self.show_ctx
         title = self.titles.get(ctx["mid"]) or "this show"
-        text, ok = QInputDialog.getText(self, "Another name", f"Another name to search for {title}\n"
+        text, ok = ask_text(self, "Another name", f"Another name to search for {title}\n"
                                         "(it's also used to recognize its releases):")
         if ok and text.strip():
             self.remember_alias(ctx["mid"], text.strip(), "yours")
@@ -14771,10 +15430,8 @@ class TorrentPage(Page):
         menu.exec(self.dl_tree.viewport().mapToGlobal(pos))
 
     def remove_with_files(self, hashes):
-        box = QMessageBox(QMessageBox.Question, "Delete files",
-                          f"Remove {'these torrents' if len(hashes) > 1 else 'this torrent'} and delete the "
-                          "downloaded files?", QMessageBox.Yes | QMessageBox.Cancel, self)
-        if box.exec() == QMessageBox.Yes:
+        if confirm(self, "Delete files", f"Remove {'these torrents' if len(hashes) > 1 else 'this torrent'} and "
+                   "delete the downloaded files?", ok="Delete", danger=True):
             qbit = self.downloads.client
             self.downloads.run(lambda: qbit.delete(hashes, delete_files=True))
 
@@ -15010,12 +15667,8 @@ class TorrentPage(Page):
             lines.append(f"•  {name}" + (f"  episode {episode_ranges(ep)}" if ep else ""))
         if len(items) > 12:
             lines.append(f"…and {len(items) - 12} more")
-        box = QMessageBox(QMessageBox.Question, "New episodes",
-                          f"The feed has {len(items)} episode{'s' if len(items) != 1 else ''} you don't have yet:\n\n"
-                          + "\n".join(lines) + "\n\nDownload them now?", QMessageBox.Yes | QMessageBox.No, self)
-        box.button(QMessageBox.Yes).setText("Download")
-        box.button(QMessageBox.No).setText("Not now")
-        if box.exec() == QMessageBox.Yes:
+        if confirm(self, "New episodes", f"Download {len(items)} episode{'s' if len(items) != 1 else ''} you don't "
+                   "have yet?\n\n" + "\n".join(lines), ok="Download", cancel="Not now"):
             self.download(items)
 
     def refilter(self):
@@ -17330,6 +17983,8 @@ class WheelDebounce(QObject):
         if t in (QEvent.Polish, QEvent.Resize, QEvent.WindowTitleChange) and obj.isWidgetType() and obj.isWindow():
             frame_event(obj, t)
             return False
+        if t == QEvent.MouseButtonRelease or t == QEvent.Shortcut and INAPP["stack"]:
+            return inapp_event(obj, t)
         if self.replaying or t != QEvent.Wheel:
             return False
         d, ts = e.angleDelta().y(), e.timestamp()
@@ -17996,7 +18651,7 @@ def save_lookups(data):
         pass
 
 
-class AniListPicker(QDialog):
+class AniListPicker(InAppDialog):
     """Search AniList and pick the right show by hand."""
 
     def __init__(self, parent, title, query):
@@ -18878,7 +19533,7 @@ class TrackEditor(QWidget):
             subs_mod.extract_track(self.path, row["src"], f)
             self.tool.notify.emit(f"Saved {Path(f).name}")
         except Exception as e:
-            QMessageBox.warning(self, "Subtitles", f"Couldn't save it: {e}")
+            tell(self, "Subtitles", f"Couldn't save it: {e}", warn=True)
 
     def sync_buttons(self):
         ready = bool(self.path) and subs_mod.ffmpeg_installed() and self.tool.job is None and self.loader is None
@@ -18934,14 +19589,14 @@ class TrackEditor(QWidget):
         files = self.tool.ticked_files() if self.scope.value() == "ticked" else [self.path]
         if self.path not in files:
             files = [self.path] + files
-        if not any(r["keep"] for r in self.rows) and QMessageBox.question(
-                self, "Subtitles", "Remove every subtitle track?") != QMessageBox.Yes:
+        if not any(r["keep"] for r in self.rows) and not confirm(
+                self, "Subtitles", "Remove every subtitle track?", ok="Remove all", danger=True):
             return
         n = len(files)
-        if QMessageBox.question(self, "Subtitles", f"Change the subtitle tracks of {n} episode{'s' if n != 1 else ''}?"
+        if not confirm(self, "Subtitles", f"Change the subtitle tracks of {n} episode{'s' if n != 1 else ''}?"
                                 f"\n\nEach file is copied with the new tracks next to the original, checked, then "
                                 f"swapped in (about 1 GB written per episode). The originals are kept: Restore "
-                                f"originals puts them back.") != QMessageBox.Yes:
+                                f"originals puts them back.", ok="Change"):
             return
         here = self.path
 
@@ -18957,9 +19612,9 @@ class TrackEditor(QWidget):
             return
         files = [f for f in (self.tool.ticked_files() if self.scope.value() == "ticked" else [self.path])
                  if subs_mod.has_backup(f)] or [self.path]
-        if QMessageBox.question(self, "Subtitles", f"Put the original subtitles back in {len(files)} episode"
+        if not confirm(self, "Subtitles", f"Put the original subtitles back in {len(files)} episode"
                                 f"{'s' if len(files) != 1 else ''}? This also undoes color changes and text tracks "
-                                "made from pictures.") != QMessageBox.Yes:
+                                "made from pictures.", ok="Restore"):
             return
         self.tool.start_job(FileJob(files, lambda f, say: "" if subs_mod.restore_file(f) else "nothing to restore",
                                     "restore"), "Restored", lambda: self.load(self.path))
@@ -19275,10 +19930,10 @@ class SubDownloader(QWidget):
             return
         inside, default = self.save_as.value() == "inside", self.make_default.isChecked()
         style = subs_mod.full_style(self.settings.get("subtool_style") or {}) if self.styled.isChecked() else None
-        if inside and QMessageBox.question(
+        if inside and not confirm(
                 self, "Subtitles", f"Add the subtitles to {len(picks)} episode{'s' if len(picks) != 1 else ''}?\n\n"
                 "Each file is copied with the new track next to the original, checked, then swapped in (about 1 GB "
-                "written per episode). Restore originals (Tracks) takes the track out again.") != QMessageBox.Yes:
+                "written per episode). Restore originals (Tracks) takes the track out again.", ok="Add"):
             return
         jobs = {f: (c, t, s) for f, c, t, s in picks}
 
@@ -19571,8 +20226,8 @@ class SubtitleTool(QWidget):
         if self.job_after:
             self.job_after()
         if self.failures:
-            QMessageBox.warning(self, "Subtitles", text + "\n\n" + "\n".join(self.failures[:12]) +
-                                (f"\n… and {len(self.failures) - 12} more" if len(self.failures) > 12 else ""))
+            tell(self, "Subtitles", text + "\n\n" + "\n".join(self.failures[:12]) +
+                                (f"\n… and {len(self.failures) - 12} more" if len(self.failures) > 12 else ""), warn=True)
         self.update_summary()
 
     def _remember(self, key, value):
@@ -19804,7 +20459,7 @@ class SubtitleTool(QWidget):
                      f"copied with the new subtitles next to the original on {drive}, checked, then swapped in "
                      "(about 1 GB written per episode). The original subtitle tracks are kept, so Restore originals "
                      "undoes it. Episodes open in another app are skipped.")
-        if not ocr and QMessageBox.question(self, "Subtitles", text) != QMessageBox.Yes:
+        if not ocr and not confirm(self, "Subtitles", text, ok="Start"):
             return
         self.editor.engine().release()   # the preview's episode may be one of these
         self.job = SubJob(files, self.editor.value(), restore, ocr)
@@ -19851,8 +20506,8 @@ class SubtitleTool(QWidget):
         if self.editor.episode:
             self.editor.set_episode(self.editor.episode)   # the preview again (it let go of the file for the run)
         if self.failures or (self.pictures and not changed):
-            QMessageBox.warning(self, "Subtitles", text + "\n\n" + "\n".join(self.failures[:12]) +
-                                (f"\n… and {len(self.failures) - 12} more" if len(self.failures) > 12 else ""))
+            tell(self, "Subtitles", text + "\n\n" + "\n".join(self.failures[:12]) +
+                                (f"\n… and {len(self.failures) - 12} more" if len(self.failures) > 12 else ""), warn=True)
         self.update_summary()
 
     def shutdown(self):
@@ -20101,12 +20756,12 @@ class HealthTool(QWidget):
             return
         size = sum(os.path.getsize(f) for f in files)
         names = "\n".join(Path(f).name for f in files[:8]) + (f"\n… and {len(files) - 8} more" if len(files) > 8 else "")
-        if QMessageBox.question(self, "Library health", f"Send {len(files)} file{'s' if len(files) != 1 else ''} "
-                                f"({human(size)}) to the Recycle Bin?\n\n{names}") != QMessageBox.Yes:
+        if not confirm(self, "Library health", f"Send {len(files)} file{'s' if len(files) != 1 else ''} "
+                                f"({human(size)}) to the Recycle Bin?\n\n{names}", ok="Send to Recycle Bin", danger=True):
             return
         err = recycle(files)
         if err:
-            QMessageBox.warning(self, "Library health", err)
+            tell(self, "Library health", err, warn=True)
         else:
             self.notify.emit(f"Sent {len(files)} file{'s' if len(files) != 1 else ''} to the Recycle Bin")
         if self.report:
@@ -20277,14 +20932,14 @@ class StorageTool(QWidget):
     def recycle_ticked(self):
         t = self.ticked()
         size = sum(self.sizes.get(f, 0) for f in t)
-        if QMessageBox.question(self, "Storage", f"Send {len(t)} show{'s' if len(t) != 1 else ''} ({human(size)}) to "
+        if not confirm(self, "Storage", f"Send {len(t)} show{'s' if len(t) != 1 else ''} ({human(size)}) to "
                                 "the Recycle Bin?\n\n" + "\n".join(Path(f).name for f in t[:10]) +
                                 "\n\nThey stay in the Recycle Bin until you empty it (Windows asks first if "
-                                "something is too big for it).") != QMessageBox.Yes:
+                                "something is too big for it).", ok="Send to Recycle Bin", danger=True):
             return
         err = recycle(t)
         if err:
-            QMessageBox.warning(self, "Storage", err)
+            tell(self, "Storage", err, warn=True)
         else:
             self.notify.emit(f"Sent {len(t)} show{'s' if len(t) != 1 else ''} to the Recycle Bin")
         self.library_changed.emit()
@@ -20297,7 +20952,7 @@ class StorageTool(QWidget):
             return
         if os.path.normcase(os.path.abspath(dest)).startswith(os.path.normcase(os.path.abspath(
                 self.settings.get("library") or "?"))):
-            QMessageBox.information(self, "Storage", "Pick a folder outside your library.")
+            tell(self, "Storage", "Pick a folder outside your library.")
             return
         self.settings["storage_archive"] = dest
         save_settings(self.settings)
@@ -20305,14 +20960,14 @@ class StorageTool(QWidget):
         try:
             free = shutil.disk_usage(dest).free
         except OSError as e:
-            QMessageBox.warning(self, "Storage", str(e))
+            tell(self, "Storage", str(e), warn=True)
             return
         if free < size * 1.02:
-            QMessageBox.warning(self, "Storage", f"Not enough space there ({human(free)} free, {human(size)} needed).")
+            tell(self, "Storage", f"Not enough space there ({human(free)} free, {human(size)} needed).", warn=True)
             return
         clash = [f for f in t if (Path(dest) / Path(f).name).exists()]
         if clash:
-            QMessageBox.warning(self, "Storage", "Already there: " + ", ".join(Path(f).name for f in clash[:5]))
+            tell(self, "Storage", "Already there: " + ", ".join(Path(f).name for f in clash[:5]), warn=True)
             return
         self.busy.setRange(0, len(t))
         self.busy.setValue(0)
@@ -20336,7 +20991,7 @@ class StorageTool(QWidget):
         self.job = None
         self.busy.hide()
         if err:
-            QMessageBox.warning(self, "Storage", f"Stopped: {err}")
+            tell(self, "Storage", f"Stopped: {err}", warn=True)
         if done:
             self.notify.emit(f"Moved {len(done)} show{'s' if len(done) != 1 else ''} to {dest}")
         self.library_changed.emit()
@@ -22562,7 +23217,7 @@ class PadNavigator(QObject):
         for w in (self.menu_panel, self.kb):
             if w is not None and w.isVisible():
                 return w
-        modal = QApplication.activeModalWidget()
+        modal = modal_widget()
         if modal is not None:
             return modal
         tv = getattr(self.win, "tv", None)
@@ -22605,6 +23260,9 @@ class PadNavigator(QObject):
             win = w.window()
         except RuntimeError:
             win = self.win
+        for layer in reversed(INAPP["stack"]):   # a box in a pop-up inside the window: the keyboard over that pop-up
+            if shiboken6.isValid(w) and layer.isAncestorOf(w):
+                return layer
         tv = getattr(self.win, "tv", None)
         if win is self.win and tv is not None and tv.isVisible():
             return tv
@@ -22660,7 +23318,7 @@ class PadNavigator(QObject):
         if self.menu_panel is not None and self.menu_panel.isVisible() and name == "START":
             return self.menu_panel.close_panel()
         tv = getattr(self.win, "tv", None)
-        if (tv is not None and tv.isVisible() and kb is None and QApplication.activeModalWidget() is None
+        if (tv is not None and tv.isVisible() and kb is None and modal_widget() is None
                 and not (self.menu_panel is not None and self.menu_panel.isVisible())):
             if name in ("LB", "RB"):
                 return tv.step_tab(-1 if name == "LB" else 1)
@@ -22846,7 +23504,7 @@ class PadNavigator(QObject):
             if self.menu_panel.isVisible():
                 QTimer.singleShot(0, lambda: self.move("DPAD_DOWN"))
             return
-        modal = QApplication.activeModalWidget()
+        modal = modal_widget()
         if modal is not None:
             return self.key(Qt.Key_Escape, modal)
         tv = getattr(self.win, "tv", None)
@@ -22899,7 +23557,7 @@ def backup_dir(settings):
 BACKUP_KINDS = {"auto": "Weekly", "manual": "Made by you", "before restore": "Before a restore"}
 
 
-class RestoreDialog(QDialog):
+class RestoreDialog(InAppDialog):
     """Pick what to put back from a backup."""
 
     def __init__(self, parent, path, manifest):
@@ -23123,7 +23781,7 @@ class BackupTool(QWidget):
             return
         m = backup_mod.read_manifest(path)
         if not m:
-            QMessageBox.warning(self, APP_NAME, "That file isn't a Kura backup.")
+            tell(self, APP_NAME, "That file isn't a Kura backup.", warn=True)
             return
         dlg = RestoreDialog(self, path, m)
         if dlg.exec() == QDialog.Accepted and dlg.names():
@@ -23139,10 +23797,10 @@ class BackupTool(QWidget):
 
     def delete(self):
         path = self.current()
-        if path and QMessageBox.question(self, APP_NAME, "Send this backup to the Recycle Bin?") == QMessageBox.Yes:
+        if path and confirm(self, APP_NAME, "Send this backup to the Recycle Bin?", ok="Send to Recycle Bin", danger=True):
             err = recycle([path])
             if err:
-                QMessageBox.warning(self, APP_NAME, err)
+                tell(self, APP_NAME, err, warn=True)
             self.fill()
 
     def shutdown(self):
@@ -23306,12 +23964,12 @@ class LogTool(QWidget):
 
     def clear(self):
         p = self.path()
-        if p.exists() and QMessageBox.question(self, APP_NAME, f"Empty {p.name}?") == QMessageBox.Yes:
+        if p.exists() and confirm(self, APP_NAME, f"Empty {p.name}?", ok="Empty", danger=True):
             try:
                 with open(p, "w", encoding="utf-8"):
                     pass
             except OSError as e:
-                QMessageBox.warning(self, APP_NAME, f"Couldn't empty it ({e}).")
+                tell(self, APP_NAME, f"Couldn't empty it ({e}).", warn=True)
             self.load(force=True)
 
 CAPTURE_IMAGES = (".png", ".jpg", ".jpeg", ".webp", ".avif")
@@ -23645,12 +24303,12 @@ class CapturesTool(QWidget):
         paths = [it.data(Qt.UserRole) for it in self.grid.selectedItems()] or ([self.current()] if self.current() else [])
         if not paths:
             return
-        if QMessageBox.question(self, "Captures", f"Send {len(paths)} capture{'s' if len(paths) != 1 else ''} to the "
-                                "Recycle Bin?") != QMessageBox.Yes:
+        if not confirm(self, "Captures", f"Send {len(paths)} capture{'s' if len(paths) != 1 else ''} to the "
+                                "Recycle Bin?", ok="Send to Recycle Bin", danger=True):
             return
         err = recycle(paths)
         if err:
-            QMessageBox.warning(self, "Captures", err)
+            tell(self, "Captures", err, warn=True)
         cap_mod.forget(self.settings, [p for p in paths if not os.path.exists(p)])
         self.refresh()
 
@@ -23707,7 +24365,7 @@ class CapturesTool(QWidget):
         if self.sheet_job is not None:
             return
         if not subs_mod.ffmpeg_installed():
-            QMessageBox.information(self, "Captures", "Contact sheets need FFmpeg: Settings → Captures → Install FFmpeg.")
+            tell(self, "Captures", "Contact sheets need FFmpeg: Settings → Captures → Install FFmpeg.")
             return
         start = self.settings.get("library") or ""
         f, _ = QFileDialog.getOpenFileName(self, "Contact sheet of which episode?", start,
@@ -24565,7 +25223,7 @@ class LiveTVPage(Page):
         self.settings, self.account, self.library = settings, account, library
         self.tv = livetv_mod.LiveTV(SCRIPT_DIR)
         self.tvs = {False: self.tv, True: None}   # Anime / 18+ (made the first time you're on that side)
-        self.durations = livetv_mod.Durations(SCRIPT_DIR / "livetv_durations.json", lambda: subs_mod.FFPROBE)
+        self.durations = file_durations()
         self.provider = LiveProvider(self.tv, account)
         self.provider.page = self   # reminders from the player's guide
         self.job, self.shows, self.cards = None, [], []
@@ -24960,7 +25618,7 @@ class LiveTVPage(Page):
         self.ensure(force=True)
 
     def delete_channel(self, cid):
-        if QMessageBox.question(self, "Live TV", "Delete this channel?") != QMessageBox.Yes:
+        if not confirm(self, "Live TV", "Delete this channel?", ok="Delete", danger=True):
             return
         self.tv.custom = [c for c in self.tv.custom if c["id"] != cid]
         self.tv.save_channels()
@@ -29224,7 +29882,7 @@ class TopFive(QWidget):
                        QFontMetrics(f).elidedText(it["title"], Qt.ElideRight, int(w * 2 - 10)))
 
 
-def wrapped_image(r, name, avatar, covers):
+def wrapped_image(r, name, avatar, covers, fav=""):
     """The shareable card: 1080×1350, painted on its own (doesn't depend on the window's size)."""
     W, H = 1080, 1350
     img = QImage(W, H, QImage.Format_ARGB32_Premultiplied)
@@ -29276,6 +29934,11 @@ def wrapped_image(r, name, avatar, covers):
     p.setPen(QColor(255, 255, 255, 190))
     p.setFont(font(30, QFont.DemiBold))
     p.drawText(QRectF(x, 440, 900, 40), Qt.AlignLeft | Qt.AlignVCenter, "Top 5")
+    if fav:   # your #1 AniList favorite
+        p.setPen(QColor(255, 255, 255, 150))
+        p.setFont(font(26))
+        p.drawText(QRectF(x + 160, 440, W - 2 * x - 160, 40), Qt.AlignRight | Qt.AlignVCenter,
+                   QFontMetrics(font(26)).elidedText(f"Favorite: {fav}", Qt.ElideRight, W - 2 * x - 160))
     cw, ch = 168, 238
     for i, it in enumerate(r["top"][:5]):
         cx = x + i * (cw + 15)
@@ -29335,14 +29998,198 @@ def wrapped_image(r, name, avatar, covers):
 
 
 
+# ---------------------------------------------------------------- your AniList favorites (Nov 2026)
+# User's pick on canvas UBMbsfr5DaGbMjP3JWUHAq: A (a Favorites tab in Statistics) with the extras: a Favorite
+# button on show pages and character cards, your #1 favorites on Your year, a Library "Favorites" chip + heart.
+
+class Favorites(QObject):
+    """Your AniList favorites (anilist_favorites.json, `stats.fetch_favorites`). Refreshed after 6 h (Statistics,
+    startup) or with Statistics' Refresh; a heart click shows at once and is sent to AniList in the background."""
+    changed = Signal()
+
+    def __init__(self, account):
+        super().__init__(account)
+        self.account = account
+        self.data = stats_mod.load_favorites() or {}
+        self.wish = {}   # {(kind, id): on}: clicked, AniList hasn't answered yet
+        self.calls, self.fetching = set(), False
+
+    def items(self, kind):
+        return self.data.get(kind) or []
+
+    def has(self, kind, item_id):
+        if (kind, item_id) in self.wish:
+            return self.wish[(kind, item_id)]
+        return any(n.get("id") == item_id for n in self.items(kind))
+
+    def anime_ids(self):
+        ids = {n["id"] for n in self.items("anime")}
+        for (kind, i), on in self.wish.items():
+            if kind == "anime":
+                (ids.add if on else ids.discard)(i)
+        return ids
+
+    def refresh(self, force=False):
+        if not self.account.connected or self.fetching:
+            return
+        if not force and self.data and self.data.get("v") == stats_mod.FAV_VERSION and \
+                time.time() - self.data.get("fetched", 0) < stats_mod.MAX_AGE:
+            return
+        token = self.account.token
+        self.fetching = True
+        self._call(lambda: stats_mod.fetch_favorites(token), None)
+
+    def set(self, kind, item_id, on):
+        if not self.account.connected:
+            return
+        self.wish[(kind, item_id)] = on
+        self.changed.emit()
+        token = self.account.token
+        self._call(lambda: stats_mod.set_favorite(token, kind, item_id, on), (kind, item_id))
+
+    def _call(self, fn, key):
+        call = BgCall(fn)
+        call.done.connect(lambda res, err, c=call: self._done(c, key, res, err))
+        self.calls.add(call)
+        call.start()
+
+    def _done(self, call, key, res, err):
+        call.wait()
+        self.calls.discard(call)
+        if key is None:
+            self.fetching = False
+        else:
+            self.wish.pop(key, None)
+        if res:
+            self.data = res
+        if err:
+            klog.warning(f"AniList favorites: {err}")
+            if key is not None:
+                self.account.message.emit(f"Couldn't change your AniList favorites: {err}")
+        self.changed.emit()
+
+
+class FavButton(QPushButton):
+    """ Favorite: a heart that's filled (red) while it's one of your AniList favorites; click to add / remove."""
+
+    def __init__(self, kind, item_id):
+        super().__init__(" Favorite")
+        self.kind, self.item_id = kind, item_id
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIcon(glyph_icon("favorite", C["text"], C["bad"]))
+        self.setStyleSheet(f"QPushButton:checked {{ border-color: {C['bad']}; color: #ff9aa8;"
+                           f" background: rgba(255,93,115,0.12); }}")
+        self.clicked.connect(lambda on: APP["favorites"].set(self.kind, self.item_id, on))
+        APP["favorites"].changed.connect(self.sync)
+        self.sync()
+
+    def sync(self):
+        on = APP["favorites"].has(self.kind, self.item_id)
+        self.setChecked(on)
+        self.setToolTip("In your AniList favorites · click to remove" if on else "Add to your AniList favorites")
+
+
+def fav_character(n):
+    """A favorite character from AniList → the shape CharCard / CharacterDialog use (role, voice actor and seasons
+    from the most popular show they're in)."""
+    e = (((n.get("media") or {}).get("edges")) or [{}])[0] or {}
+    va = (e.get("voiceActors") or [None])[0] or {}
+    show = e.get("node") or {}
+    name = n.get("name") or {}
+    return {"id": n["id"], "name": name.get("full") or "?", "native": name.get("native") or "",
+            "image": (n.get("image") or {}).get("large"), "desc": n.get("description") or "", "age": n.get("age"),
+            "gender": n.get("gender"), **char_facts(n), "url": n.get("siteUrl"), "main": e.get("characterRole") == "MAIN" if e.get("characterRole") else None,
+            "seasons": [media_title(show)] if show else [], "show": media_title(show) if show else "",
+            "show_id": show.get("id"), "adult": bool(show.get("isAdult")),
+            "va": {"id": va.get("id"), "name": (va.get("name") or {}).get("full") or "",
+                   "native": (va.get("name") or {}).get("native") or "", "image": (va.get("image") or {}).get("large"),
+                   "url": va.get("siteUrl")} if va else None}
+
+
+class FavPerson(QFrame):
+    """A favorite voice actor / staff member: round photo, name, what they do. Click: their AniList page."""
+
+    def __init__(self, n):
+        super().__init__()
+        self.url = n.get("siteUrl")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedWidth(120)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        name = (n.get("name") or {}).get("full") or "?"
+        self.img = RoundedImage(84, 84, 42, name)
+        v.addWidget(self.img, 0, Qt.AlignHCenter)
+        jobs = (n.get("primaryOccupations") or [])[:1]
+        roles = [((c.get("name") or {}).get("full") or "") for c in ((n.get("characters") or {}).get("nodes") or [])]
+        sub = "  ·  ".join(x for x in (", ".join(jobs), ", ".join(r for r in roles if r)) if x)
+        for text, faint in ((name, False), (sub, True)):
+            t = QLabel(QFontMetrics(self.font()).elidedText(text, Qt.ElideRight, 118))
+            t.setAlignment(Qt.AlignHCenter)
+            t.setStyleSheet(f"background: transparent; color: {C['muted']}; font-size: 8.5pt;" if faint else
+                            "background: transparent; font-weight: 600; font-size: 9.5pt;")
+            v.addWidget(t)
+        self.setToolTip("\n".join(x for x in (name, sub, "Click to open on AniList") if x))
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.url:
+            webbrowser.open(self.url)
+
+
+class FavPicks(QWidget):
+    """Your year: your #1 favorite anime and character, each with its picture."""
+
+    def __init__(self):
+        super().__init__()
+        self.row = QHBoxLayout(self)
+        self.row.setContentsMargins(0, 8, 0, 0)
+        self.row.setSpacing(24)
+
+    def set(self, anime, char):
+        clear_layout(self.row)
+        if not anime and not char:
+            self.row.addWidget(label("No AniList favorites yet: use the Favorite button on a show's page or a "
+                                     "character.", "muted", wrap=True), 1)
+            return
+        for kind, item in (("anime", anime), ("char", char)):
+            if not item:
+                continue
+            box = QHBoxLayout()
+            box.setSpacing(14)
+            if kind == "anime":
+                img = RoundedImage(64, 92, 8, media_title(item))
+                load_image_into(img, (item.get("coverImage") or {}).get("large"), str(item["id"]))
+                name, cap, sub = media_title(item), "FAVORITE ANIME", " · ".join(
+                    x for x in (FORMAT_TEXT.get(item.get("format"), ""), str(item.get("seasonYear") or "")) if x)
+            else:
+                img = RoundedImage(80, 80, 40, item["name"])
+                load_image_into(img, item.get("image"), f"char_{item['id']}")
+                name, cap = item["name"], "FAVORITE CHARACTER"
+                sub = f"voiced by {item['va']['name']}" if item.get("va") else item.get("show") or ""
+            box.addWidget(img, 0, Qt.AlignVCenter)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            col.addStretch(1)
+            caption = label(cap, "faint")
+            caption.setStyleSheet("font-size: 8pt; font-weight: 600; letter-spacing: 1px; background: transparent;")
+            col.addWidget(caption)
+            col.addWidget(label(name, "h2", wrap=True))
+            if sub:
+                col.addWidget(label(sub, "faint", wrap=True))
+            col.addStretch(1)
+            box.addLayout(col, 1)
+            self.row.addLayout(box, 1)
+
+
 class StatsPage(QWidget):
     """Statistics: your AniList profile (banner, avatar, name) and your anime stats, from AniList's own
     statistics or worked out live from your list (`stats_source`); tabs Overview / Genres & tags /
     Studios / Years / Kura (`stats_tab`)."""
     want_settings = Signal()
-    TABS = [("overview", "Overview"), ("wrapped", "Your year"), ("genres", "Genres && tags"), ("studios", "Studios"),
-            ("years", "Years"),
-            ("kura", "Kura")]
+    open_media = Signal(int, str, object)   # a favorite anime was clicked
+    TABS = [("overview", "Overview"), ("wrapped", "Your year"), ("favorites", "Favorites"), ("genres", "Genres && tags"),
+            ("studios", "Studios"), ("years", "Years"), ("kura", "Kura")]
 
     def __init__(self, settings, account, library):
         super().__init__()
@@ -29419,6 +30266,7 @@ class StatsPage(QWidget):
             self.pages[key] = page
         self.on_tab(self.tabs.value(), save=False)
         account.changed.connect(lambda: self.isVisible() and self.render())
+        APP["favorites"].changed.connect(self.on_favorites)
 
     # ---- building the tabs (once; render() fills them)
     def tiles(self, lay, specs):
@@ -29496,6 +30344,8 @@ class StatsPage(QWidget):
         g.add(stat_card("Most-watched series", "Episodes, from your Crunchyroll history", self.wr_most))
         self.wr_facts = KeyValues()
         g.add(stat_card("Highlights", "", self.wr_facts), 2)
+        self.wr_fav = FavPicks()
+        g.add(stat_card("Your favorites", "Your #1 anime and character on AniList", self.wr_fav), 2)
         self.wr_kura = KeyValues()
         g.add(stat_card("In Kura", "Kura's player and downloads", self.wr_kura, kura=True))
         lay.addWidget(g)
@@ -29503,6 +30353,9 @@ class StatsPage(QWidget):
         self.wr_result = None
         self.wr_covers = {}
         self.wr_loader = None
+
+    def build_favorites(self, lay):
+        self.fv_lay, self.fv_panel, self.fv_sig = lay, None, None
 
     def build_years(self, lay):
         g = ResponsiveGrid()
@@ -29539,9 +30392,11 @@ class StatsPage(QWidget):
             self.measure_library()
         if key == "wrapped":
             self.fill_wrapped()
+        if key == "favorites":
+            self.fill_favorites()
         for w in (self.source_lbl, self.source):
-            w.setVisible(key != "wrapped")   # the Year in review doesn't use AniList's own statistics
-        if key == "wrapped":
+            w.setVisible(key not in ("wrapped", "favorites"))   # these two don't use AniList's own statistics
+        if key in ("wrapped", "favorites"):
             self.note.hide()
 
     def on_source(self, key):
@@ -29567,6 +30422,7 @@ class StatsPage(QWidget):
             return
         if force:
             self.account.refresh()
+        APP["favorites"].refresh(force)
         saved = stats_mod.load()
         if (force or stats_mod.stale(saved)) and not self.fetching:
             self.fetching = True
@@ -29661,6 +30517,16 @@ class StatsPage(QWidget):
         if self.tabs.value() == "wrapped":
             self.note.hide()
             self.fill_wrapped()
+        if self.tabs.value() == "favorites":
+            self.note.hide()
+            self.fill_favorites()
+
+    def on_favorites(self):
+        if self.isVisible() and self.account.connected:
+            if self.tabs.value() == "favorites":
+                self.fill_favorites()
+            elif self.tabs.value() == "wrapped":
+                self.fill_wrapped()
 
     # ---- filling
     def fill_overview(self, d, viewer):
@@ -29788,10 +30654,124 @@ class StatsPage(QWidget):
                  ("Movies", str(r["movies"]))]
         self.wr_facts.set(facts)
         k = r["kura"]
+        anime, chars, _, _ = self.side_favorites()
+        self.wr_fav.set(anime[0] if anime else None, chars[0] if chars else None)
+        self.wr_fav_name = chars[0]["name"] if chars else (media_title(anime[0]) if anime else "")
         self.wr_kura.set([("Watched in Kura's player", f"{k['seconds'] / 3600:.1f} h" if k["seconds"] else "–"),
                           ("Episodes finished in Kura", str(k["finished"])),
                           ("Torrents sent", str(k["torrents"]))])
         self.load_wrapped_covers(r)
+
+    def side_favorites(self):
+        """Your favorites for the side Kura is on: (anime, characters, staff, studios)."""
+        favs = APP["favorites"]
+        on = acct.ADULT["on"]
+        anime = [n for n in favs.items("anime") if bool(n.get("isAdult")) == on]
+        chars = [c for c in map(fav_character, favs.items("characters")) if c["adult"] == on]
+        return anime, chars, favs.items("staff"), favs.items("studios")
+
+    def fill_favorites(self):
+        favs = APP["favorites"]
+        anime, chars, staff, studios = self.side_favorites()
+        sig = (favs.data.get("fetched"), tuple(sorted(favs.wish.items())), acct.ADULT["on"], len(self.library.items))
+        if sig == self.fv_sig:
+            return
+        self.fv_sig = sig
+        if self.fv_panel is not None:   # a fresh panel each time (the old one hidden at once, not left to paint)
+            self.fv_panel.hide()
+            self.fv_panel.deleteLater()
+        self.fv_panel = QWidget()
+        self.fv_box = QVBoxLayout(self.fv_panel)
+        self.fv_box.setContentsMargins(0, 0, 0, 0)
+        self.fv_box.setSpacing(14)
+        self.fv_lay.addWidget(self.fv_panel)
+        if favs.fetching and not favs.data:
+            self.fv_box.addWidget(label("Loading your favorites from AniList…", "muted"))
+            return
+        url = (self.account.user or {}).get("siteUrl")
+
+        def section(title, n, body, link=None):
+            head = QHBoxLayout()
+            head.setSpacing(10)
+            head.addWidget(row_title(title))
+            head.addWidget(label(_num(n), "faint"), 0, Qt.AlignBottom)
+            head.addStretch(1)
+            if link:
+                b = QPushButton(" Change order on AniList")
+                b.setObjectName("ghost")
+                b.setIcon(glyph_icon("open_in_new", C["muted"], px=14))
+                b.clicked.connect(lambda: webbrowser.open(link))
+                head.addWidget(b)
+            self.fv_box.addLayout(head)
+            self.fv_box.addWidget(body)
+            self.fv_box.addSpacing(10)
+
+        def empty(text):
+            box = card()
+            h = QHBoxLayout(box)
+            h.setContentsMargins(20, 16, 20, 16)
+            h.setSpacing(14)
+            h.addWidget(glyph_label("favorite", C["bad"], 22))
+            h.addWidget(label(text, "muted", wrap=True), 1)
+            return box
+
+        # anime: posters, a mark on the ones you have, click = the show's page
+        if anime:
+            cards = []
+            for m in anime:
+                have = self.library.path_for_media(m["id"])
+                c = RecCard(m, None, ("In your library", C["ok"]) if have else None,
+                            tip="In your library" if have else "Not in your library")
+                c.clicked.connect(lambda m=m, c=c: self.open_media.emit(m["id"], media_title(m), c.img.img))
+                load_image_into(c, (m.get("coverImage") or {}).get("large"), str(m["id"]))
+                cards.append(c)
+            grid = RecGrid(cards)
+            grid.set_expanded(True)
+            body = grid
+        else:
+            body = empty("No favorite anime yet. Click Favorite on a show's page to add one here (and to your "
+                         "AniList profile).")
+        section("Anime", len(anime), body, f"{url}/favorites" if url and anime else None)
+        # characters: portraits with their show, click = the character card
+        if chars:
+            w = QWidget()
+            flow = FlowLayout(w, spacing=16)
+            for c in chars:
+                cc = CharCard(c, sub=c["show"])
+                load_image_into(cc.img, c.get("image"), f"char_{c['id']}")
+                cc.clicked.connect(lambda c: CharacterDialog(self, c, open_media=lambda mid: self.open_media.emit(
+                    mid, "", None)).exec())
+                flow.addWidget(cc)
+            body = w
+        else:
+            body = empty("No favorite characters yet. Open a character on a show's page and click Favorite.")
+        section("Characters", len(chars), body)
+        if staff:
+            w = QWidget()
+            flow = FlowLayout(w, spacing=16)
+            for n in staff:
+                fp = FavPerson(n)
+                load_image_into(fp.img, (n.get("image") or {}).get("large"), f"va_{n['id']}")
+                flow.addWidget(fp)
+            section("Voice actors & staff", len(staff), w)
+        if studios:
+            have = {}
+            for idx in self.library.indexes().values():
+                m = (media_for(idx.get("mid"), self.account) if idx else None) or {}
+                for st in {x.get("name") for x in ((m.get("studios") or {}).get("nodes") or []) if x.get("name")}:
+                    have[st] = have.get(st, 0) + 1
+            w = QWidget()
+            flow = FlowLayout(w, spacing=10)
+            for n in studios:
+                k, name = have.get(n.get("name"), 0), n.get("name") or "?"
+                b = QPushButton(f"{name}  ·  {k} show{'s' if k != 1 else ''} in your library" if k else name)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setToolTip("Open on AniList")
+                b.clicked.connect(lambda _=False, u=n.get("siteUrl"): u and webbrowser.open(u))
+                flow.addWidget(b)
+            section("Studios", len(studios), w)
+        self.fv_box.addWidget(label("From your AniList favorites. Click Favorite on a show's page or a character "
+                                    "to add or remove one.", "faint", wrap=True))
 
     def load_wrapped_covers(self, r):
         want = [(t["id"], t["cover"]) for t in r["top"] if t.get("cover") and t["id"] not in self.wr_covers]
@@ -29812,7 +30792,8 @@ class StatsPage(QWidget):
 
     def wrapped_card(self):
         r = getattr(self, "wr_result", None)
-        return wrapped_image(r, getattr(self, "wr_name", ""), getattr(self, "wr_avatar", None), self.wr_covers) if r else None
+        return wrapped_image(r, getattr(self, "wr_name", ""), getattr(self, "wr_avatar", None), self.wr_covers,
+                             getattr(self, "wr_fav_name", "")) if r else None
 
     def save_wrapped(self):
         img = self.wrapped_card()
@@ -30367,6 +31348,7 @@ class MainWindow(QMainWindow):
 
         acct.PROGRESS_SCALE.update({int(k): v for k, v in org.EPISODE_SPLIT.items()})   # two-in-one (Edit info)
         self.account = acct.Account(self)
+        self.favorites = APP["favorites"] = Favorites(self.account)   # your AniList favorites
         self.pages = QStackedWidget()
         self.library = LibraryPage(self.settings, self.account)
         APP["settings"] = self.settings
@@ -30472,6 +31454,10 @@ class MainWindow(QMainWindow):
         self.library.open_media.connect(self.show_media)
         self.seasonal.open_show.connect(self.show_details)
         self.seasonal.open_media.connect(self.show_media)
+        self.stats.open_media.connect(self.show_media)
+        self.favorites.changed.connect(self.library.mark_favorites)
+        QTimer.singleShot(20_000, self.favorites.refresh)   # after 6 h: hearts on show pages and Library covers
+        self.account.changed.connect(lambda: self.account.connected and self.favorites.refresh())
         self.todo.open_media.connect(self.show_media)
         self.schedule.open_media.connect(self.show_media)
         self.torrents.open_media.connect(self.show_media)
@@ -30517,6 +31503,7 @@ class MainWindow(QMainWindow):
         self.account.changed.connect(self.update_badges)
         self.library.updated.connect(self.update_badges)
         self.close_overlay = CloseOverlay(self.centralWidget())   # close_action = ask
+        INAPP["win"] = self   # pop-ups open inside this window
         self.close_overlay.chosen.connect(self.on_close_chosen)
         self.lock_screen = LockScreen(self.centralWidget(), self.settings)   # the hentai side's lock
         self.tv = TvMode(self)   # full screen, made for a controller
@@ -31691,7 +32678,7 @@ class MainWindow(QMainWindow):
         lib = Path(anime_library(self.settings) or "")
         dest = Path(adult_value(self.settings, "library") or "")
         if not lib.is_dir() or not str(dest):
-            QMessageBox.information(self, APP_NAME, "Set the Anime library and the hentai library folder first.")
+            tell(self, APP_NAME, "Set the Anime library and the hentai library folder first.")
             return
         cache = org.load_cache()
         found = []
@@ -31721,7 +32708,7 @@ class MainWindow(QMainWindow):
             c.wait()
             shows = sorted(set(found) | set(more or []))
             if not shows:
-                QMessageBox.information(self, APP_NAME, "No hentai in your Anime library.")
+                tell(self, APP_NAME, "No hentai in your Anime library.")
                 return
             dlg = AdultMoveDialog(self, shows, dest)
             if dlg.exec() != QDialog.Accepted:
@@ -31740,7 +32727,7 @@ class MainWindow(QMainWindow):
             klog.info(f"Moved {moved} adult show(s) to {dest}")
             self.notify(f"Moved {moved} show{'s' if moved != 1 else ''} to {dest}")
             if failed:
-                QMessageBox.warning(self, APP_NAME, "\n".join(failed))
+                tell(self, APP_NAME, "\n".join(failed), warn=True)
             self.library.root_cache.clear()
             self.library.refresh()
         call.done.connect(done)
@@ -32115,7 +33102,7 @@ class MainWindow(QMainWindow):
                     self.tray_notice.start(screen)
                 return
         if self.job is not None:
-            QMessageBox.information(self, APP_NAME, "A job is still running. Wait for it to finish before closing.")
+            tell(self, APP_NAME, "A job is still running. Wait for it to finish before closing.")
             e.ignore()
             return
         self.tray_notice.hide()
@@ -32182,7 +33169,7 @@ class MainWindow(QMainWindow):
     def restart(self):
         """Close and open again (a restore puts the files back in between)."""
         if self.job is not None:
-            QMessageBox.information(self, APP_NAME, "A job is still running. The restore happens the next time Kura "
+            tell(self, APP_NAME, "A job is still running. The restore happens the next time Kura "
                                                     "starts.")
             return
         self.restart_after = True
@@ -32249,7 +33236,7 @@ class MainWindow(QMainWindow):
         self.update_job.start()
 
 
-class UpdateDialog(QDialog):
+class UpdateDialog(InAppDialog):
     """A new Kura: what's new, then Update now: a backup of your data, the download (only what changed, each file
     checked), then Kura closes, the files are swapped (updater.apply_script) and it opens again."""
     progress = Signal(object, object)   # bytes done, total (can pass 2 GB)

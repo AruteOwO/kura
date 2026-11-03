@@ -1513,12 +1513,29 @@ def transfer(src, dst, dry):
             os.link(src, dst)
         except OSError as e:
             log.warning(f"  Hardlink failed ({e}), copying instead")
-            shutil.copy2(src, dst)
+            copy_whole(src, dst)
     elif MODE == "copy":
-        shutil.copy2(src, dst)
+        copy_whole(src, dst)
     else:
-        shutil.move(str(src), str(dst))
+        move_whole(src, dst)
     return True
+
+
+def move_whole(src, dst):
+    try:
+        os.rename(src, dst)   # the same drive: instant, never half done
+    except OSError:
+        copy_whole(src, dst)   # another drive (D: downloads → I: library)
+        os.remove(src)
+
+
+def copy_whole(src, dst):
+    """Copy as "name.part", then rename: a copy cut off (Kura crashed during a 1.4 GB move to I:) left a broken
+    episode under its real name, and every later run skipped it as "Already exists". A leftover .part is just
+    written again."""
+    part = dst.with_name(dst.name + ".part")
+    shutil.copy2(src, part)
+    os.replace(part, dst)
 
 
 def sidecars(video):
@@ -2316,8 +2333,8 @@ def apply_extras_plan(items, dry=False):
             dest.parent.mkdir(parents=True, exist_ok=True)
             for sc in list(sidecars(src)):
                 if not (dest.parent / sc.name).exists():
-                    shutil.move(str(sc), str(dest.parent / sc.name))
-            shutil.move(str(src), str(dest))
+                    move_whole(sc, dest.parent / sc.name)
+            move_whole(src, dest)
             moved += 1
             log.info(f"{it['show']}: {src.name} -> {dest.parent}")
             emptied.add(src.parent)

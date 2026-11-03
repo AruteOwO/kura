@@ -535,7 +535,8 @@ class MpvWidget(QOpenGLWidget):
     @staticmethod
     def _log(level, component, message):
         if level in ("error", "fatal") and "INVALID_ENUM" not in message:   # harmless OpenGL noise
-            print(f"mpv {level}: {message.strip()}")
+            # into kura.log: the last lines before a crash (Nov 2: Kura closed leaving full screen, nothing logged)
+            logging.getLogger("kura").warning(f"mpv {level} ({component}): {message.strip()}")
 
     def initializeGL(self):
         # Also runs again after the widget moves to another window (Kura <-> pop-out):
@@ -3851,6 +3852,8 @@ class PlayerView(QWidget):
 
     def toggle_fullscreen(self):
         win = self.window()   # Kura's window, or the pop-out
+        logging.getLogger("kura").info(f"Player: {'leaving' if win.isFullScreen() else 'going'} full screen "
+                                       f"({type(win).__name__}, at {self.mpv.time_pos or 0:.0f} s)")
         if win.isFullScreen():
             win.showNormal()
             self.full_btn.setIcon(icon(FULL))

@@ -66,7 +66,7 @@ DETAILS_FILE = SCRIPT_DIR / "anilist_details.json"   # show info for the detail 
 PLAYBACK_STATE_FILE = SCRIPT_DIR / "playback_state.json"   # where Kura's player left off, per file
 APP_NAME = "Kura"
 APP_ID = "Kura.AnimeLibrary"   # Windows groups the taskbar button and icon under this
-APP_VERSION = "1.0.10"          # release.py sets it
+APP_VERSION = "1.0.11"          # release.py sets it
 UPDATE_REPO = "AruteOwO/kura"               # "owner/name" on GitHub: where updates come from (updater.py); empty = no updates
 # Kura's own Discord application (Rich Presence shows "Watching Kura"): a public ID, not a secret, so everyone's
 # Discord status works with just the switch, like Taiga

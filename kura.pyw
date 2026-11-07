@@ -9734,7 +9734,8 @@ class DetailPage(QWidget):
     def rewatch_start(self):
         """Where to start a show you've finished (every season on your list Completed), like next_episode's result:
         the first season you have on your drive and its first file, else season 1 episode 1 (path None: streamed)."""
-        secs = [s for s in self.result["sections"] if s.get("id") and s.get("counted")]
+        # a season that hasn't aired yet doesn't count (Frieren's announced Season 3 hid the button: user, Nov 7 2026)
+        secs = [s for s in self.result["sections"] if s.get("id") and s.get("counted") and s.get("aired") != 0]
         if not secs or any((self.account.entry(s["id"]) or {}).get("status") != "COMPLETED" for s in secs):
             return None
         for s in secs:

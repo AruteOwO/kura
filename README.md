@@ -22,7 +22,9 @@ same library.
 ## Features
 
 <p align="center"><img src="docs/images/home.png" alt="Home: up next, new in your library, airing today" width="100%"></p>
+<p align="center"><img src="docs/images/browse.png" alt="Browse: a surprise pick, moods, trending and what you can stream right now" width="100%"></p>
 <p align="center"><img src="docs/images/library.png" alt="Library: a show page with progress, seasons and trailer" width="100%"></p>
+<p align="center"><img src="docs/images/versions.png" alt="Versions: pick which version of an episode plays, or set a rule for the show" width="100%"></p>
 <p align="center"><img src="docs/images/schedule.png" alt="Schedule: the week's episodes and what's downloaded" width="100%"></p>
 <p align="center"><img src="docs/images/tvmode.png" alt="TV mode: full screen with a controller, a show's banner art, episodes and button hints" width="100%"></p>
 <p align="center">

@@ -72,6 +72,9 @@ ANISKIP_FILE = None     # Kura sets this: aniskip_cache.json (opening / ending t
 EPISODE_INFO = None     # Kura sets this: playlist -> {"items": [{name, watched, minutes, pic}...], "missing": [...]}
 EPISODE_PICS = None     # Kura sets this: [(key, kind, data)] -> pictures arrive later through PlayerView.episode_image
 COVER = None            # Kura sets this: playlist item -> the show's cover (QImage) or None
+STREAM = None           # Kura sets this: playlist item with "stream" -> its torrent's state (stream.Stream.status())
+RELEASE = None          # Kura sets this: (AniList id, episode, search) -> ("found", "SubsPlease 1080p") /
+                        # ("looking", None) / ("none", None) for an episode that isn't on disk (Watch streams it)
 _skip_lock = threading.Lock()
 _skip_store = None
 SKIP_NAMES = {"op": "Opening", "mixed-op": "Opening", "ed": "Ending", "mixed-ed": "Ending", "recap": "Recap"}
@@ -172,6 +175,9 @@ QLabel#time {{ color: #c8ccd6; font-size: 9pt; }}
 QLabel#title {{ font-size: 10.5pt; font-weight: 600; }}
 QLabel#sub {{ color: {MUTED}; font-size: 9pt; }}
 QLabel#osd {{ background: rgba(15,17,21,0.8); border-radius: 10px; padding: 8px 14px; font-size: 11pt; }}
+QPushButton#streamchip {{ color: #f5c66b; background: rgba(245,182,66,0.16); border: 1px solid rgba(245,182,66,0.4);
+                    border-radius: 12px; padding: 3px 10px; font-size: 9pt; font-weight: 600; }}
+QPushButton#streamchip:hover {{ background: rgba(245,182,66,0.26); }}
 QSlider::groove:horizontal {{ height: 4px; background: rgba(255,255,255,0.25); border-radius: 2px; }}
 QSlider::sub-page:horizontal {{ background: {TEXT}; border-radius: 2px; }}
 QSlider::handle:horizontal {{ width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; background: {TEXT}; }}
@@ -357,6 +363,82 @@ class StillWatchingCard(QFrame):
         self.adjustSize()
         self.show()
         self.raise_()
+
+
+def fmt_wait(secs):
+    if secs is None:
+        return ""
+    if secs < 60:
+        return f"about {max(5, int(round(secs / 5)) * 5)} s"
+    return f"about {int(round(secs / 60))} min"
+
+
+class StreamCard(QFrame):
+    """Playing a torrent that's still downloading: shown while the player waits for qBittorrent (the torrent's info,
+    the start of the file, or a part you jumped to). Go back returns to where you were before the jump."""
+    go_back = Signal(float)
+    give_up = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("nextup")
+        self.setStyleSheet("QFrame#nextup { background: rgba(18,20,26,0.92); border: 1px solid rgba(255,255,255,0.14);"
+                           " border-radius: 16px; }")
+        self.setFixedWidth(380)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(24, 20, 24, 20)
+        v.setSpacing(6)
+        k = QLabel("STREAMING")
+        k.setStyleSheet("color: #f5b642; font-size: 8pt; font-weight: 700; background: transparent;")
+        v.addWidget(k)
+        self.title = QLabel("")
+        self.title.setWordWrap(True)
+        self.title.setStyleSheet(f"color: {TEXT}; font-size: 13pt; font-weight: 600; background: transparent;")
+        v.addWidget(self.title)
+        self.sub = QLabel("")
+        self.sub.setWordWrap(True)
+        self.sub.setStyleSheet(f"color: {MUTED}; font-size: 9.5pt; background: transparent;")
+        v.addWidget(self.sub)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(4)
+        self.bar.setStyleSheet("QProgressBar { background: rgba(255,255,255,0.12); border: none; border-radius: 2px; }"
+                               " QProgressBar::chunk { background: #f5b642; border-radius: 2px; }")
+        v.addSpacing(4)
+        v.addWidget(self.bar)
+        v.addSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.back = QPushButton("")
+        self.back.setCursor(Qt.PointingHandCursor)
+        self.back.setFocusPolicy(Qt.NoFocus)
+        self.back.setStyleSheet("QPushButton { background: rgba(255,255,255,0.12); color: white; border: 1px solid"
+                                " rgba(255,255,255,0.16); border-radius: 9px; padding: 7px 14px; }"
+                                " QPushButton:hover { background: rgba(255,255,255,0.2); }")
+        self.back.clicked.connect(lambda: self.go_back.emit(self.back_to))
+        self.stop = QPushButton("Close the player")
+        self.stop.setCursor(Qt.PointingHandCursor)
+        self.stop.setFocusPolicy(Qt.NoFocus)
+        self.stop.setStyleSheet(self.back.styleSheet())
+        self.stop.clicked.connect(self.give_up)
+        row.addWidget(self.back)
+        row.addWidget(self.stop)
+        row.addStretch(1)
+        v.addLayout(row)
+        self.back_to = None
+        self.hide()
+
+    def set(self, title, sub, frac, back_to=None, can_close=False):
+        self.title.setText(title)
+        self.sub.setText(sub)
+        self.bar.setVisible(frac is not None)
+        self.bar.setValue(int(max(0.0, min(1.0, frac or 0)) * 1000))
+        self.back_to = back_to
+        self.back.setText(f"Go back to {fmt_time(back_to)}" if back_to is not None else "")
+        self.back.setVisible(back_to is not None)
+        self.stop.setVisible(can_close)
+        self.adjustSize()
 
 
 class ThumbSeeker(threading.Thread):
@@ -564,8 +646,11 @@ class MpvWidget(QOpenGLWidget):
             self.ctx = None
             self.doneCurrent()
 
+    frames = 0   # frames drawn (the after-a-long-pause heartbeat resets and reports it)
+
     def paintGL(self):
         if self.ctx:
+            self.frames += 1
             r = self.devicePixelRatioF()
             # Don't wait for the frame's display time: this runs on Kura's UI thread, and that wait
             # (mpv's default) left the interface ~38 ms behind on every frame while a video played
@@ -657,6 +742,12 @@ class SeekBar(QWidget):
         t = self._x_to_time(self.hover_x)
         label = next((name for s, e, name in self.marks if s <= t <= e), "")
         text = f"{fmt_time(t)}  ·  {label}" if label else fmt_time(t)
+        st = getattr(self.view, "stream_state", None)
+        if st and not st.get("complete"):   # a torrent still downloading: is this part there yet?
+            frac = t / self.duration
+            if not any(a <= frac < b for a, b in st.get("ranges") or []):
+                eta = st["eta"](frac) if st.get("eta") else None
+                text += "  ·  not downloaded yet" + (f", ready in {fmt_wait(eta)}" if eta else "")
         x = int(max(0, min(self.width() - 80, self.hover_x - 40)))
         self.view.hover_label(text, self.mapTo(self.view, QPointF(x, 0).toPoint()), 0)
         self.view.hover_thumb(t, self.mapTo(self.view, QPointF(self.hover_x, 0).toPoint()))
@@ -670,8 +761,14 @@ class SeekBar(QWidget):
         y = self.height() / 2 - h / 2
         track = QRectF(6, y, w, h)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, 60))
+        st = getattr(self.view, "stream_state", None)
+        streaming = bool(st and not st.get("complete"))
+        p.setBrush(QColor(255, 255, 255, 30 if streaming else 60))
         p.drawRoundedRect(track, h / 2, h / 2)
+        if streaming:   # what qBittorrent has downloaded so far: you can jump anywhere in it
+            p.setBrush(QColor(255, 255, 255, 85))
+            for a, b in st.get("ranges") or []:
+                p.drawRect(QRectF(6 + w * a, y, max(1.5, w * (b - a)), h))
         if self.duration:
             for start, end, _ in self.marks:   # opening / ending
                 x1, x2 = 6 + w * start / self.duration, 6 + w * min(end, self.duration) / self.duration
@@ -832,7 +929,7 @@ class EpisodeRow(QWidget):
             f.setPixelSize(12)
             f.setWeight(QFont.DemiBold)
             p.setFont(f)
-            p.drawText(thumb, Qt.AlignCenter, "Find")
+            p.drawText(thumb, Qt.AlignCenter, "Watch")
         else:
             g = QLinearGradient(thumb.topLeft(), thumb.bottomRight())
             g.setColorAt(0, QColor("#2c3448"))
@@ -2671,6 +2768,7 @@ class PlayerView(QWidget):
     find_episode = Signal(int, float)   # a missing episode clicked in the episode list: AniList id, episode
     title_changed = Signal(str)
     marks_ready = Signal(str, list)
+    keep_toggled = Signal(str, bool)   # a stream (Kura's engine): keep the episode (stream token, keep)
 
     def __init__(self, mpv_mod, settings, save_settings, state_file, mal_lookup=None):
         super().__init__(None)
@@ -2786,6 +2884,16 @@ class PlayerView(QWidget):
         right.setSpacing(2)
         right.addSpacing(10)
         right.addStretch(1)
+        # a torrent playing while it downloads: how far along it is; with Kura's engine also whether you keep it
+        # (a click switches: kept = filed into your library, else deleted once you stop watching)
+        self.stream_chip = QPushButton("")
+        self.stream_chip.setObjectName("streamchip")
+        self.stream_chip.setCursor(Qt.PointingHandCursor)
+        self.stream_chip.clicked.connect(self.toggle_keep)
+        self.stream_chip.setFixedHeight(26)
+        self.stream_chip.hide()
+        right.addWidget(self.stream_chip, 0, Qt.AlignVCenter)
+        right.addSpacing(6)
         self.ep_btn = self._btn(right, "list", "Episodes (E)", self.toggle_episodes)
         self.ep_btn.setText("Episodes")
         self.ep_btn.setObjectName("epbtn")
@@ -2812,7 +2920,7 @@ class PlayerView(QWidget):
         self.long_btn = b3
         # the mini player only keeps the basics
         self.mini_hidden = [b1, b2, b3, self.speed_btn, self.audio_btn, self.sub_btn, self.vol, self.full_btn,
-                            self.subtitle, self.pin_btn, self.ep_btn, self.dur_lbl]
+                            self.subtitle, self.pin_btn, self.ep_btn, self.dur_lbl, self.stream_chip]
         self.ep_panel = EpisodePanel(self)
         self.ep_panel.play.connect(lambda i: (self.note_input(), self.play_index(i)))
         self.ep_panel.find.connect(self.find_episode)
@@ -2825,6 +2933,10 @@ class PlayerView(QWidget):
         self.still_card = StillWatchingCard(self)
         self.still_card.keep_going.connect(lambda: (self.note_input(), self.step_episode(1)))
         self.still_card.done.connect(self.close_requested)
+        self.stream_card = StreamCard(self)
+        self.stream_card.go_back.connect(lambda t: (self.note_input(), self.on_seek(t, True)))
+        self.stream_card.give_up.connect(self.close_requested)
+        self.stream_state, self.stream_polled, self.seek_from = None, 0, None
         self.thumb = QLabel(self)   # the frame above the seek bar while hovering it
         self.thumb.setObjectName("seekthumb")
         self.thumb.hide()
@@ -2955,6 +3067,7 @@ class PlayerView(QWidget):
         self.vol.setVisible(w >= 880)
         self.speed_btn.setVisible(w >= 760)
         self.ep_btn.setText("Episodes" if w >= 820 else "")
+        self.stream_chip.setVisible(bool(self.stream_chip.text()) and w >= 980)
         self.title.setVisible(w >= 700)
         self.subtitle.setVisible(w >= 700)
 
@@ -2996,11 +3109,9 @@ class PlayerView(QWidget):
         self.ep_last_index = self.index
         self.ep_panel.set_sections(out, key)
 
-    def episode_sections(self, scroll=False):
-        """[{key, name, rows}] by season: the playlist plus the aired episodes you don't have (the episode list
-        and TV mode's row)."""
+    def ensure_ep_info(self, again=False):
         first = self.playlist[0]["path"] if self.playlist else None
-        if self.ep_info_for != (first, len(self.playlist)) or scroll:
+        if self.ep_info_for != (first, len(self.playlist)) or again:
             self.ep_info = None
             if EPISODE_INFO is not None:
                 try:
@@ -3010,7 +3121,49 @@ class PlayerView(QWidget):
             if self.ep_info_for is not None and self.ep_info_for[0] != first:
                 self.ep_panel.pics = {}
             self.ep_info_for = (first, len(self.playlist))
-        info = self.ep_info or {}
+        return self.ep_info or {}
+
+    def release_state(self, mid, ep, search=True):
+        """What Watch would do for an episode you don't have: ("found", label) / ("looking", None) / ("none", None)."""
+        if RELEASE is None or mid is None:
+            return ("none", None)
+        try:
+            return RELEASE(mid, ep, search)
+        except Exception:
+            return ("none", None)
+
+    def next_missing(self):
+        """The episode after this one when it aired but isn't on disk (Up next streams it), else None."""
+        cur = self.current
+        if not cur or cur.get("mid") is None or not isinstance(cur.get("episode"), (int, float)) or cur.get("live"):
+            return None
+        want = cur["episode"] + 1
+        return next((m for m in self.ensure_ep_info().get("missing") or []
+                     if m["mid"] == cur["mid"] and m["episode"] == want), None)
+
+    def prefetch_next_missing(self):
+        nm = self.next_missing() if self.current and self.settings.get("player_autonext", True) else None
+        if nm is not None:
+            self.release_state(nm["mid"], nm["episode"], search=True)
+
+    def releases_changed(self):
+        """Kura found (or didn't) a release for an episode: the list's notes and Up next say so."""
+        self.refresh_episodes()
+        nm = getattr(self, "pending_missing", None)
+        if nm and self.next_card.isVisible():
+            self.next_card.sub.setText(self.missing_up_next_text(*nm))
+
+    def missing_up_next_text(self, mid, ep):
+        kind, label = self.release_state(mid, ep)
+        ep_txt = f"{ep:g}" if isinstance(ep, float) else str(ep)
+        return (f"Episode {ep_txt}  ·  streams {label}" if kind == "found" else
+                f"Episode {ep_txt}  ·  looking for a torrent…" if kind == "looking" else
+                f"Episode {ep_txt}  ·  not downloaded")
+
+    def episode_sections(self, scroll=False):
+        """[{key, name, rows}] by season: the playlist plus the aired episodes you don't have (the episode list
+        and TV mode's row)."""
+        info = self.ensure_ep_info(again=scroll)
         extra = info.get("items") or []
         resume = self._resume_state()
         nxt = self.next_index()
@@ -3061,12 +3214,26 @@ class PlayerView(QWidget):
                 "note": note, "note_color": color, "prog": prog if state != "seen" else 0, "ep": ep,
                 "index": i, "pic": ex.get("pic"), "pic_key": item["path"],
                 "sort": float(item.get("recap") or ep or 0)})
+        cur = self.current or {}
+        after = [m for m in info.get("missing") or [] if m["mid"] == cur.get("mid")
+                 and isinstance(cur.get("episode"), (int, float)) and m["episode"] > cur["episode"]]
+        near = {(m["mid"], m["episode"]) for m in sorted(after, key=lambda m: m["episode"])[:3]}   # looked up now
+        up_next = nxt is None and self.settings.get("player_autonext", True)
         for m in info.get("missing") or []:
             ep = m["episode"]
             ep_txt = f"{ep:g}" if isinstance(ep, float) else str(ep)
+            kind, label = self.release_state(m["mid"], ep, search=(m["mid"], ep) in near)
+            first = up_next and isinstance(cur.get("episode"), (int, float)) and m["mid"] == cur.get("mid") \
+                and ep == cur["episode"] + 1
+            if kind == "found":
+                note, color = (f"Up next  ·  will stream {label}" if first else f"Torrent found  ·  {label}"), "#f5c66b"
+            elif kind == "looking":
+                note, color = "Looking for a torrent…", "#8a92a6"
+            else:
+                note, color = "Not downloaded  ·  Watch", "#8a92a6"
             section(m.get("season"))["rows"].append({
                 "state": "missing", "num": f"EPISODE {ep_txt}", "title": m.get("name") or f"Episode {ep_txt}",
-                "note": "Not downloaded  ·  Find", "note_color": "#8a92a6", "prog": 0, "ep": ep,
+                "note": note, "note_color": color, "prog": 0, "ep": ep,
                 "find": (m["mid"], float(ep)), "pic": None, "pic_key": None, "sort": float(ep)})
         out = []
         for key in sorted(sections):
@@ -3101,7 +3268,8 @@ class PlayerView(QWidget):
 
     def hover_thumb(self, t, pos):
         """The frame at the time under the mouse, above the seek bar (asked from a hidden mpv)."""
-        if t is None or not self.current or not self.settings.get("player_seek_thumbs", True):
+        if t is None or not self.current or not self.settings.get("player_seek_thumbs", True) \
+                or self.stream_incomplete():   # a second reader would wait on the holes too
             self.thumb.hide()
             self.thumb_time = None
             return
@@ -3194,6 +3362,8 @@ class PlayerView(QWidget):
         return (p.x() - 14) if p is not None and p.isVisible() else self.width() - 28
 
     def place_floating(self):
+        if getattr(self, "stream_card", None) is not None and self.stream_card.isVisible():
+            self.place_stream_card()
         p = getattr(self, "ep_panel", None)
         if p is not None and p.isVisible():
             top = self.top.height() - 8
@@ -3400,7 +3570,17 @@ class PlayerView(QWidget):
         self.tracks_applied = None
         self.thumb_cache = {}
         self.mpv.pause = False
-        self.mpv.play(self.current["path"])
+        self.stream_state, self.stream_polled, self.seek_from, self.stream_pos = None, 0, None, None
+        self.pending_missing = None
+        if self.next_index() is None:   # the last one you have: look up the next episode now, for Up next
+            QTimer.singleShot(4000, self.prefetch_next_missing)
+        self.stream_card.hide()
+        self.stream_chip.setText("")
+        if self.current.get("stream"):   # a torrent still downloading: wait for qBittorrent as long as it takes
+            self.mpv.loadfile(self.current["path"], network_timeout="0")
+            self.update_stream()
+        else:
+            self.mpv.play(self.current["path"])
         # mpv pauses itself at the end of a file (keep-open) and ignores "unpause" while it's still there:
         # unpause again once the new file is playing, or the next episode opened paused
         self.force_play = True
@@ -3472,6 +3652,8 @@ class PlayerView(QWidget):
             return
         if not self.current:
             return
+        if self.current.get("stream"):
+            self.update_stream()
         try:
             pos, dur, paused = self.mpv.time_pos, self.mpv.duration, self.mpv.pause
         except Exception:
@@ -3530,7 +3712,13 @@ class PlayerView(QWidget):
                 self.save_resume(dur, dur)
                 self.progress.emit({**self.current, "pos": dur, "duration": dur, "paused": False})
                 nxt_i = self.next_index()
-                if self.settings.get("player_autonext", True) and nxt_i is not None:
+                nm = self.next_missing() if nxt_i is None and self.settings.get("player_autonext", True) else None
+                if nm is not None and not self.tv:   # the next episode aired but isn't on disk: Up next streams it
+                    self.pending_missing = (nm["mid"], nm["episode"])
+                    self.next_card.start(self.current.get("title") or "", self.missing_up_next_text(*self.pending_missing))
+                    self.place_floating()
+                    self.show_controls()
+                elif self.settings.get("player_autonext", True) and nxt_i is not None:
                     limit = int(self.settings.get("player_still_watching", 3) or 0)
                     if limit and self.auto_streak >= limit:   # nobody's touched anything for a while
                         self.still_card.ask(self.current.get("title") or "", self.auto_streak)
@@ -3547,6 +3735,125 @@ class PlayerView(QWidget):
                         self.next_card.start(nxt.get("title") or Path(nxt["path"]).stem, sub)
                         self.place_floating()
                         self.show_controls()
+
+    # ---- a torrent playing while qBittorrent downloads it
+    def stream_incomplete(self):
+        st = self.stream_state if self.current and self.current.get("stream") else None
+        return bool(st and not st.get("complete"))
+
+    def update_stream(self):
+        """The seek bar's downloaded parts, the dock's chip and the waiting card, twice a second."""
+        item = self.current
+        if not item or not item.get("stream") or STREAM is None:
+            return
+        now = time.time()
+        if now - self.stream_polled < 0.5 and self.stream_state is not None:
+            return
+        self.stream_polled = now
+        try:   # where you are, as a fraction: the engine only focuses when the download edge is close to it
+            pos, dur = self.mpv.time_pos, self.mpv.duration
+            st = STREAM(item, (pos / dur) if pos is not None and dur else None)
+        except Exception:
+            st = None
+        self.stream_state = st
+        if not st:
+            return
+        mb = 1048576
+        speed = f" · {st['speed'] / mb:.1f} MB/s" if st.get("speed") else ""
+        if "keep" in st:   # Kura's engine: kept or deleted after, and the chip switches it
+            keep = "Keeping it" if st["keep"] else "Deleted after"
+            chip = f"Downloaded  ·  {keep}" if st["complete"] else \
+                f"Streaming · {int(st['done'] * 100)}%{speed}  ·  {keep}"
+            tip = ("Kept: it's filed into your library. Click to delete it once you stop watching instead."
+                   if st["keep"] else "Deleted once you stop watching. Click to keep it in your library.")
+        else:
+            chip = "" if st["complete"] else f"Streaming · {int(st['done'] * 100)}%{speed}"
+            tip = "Playing while qBittorrent downloads it. It's filed into your library when done."
+        if chip != self.stream_chip.text():
+            self.stream_chip.setText(chip)
+            self.stream_chip.setToolTip(tip)
+            self.fit_dock()
+        self.seekbar.update()
+        try:
+            dur, pos, paused = self.mpv.duration, self.mpv.time_pos, bool(self.mpv.pause)
+            waiting, eof = bool(self.mpv.paused_for_cache), bool(self.mpv.eof_reached)
+        except Exception:
+            dur, pos, paused, waiting, eof = None, None, True, False, False
+        # a jump past what's downloaded doesn't show as buffering: mpv sits in the seek, the position frozen
+        last = getattr(self, "stream_pos", None)
+        playing_on = bool(pos is not None and last and last[0] is not None and 0.05 < pos - last[0] < 2.0)   # not a jump
+        if pos is None or last is None or last[0] is None or abs(pos - last[0]) > 0.05 or paused:
+            self.stream_pos = (pos, now)
+        elif not eof and now - last[1] > 1.2:
+            waiting = True
+        title, sub, frac, back, can_close = None, "", None, None, False
+        if st["phase"] == "error":
+            title, sub, can_close = "Can't play this torrent", st.get("error") or "", True
+        elif not dur:   # still opening
+            can_close = True
+            if st["phase"] in ("starting", "metadata"):
+                seeds = st.get("seeds") or 0
+                title = "Getting the torrent's info"
+                sub = f"Asking {seeds} peer{'s' if seeds != 1 else ''} for the file list…" if seeds else \
+                    "Looking for peers…"
+            elif not st.get("first_done") and st.get("done", 0) > 0.02:
+                # later parts arrive, the first piece doesn't: the peers sending fast don't have it (a big piece, few
+                # seeds). qBittorrent can't be told to fetch one piece now; say so instead of "0 of 12 MB · 46 MB/s"
+                seeds, piece = st.get("seeds") or 0, (st.get("piece") or 0) / mb
+                title = "Waiting for the first piece"
+                sub = (f"The first {piece:.0f} MB piece hasn't come yet: the peers sending fast don't have it"
+                       f" ({seeds} seed{'s' if seeds != 1 else ''}). Releases with more seeders start sooner.")
+                frac = None
+            else:
+                need = max(1, st.get("need") or 1)
+                title = "Downloading the start"
+                sub = f"{min(st['start'], need) / mb:.0f} of {need / mb:.0f} MB{speed}"
+                frac = min(1.0, st["start"] / need)
+        elif waiting and not st["complete"] and pos is not None:
+            title = "Downloading this part"
+            if "keep" in st:   # Kura's engine fetches the part you're at first (its estimate assumes in-order)
+                sub = "Kura is fetching this part first." if st.get("speed") else "Waiting for peers."
+            else:
+                eta = st["eta"](pos / dur) if st.get("eta") else None
+                sub = (f"Ready in {fmt_wait(eta)}. " if eta else "Waiting for peers. ") + \
+                    "qBittorrent downloads in order, so the parts before it come first."
+            if self.seek_from is not None and abs(self.seek_from - pos) > 5:
+                back = self.seek_from
+        if title:
+            self.stream_card.set(title, sub, frac, back, can_close)
+            self.place_stream_card()
+            self.stream_card.show()
+            self.stream_card.raise_()
+        else:
+            self.stream_card.hide()
+            if playing_on and not waiting:
+                self.seek_from = None   # playing again: the next jump starts from here
+
+    def place_stream_card(self):
+        c = self.stream_card
+        if c.isVisible() or c.title.text():
+            right = self.right_edge() if hasattr(self, "ep_panel") else self.width()
+            c.move(max(12, (right - c.width()) // 2), max(70, (self.height() - c.height()) // 2 - 40))
+
+    def toggle_keep(self):
+        """The streaming chip / ⋯ menu: keep this streamed episode (filed into your library) or not (deleted)."""
+        st = self.stream_state
+        if not self.current or not st or "keep" not in st:
+            return
+        on = not st["keep"]
+        self.keep_toggled.emit(self.current["stream"], on)
+        st["keep"] = on
+        self.stream_polled = 0   # the chip says so at once
+        self.update_stream()
+        self.show_osd("Keeping this episode: it's filed into your library" if on
+                      else "Not keeping it: deleted once you stop watching")
+
+    def stream_only_once_done(self):
+        """Clips, contact sheets and the file's folder need the whole file."""
+        if self.stream_incomplete():
+            self.show_osd("Available once the episode has downloaded")
+            return True
+        return False
 
     def current_mark(self, pos):
         return next(((s, e, name) for s, e, name in self.marks if pos is not None and s <= pos < e - 1), None)
@@ -3603,6 +3910,11 @@ class PlayerView(QWidget):
         (final=True, exact). Never waits for mpv, and skips positions it can't keep up with."""
         if self.live and self.live.get("prog"):   # Live TV: back in time yes, past live no
             t = min(t, time.time() - self.live["prog"]["start"])
+        if self.current and self.current.get("stream") and self.seek_from is None:
+            try:   # where you were, for "Go back to" if this jump lands past what's downloaded
+                self.seek_from = float(self.mpv.time_pos or 0)
+            except (TypeError, ValueError):
+                pass
         self.seek_hold = (t, time.time() + 3)
         self.seek_pending = (t, final)
         self.set_times(t, self.seekbar.duration)
@@ -3650,6 +3962,10 @@ class PlayerView(QWidget):
             self.auto_streak += 1
         else:
             self.note_input()
+        nm, self.pending_missing = getattr(self, "pending_missing", None), None
+        if nm and self.next_index() is None:   # not on disk: Kura finds it and streams it here
+            self.find_episode.emit(nm[0], float(nm[1]))
+            return
         self.step_episode(1)
 
     def step_episode(self, delta):
@@ -3922,7 +4238,7 @@ class PlayerView(QWidget):
                           bool(t.get("selected"))))
         if not items:
             items.append(("No tracks", None, None))
-        if kind == "sub" and self.current:
+        if kind == "sub" and self.current and not self.current.get("stream"):
             items.append(("Find subtitles…", lambda: self.find_subs.emit(self.current["path"]), None))
         self.open_menu(items, self.audio_btn if kind == "audio" else self.sub_btn)
 
@@ -4000,6 +4316,9 @@ class PlayerView(QWidget):
             ("Contact sheet of this episode", self.contact_sheet, None),
             None,
             ("Show file in folder", self.reveal, None),
+            *([None, ("Keep this episode", self.toggle_keep, bool(self.stream_state.get("keep")))]
+              if self.stream_state and "keep" in self.stream_state and self.current and self.current.get("stream")
+              else []),
         ], self.more_btn)
 
     def go_to_time(self):
@@ -4020,6 +4339,9 @@ class PlayerView(QWidget):
         self.show_osd(f"Subtitle delay {self.mpv.sub_delay:+.1f} s")
 
     def reveal(self):
+        if self.current and self.current.get("stream"):
+            self.show_osd("It's in qBittorrent's download folder until it's filed into your library")
+            return
         if self.current and os.name == "nt":
             import subprocess
             subprocess.Popen(["explorer", "/select,", self.current["path"]])
@@ -4432,7 +4754,7 @@ class PlayerView(QWidget):
             QApplication.clipboard().setImage(preview)
 
     def open_clip_bar(self):
-        if not self.current or self.mode == "mini":
+        if not self.current or self.mode == "mini" or self.stream_only_once_done():
             return
         self.clip_bar.open()
         self.place_floating()
@@ -4458,7 +4780,7 @@ class PlayerView(QWidget):
             pass
 
     def clip_last(self):
-        if not self.current:
+        if not self.current or self.stream_only_once_done():
             return
         pos = float(self.mpv.time_pos or 0)
         secs = float(capture.opt(self.settings, "replay_secs"))
@@ -4529,7 +4851,7 @@ class PlayerView(QWidget):
         self.next_clip()
 
     def contact_sheet(self):
-        if not self.current:
+        if not self.current or self.stream_only_once_done():
             return
         if not capture.subs.ffmpeg_installed():
             self.show_osd("Contact sheets need FFmpeg: Settings → Captures → Install FFmpeg")

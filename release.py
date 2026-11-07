@@ -92,6 +92,8 @@ def main():
     app_files += [(f, f"fonts/{f.name}") for f in sorted((HERE / "fonts").iterdir()) if f.is_file()]
     app_files += [(HERE / n, n) for n in updater.SCRIPTS]
     app_files += [(HERE / "LICENSE", "LICENSE")]   # GPL-3.0: the license ships with every copy
+    # bundled projects whose license asks for its text with every copy (libtorrent, BSD-3-Clause)
+    app_files += [(f, f"licenses/{f.name}") for f in sorted((HERE / "licenses").glob("*.txt"))]
     app = zip_files(OUT / f"Kura-{version}.zip", app_files)
     app["url"] = base + app["name"]
 

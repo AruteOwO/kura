@@ -49,6 +49,7 @@ Source: "{#SourceDir}\kura_runtime\*"; DestDir: "{app}\kura_runtime"; Flags: ign
 Source: "{#SourceDir}\fonts\*"; DestDir: "{app}\fonts"; Flags: ignoreversion
 Source: "{#SourceDir}\anime_organizer.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
 ; the release installed here: the updater reads which organizer script it put down
 Source: "{#Manifest}"; DestDir: "{app}"; DestName: "kura_installed.json"; Flags: ignoreversion
 

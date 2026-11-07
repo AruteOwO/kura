@@ -825,13 +825,71 @@ class QBit:
         except QBitError:
             pass   # 409: it exists already
 
-    def add(self, urls, save_path=""):
+    def add(self, urls, save_path="", stream=False):
+        """stream: download in order, the first and last pieces of each file first (Play now)."""
         self.ensure_category()
         data = {"urls": "\n".join(urls), "category": self.CATEGORY}
         if save_path:
             data["savepath"] = save_path
+        if stream:
+            data.update(sequentialDownload="true", firstLastPiecePrio="true")
         if self.call("torrents/add", data).strip() == "Fails.":
             raise QBitError("qBittorrent couldn't add the torrent")
+
+    def add_file(self, data, save_path="", name="kura.torrent"):
+        """A .torrent's bytes (Kura's engine hands a stream over): qBittorrent checks what's already on disk in
+        save_path, then seeds it or downloads the rest."""
+        import uuid
+        self.ensure_category()
+        if not self.logged_in:
+            self.login()
+        boundary = uuid.uuid4().hex
+        parts = []
+        for k, v in (("category", self.CATEGORY), ("savepath", save_path), ("sequentialDownload", "false")):
+            if v:
+                parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="{name}"\r\n'
+                     f'Content-Type: application/x-bittorrent\r\n\r\n'.encode() + data + b"\r\n")
+        body = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(self.url + "/api/v2/torrents/add", data=body, headers={
+            "Referer": self.url, "Origin": self.url, "User-Agent": org.USER_AGENT,
+            "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with self.opener.open(req, timeout=20) as resp:
+                answer = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            raise QBitError(f"qBittorrent answered {e.code}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise QBitOffline(f"Can't reach qBittorrent's Web UI at {self.url}") from e
+        if answer.strip() == "Fails.":
+            raise QBitError("qBittorrent couldn't add the torrent")
+
+    def info(self, h):
+        """One torrent's fields (any category), or None when qBittorrent doesn't have it."""
+        found = json.loads(self.call("torrents/info", {"hashes": h}) or "[]")
+        return found[0] if found else None
+
+    def properties(self, h):
+        return json.loads(self.call("torrents/properties", {"hash": h}) or "{}")
+
+    def piece_states(self, h):
+        """One number per piece: 0 not downloaded, 1 downloading, 2 downloaded."""
+        return json.loads(self.call("torrents/pieceStates", {"hash": h}) or "[]")
+
+    def set_sequential(self, h, on):
+        t = self.info(h)
+        if t is not None and bool(t.get("seq_dl")) != on:
+            self.call("torrents/toggleSequentialDownload", {"hashes": h})
+
+    def make_streamable(self, t):
+        """A torrent already in qBittorrent (t = its info): in order, first/last pieces first, running."""
+        h = t["hash"]
+        if not t.get("seq_dl"):
+            self.call("torrents/toggleSequentialDownload", {"hashes": h})
+        if not t.get("f_l_piece_prio"):
+            self.call("torrents/toggleFirstLastPiecePrio", {"hashes": h})
+        if t.get("state") in ("pausedDL", "stoppedDL"):
+            self.resume([h])
 
     def _either(self, new, old, hashes):
         """qBittorrent 5 renamed pause/resume to stop/start."""
@@ -861,7 +919,7 @@ class QBit:
         return files
 
     def file_priority(self, h, indexes, priority):
-        """0 = don't download, 1 = normal."""
+        """0 = don't download, 1 = normal, 6 = high, 7 = maximal."""
         if indexes:
             self.call("torrents/filePrio", {"hash": h, "id": "|".join(str(i) for i in indexes),
                                              "priority": str(priority)})

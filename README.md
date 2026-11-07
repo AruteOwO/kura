@@ -14,9 +14,10 @@
   <a href="#run-from-source"><b>Run from source</b></a>
 </p>
 
-Kura is a Windows desktop app for a self-hosted anime library. It finds new episodes, has qBittorrent download them,
-sorts them into a tidy library (show and season folders, AniList names, folder icons), keeps your AniList list in sync,
-and plays everything in its own player. Jellyfin can stream the same library.
+Kura is a Windows desktop app for a self-hosted anime library. It finds new episodes, has qBittorrent download them
+(or plays a torrent right away while it downloads), sorts them into a tidy library (show and season folders, AniList
+names, folder icons), keeps your AniList list in sync, and plays everything in its own player. Jellyfin can stream the
+same library.
 
 ## Features
 
@@ -33,6 +34,10 @@ and plays everything in its own player. Jellyfin can stream the same library.
 
 - **Downloads on their own**: new episodes of the shows you're watching are picked from release feeds by your own
   filters and sent to qBittorrent; search several sites at once for anything missing.
+- **Play now**: watch an episode straight from a torrent while it downloads, in Kura's own player. When it's done,
+  keep it (it's filed into your library) or let Kura delete it.
+- **Browse**: find something new by mood, see what's trending, get a surprise pick, or see what's ready to stream
+  right now. Shows from series you've already started stay out of the way.
 - **The organizer**: finished downloads are renamed after AniList and filed into show and season folders, with
   folder icons. It also runs on its own from qBittorrent (`pyw anime_organizer.py "%F"`).
 - **A player made for anime**: mpv inside, skip openings, endings and recaps, subtitles from several sources,
@@ -66,7 +71,7 @@ into a `kura_runtime` subfolder) and run `Kura.exe`.
 
 Windows 10/11, Python 3.12+.
 
-    pip install PySide6 anitopy pillow mpv pefile winrt-Windows.Media.Ocr winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Globalization winrt-Windows.Foundation.Collections
+    pip install PySide6 anitopy pillow mpv pefile libtorrent==2.1.1 winrt-Windows.Media.Ocr winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Globalization winrt-Windows.Foundation.Collections
     pythonw kura.pyw
 
 The built-in player needs `libmpv-2.dll` in an `mpv` folder next to `kura.pyw` (from an mpv Windows build, e.g.
@@ -89,6 +94,8 @@ Kura is free software under the **GNU General Public License v3.0**: see [LICENS
 share and change it; if you share a changed version, it has to stay under the GPL with its source available.
 
 The release bundles other projects under their own licenses: mpv / libmpv and FFmpeg (GPL / LGPL), Qt for Python
-(PySide6, LGPL v3, kept as separate replaceable libraries in `kura_runtime`) and yt-dlp (Unlicense).
+(PySide6, LGPL v3, kept as separate replaceable libraries in `kura_runtime`), yt-dlp (Unlicense) and libtorrent
+(BSD-3-Clause, Copyright (c) 2003-2020 Arvid Norberg; its full license is in [licenses/libtorrent.txt](licenses/libtorrent.txt)
+and ships with every release).
 
 Screenshots show a demo AniList list. Anime titles and artwork belong to their respective owners.

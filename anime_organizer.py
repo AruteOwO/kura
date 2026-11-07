@@ -38,6 +38,7 @@ import re
 import shutil
 import sys
 import threading
+import unicodedata
 import time
 import urllib.error
 import urllib.request
@@ -158,6 +159,19 @@ HINTS_FILE = SCRIPT_DIR / "organizer_hints.json"
 HINTS = {}
 
 
+STREAM_HOLDS_FILE = SCRIPT_DIR / "stream_holds.json"   # Kura: batches streaming one episode (see stream.py)
+
+
+def streaming_holds():
+    """The torrent folders Kura is streaming one episode of (normcased): left alone until Kura lets go."""
+    try:
+        data = json.loads(STREAM_HOLDS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {os.path.normcase(os.path.abspath(p)) for v in data.values() if isinstance(v, dict)
+            for p in v.get("paths") or [] if p}
+
+
 def load_hints():
     try:
         data = json.loads(HINTS_FILE.read_text(encoding="utf-8"))
@@ -170,10 +184,25 @@ def load_hints():
 
 def hint_for(video):
     """The show Kura downloaded this file for: by the file's name, or a folder it came in (a batch's torrent)."""
-    for name in (video.name, video.stem, *(p.name for p in list(video.parents)[:3])):
+    # up to 6 folders: a batch's "TV/Extras/No Credits/Ending v1.mkv" is 4 below the torrent's folder
+    names = (video.name, video.stem, *(p.name for p in list(video.parents)[:6]))
+    for name in names:
         mid = HINTS.get(name.lower())
         if mid:
             return mid
+    # spelled a little differently on disk than the torrent's name (the feed's "Gakkou Gurashi! (School-Live!) ...
+    # (Gakkougurashi!)" made a folder "Gakkou Gurashi (School-Live!) ..."): punctuation and case aside, one starts
+    # with the other (long names only, so a short one can't match by chance)
+    def plain(s):
+        return " ".join(re.findall(r"[a-z0-9]+", s.lower()))
+    keys = [(plain(k), v) for k, v in HINTS.items()]
+    for name in names:
+        p = plain(name)
+        if len(p) < 20:
+            continue
+        hits = {v for k, v in keys if len(k) >= 20 and (k.startswith(p) or p.startswith(k))}
+        if len(hits) == 1:
+            return hits.pop()
     return None
 
 
@@ -333,12 +362,14 @@ def extra_kind_of(path, show_dir=None):
 
 
 def pick_subfolder(season, types, is_movie):
+    # an OVA's opening / menu is an extra (Extras), not an OVA episode: checked before OVAs / Specials (an OVA
+    # entry's extras got "OVA" added from AniList's format and landed in OVAs)
+    if types & {"NCOP", "NCED", "OP", "ED", "OPENING", "ENDING", "PV", "PREVIEW", "CM", "EXTRA"}:
+        return EXTRAS_FOLDER
     if types & {"OVA", "OAD", "OAV"}:
         return "OVAs"
     if types & {"SPECIAL", "SPECIALS", "SP"} or season == 0:   # "S00E02" = a special, not season 1
         return "Specials"
-    if types & {"NCOP", "NCED", "OP", "ED", "OPENING", "ENDING", "PV", "PREVIEW", "CM", "EXTRA"}:
-        return EXTRAS_FOLDER
     if is_movie:
         return "Movies"
     return f"Season {season or 1}"
@@ -366,29 +397,55 @@ ANILIST_PER_MINUTE = 28
 # A title AniList can't find isn't searched again for this many days
 MISS_RETRY_DAYS = 3
 
-_rate_lock = threading.Lock()
+_rate_cond = threading.Condition()
 _last_request = 0.0
+_blocked_until = 0.0   # after a 429 every request waits, not just the one that got it
+_waiting = 0           # normal requests waiting for their turn
+LOW_MAX_WAIT = 90      # a low-priority request goes anyway after this long (never starved for good)
 
 
-def _throttle():
+def _throttle(low=False):
     """Wait until the next request is allowed. Thread-safe, so the GUI and a
-    running job share one budget."""
-    global _last_request
-    with _rate_lock:
-        wait = _last_request + 60 / ANILIST_PER_MINUTE - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        _last_request = time.monotonic()
+    running job share one budget. `low` (Kura's Browse page) lets every waiting
+    normal request go first: syncing your list, Home and the show you clicked."""
+    global _last_request, _waiting
+    give_up = time.monotonic() + LOW_MAX_WAIT
+    with _rate_cond:
+        if not low:
+            _waiting += 1
+        try:
+            while True:
+                now = time.monotonic()
+                if low and _waiting and now < give_up:
+                    _rate_cond.wait(min(0.5, give_up - now))
+                    continue
+                wait = max(_last_request + 60 / ANILIST_PER_MINUTE, _blocked_until) - now
+                if wait <= 0:
+                    break
+                _rate_cond.wait(wait)   # lets others in meanwhile; whoever is first when it's time goes
+            _last_request = time.monotonic()
+        finally:
+            if not low:
+                _waiting -= 1
+            _rate_cond.notify_all()
+
+
+def rate_limited(retry_after):
+    """AniList said 429: hold every request (all threads) for `retry_after` seconds."""
+    global _blocked_until
+    with _rate_cond:
+        _blocked_until = max(_blocked_until, time.monotonic() + retry_after)
+        _rate_cond.notify_all()
 MEDIA_FIELDS = "id format isAdult title { romaji english } coverImage { extraLarge large }"
 QUERY_SEARCH = ("query ($search: String) { Page(perPage: 8) { media(search: $search, type: ANIME) { "
                 + MEDIA_FIELDS + " synonyms } } }")
 QUERY_ID = "query ($id: Int) { Media(id: $id, type: ANIME) { " + MEDIA_FIELDS + " } }"
 
 
-def anilist(query, variables, tries=3):
+def anilist(query, variables, tries=3, low=False):
     body = json.dumps({"query": query, "variables": variables}).encode()
     for _ in range(tries):
-        _throttle()
+        _throttle(low)
         req = urllib.request.Request(ANILIST_URL, data=body, headers={
             "Content-Type": "application/json", "Accept": "application/json",
             "User-Agent": USER_AGENT})
@@ -399,7 +456,7 @@ def anilist(query, variables, tries=3):
             if e.code == 429:  # rate limited (90 requests/minute)
                 wait = int(e.headers.get("Retry-After", 60))
                 log.info(f"  AniList rate limit, waiting {wait}s...")
-                time.sleep(wait)
+                rate_limited(wait)   # the next _throttle waits it out (and holds everyone else too)
                 continue
             if e.code == 404:
                 return None
@@ -472,6 +529,23 @@ def bracket_titles(filename):
     return out
 
 
+NOT_A_TITLE = re.compile(r"(?:tv|ova|oad|movie|uncensored|uncut|censored|complete|season\s*\d+|s\d+|\d{4}|"
+                         r"(?:19|20)\d\d\s*-\s*(?:19|20)?\d\d)", re.IGNORECASE)
+
+
+def two_titles(title):
+    """A name holding the show's two titles, "Gakkou Gurashi (School-Live!)" or "Re Zero [Re:ZERO]": each of them
+    (the bracketed part only when it reads like a title, not "(2019)" / "(Uncensored)" / "[BD 1080p]")."""
+    m = re.fullmatch(r"\s*(.+?)\s*[(\[]([^()\[\]]+)[)\]]\s*", title)
+    if not m:
+        return []
+    out = []
+    for t in (m.group(1).strip(" -"), m.group(2).strip(" -")):
+        if re.search(r"[^\W\d_]{2,}", t) and not NOT_A_TITLE.fullmatch(t) and not TECH_WORD.search(t):
+            out.append(t)
+    return out
+
+
 def search_shorter(title):
     """AniList's search finds nothing when a word is written differently ("Konin" for "Kon'in"): search the first
     words of the title instead, and keep only a result whose title is the same once punctuation is ignored."""
@@ -515,12 +589,14 @@ def other_name(entry):
 
 
 def fetch_by_id(mid, cache):
+    """An entry by AniList id. Asked together with its relations (the same one request, and the season walk that
+    nearly always follows needs them anyway)."""
     key = f"id:{mid}"
     if key not in cache:
-        data = anilist(QUERY_ID, {"id": mid})
-        if not data or not data.get("Media"):
+        info = media_relations(mid, cache)
+        if not info:
             return None
-        cache[key] = to_entry(data["Media"])
+        cache[key] = info["entry"]
     return cache[key]
 
 
@@ -544,6 +620,21 @@ def lookup(title, want_movie, cache):
         media = choose(results, title, want_movie)
         if not media and data is not None and len(title.split()) > 2:
             media = search_shorter(title)
+        bare = "".join(ch for ch in unicodedata.normalize("NFKD", title) if not unicodedata.combining(ch))
+        if not media and data is not None and bare != title:   # AniList finds nothing for "Kämpfer", "Café ...":
+            more = anilist(QUERY_SEARCH, {"search": bare})       # the same name without accents
+            data = more if more is None else data
+            media = choose(((more or {}).get("Page") or {}).get("media") or [], title, want_movie) if more else None
+        if not media and data is not None:   # "Gakkou Gurashi (School-Live!)": each title on its own
+            for part in two_titles(title):
+                more = anilist(QUERY_SEARCH, {"search": part})
+                if more is None:
+                    data = None
+                    break
+                media = choose(((more.get("Page") or {}).get("media") or []), part, want_movie)
+                if media:
+                    log.info(f"  ('{title}' holds two titles: AniList knows '{part}')")
+                    break
         if not media:
             if data is not None:  # a real "no results", not a network error
                 cache[miss_key] = time.time()
@@ -553,27 +644,67 @@ def lookup(title, want_movie, cache):
     return cache[key], None
 
 
-QUERY_RELATIONS = ("query ($id: Int) { Media(id: $id, type: ANIME) { " + MEDIA_FIELDS
-                   + " relations { edges { relationType node { type " + MEDIA_FIELDS + " } } } } }")
 TV_FORMATS = {"TV", "TV_SHORT", "ONA"}
 EXTRA_KINDS = ("OVA", "SPECIAL", "MOVIE")
 
 
 def media_relations(mid, cache):
-    """An entry plus its related anime (prequels, sequels, side stories...)."""
+    """An entry plus its related anime (prequels, sequels, side stories...). A miss asks two steps at once (the
+    entry, its related ones and theirs) plus the entries further along the prequel / sequel chains that the last
+    request saw (`_rel_ahead`): a 6-entry series is 1-2 requests instead of 6 (Nov 2026)."""
     key = f"rel:{mid}"
     if key not in cache:
-        data = anilist(QUERY_RELATIONS, {"id": mid})
-        media = (data or {}).get("Media")
-        if not media:
-            return None
-        rels = []
-        for edge in ((media.get("relations") or {}).get("edges") or []):
+        with _rel_lock:
+            ahead = [i for i in _rel_ahead if f"rel:{i}" not in cache and i != mid]
+        prefetch_relations([mid] + ahead, cache)
+    return cache.get(key)
+
+
+# Two steps of relations per request: AniList sends a third level's lists empty (tested Nov 2026), so only the
+# first two levels are saved; the chain entries seen at the second level are asked next time (_rel_ahead).
+QUERY_RELATIONS_2 = ("query ($ids: [Int]) { Page(perPage: 50) { media(id_in: $ids, type: ANIME) { " + MEDIA_FIELDS
+                     + " relations { edges { relationType node { type " + MEDIA_FIELDS
+                     + " relations { edges { relationType node { type " + MEDIA_FIELDS + " } } } } } } } } }")
+CHAIN_RELATIONS = ("PREQUEL", "SEQUEL")
+_rel_lock = threading.Lock()
+_rel_ahead = set()
+
+
+def _relations_info(media):
+    rels = []
+    for edge in ((media.get("relations") or {}).get("edges") or []):
+        node = edge.get("node") or {}
+        if node.get("type") == "ANIME" and node.get("id"):
+            rels.append([edge.get("relationType"), to_entry(node)])
+    return {"entry": to_entry(media), "relations": rels}
+
+
+def prefetch_relations(ids, cache):
+    """Save "rel:<id>" (and "id:<id>") for these entries and every entry related to them, in one request (50 at
+    most). Entries already saved are skipped."""
+    ids = [i for i in dict.fromkeys(ids) if i and f"rel:{i}" not in cache][:50]
+    if not ids:
+        return
+    data = anilist(QUERY_RELATIONS_2, {"ids": ids})
+    media = ((data or {}).get("Page") or {}).get("media") or []
+    ahead = set()
+    for m in media:
+        cache[f"rel:{m['id']}"] = _relations_info(m)
+        cache.setdefault(f"id:{m['id']}", to_entry(m))
+        for edge in (m.get("relations") or {}).get("edges") or []:
             node = edge.get("node") or {}
-            if node.get("type") == "ANIME" and node.get("id"):
-                rels.append([edge.get("relationType"), to_entry(node)])
-        cache[key] = {"entry": to_entry(media), "relations": rels}
-    return cache[key]
+            if node.get("type") != "ANIME" or not node.get("id") or node.get("relations") is None:
+                continue
+            cache.setdefault(f"rel:{node['id']}", _relations_info(node))   # its related ones came too
+            cache.setdefault(f"id:{node['id']}", to_entry(node))
+            for e2 in node["relations"].get("edges") or []:   # one step further: asked next time
+                n2 = e2.get("node") or {}
+                if (e2.get("relationType") in CHAIN_RELATIONS and n2.get("type") == "ANIME" and n2.get("id")
+                        and f"rel:{n2['id']}" not in cache):
+                    ahead.add(n2["id"])
+    with _rel_lock:
+        _rel_ahead.clear()
+        _rel_ahead.update(ahead)
 
 
 def next_in_chain(info, rel_type):
@@ -825,7 +956,8 @@ UNCUT_WORDS = re.compile(r"uncensored|uncut|hyper ?sexy|director'?s ?cut|extende
                          r"remaster(?:ed)?", re.I)
 CUT_WORDS = re.compile(r"censored|normal|\btv\b|broadcast|\bweb\b|original|standard|regular|theatrical", re.I)
 VERSION_FOLDER_RE = re.compile(r"\b(version|ver|cut|edition)\b|^(uncensored|censored|uncut|tv|bd|blu-?ray|web|"
-                               r"normal|extended|unrated|remastered)$", re.I)
+                               r"normal|extended|unrated|remastered|hyper ?sexy|director'?s ?cut)$", re.I)
+# ("Season 1 - Hyper Sexy" next to "Season 1 - Normal" wasn't paired: Bikini Warriors, Nov 2026)
 # language versions (Tomb Raider King: English / Korean): "English", "Korean (Original)", "English Dub", "Subbed"
 LANGUAGES = r"english|korean|japanese|chinese|mandarin|cantonese|spanish|french|german|portuguese|italian"
 LANGUAGE_FOLDER_RE = re.compile(rf"^(({LANGUAGES})(\s*[-(]?\s*(dub|dubbed|sub|subbed|audio|original)\)?)?|"
@@ -853,23 +985,36 @@ def version_rank(name):
 SEASON_VERSION_RE = re.compile(r"^season\s*0*(\d+)\s*[-\u2013\u2014:]\s*(.+)$", re.I)
 
 
+PLAIN_SEASON_RE = re.compile(r"^season\s*0*(\d+)$", re.I)
+
+
 def season_version(name):
-    """(season, version) for a folder like "Season 1 - Korean" / "Season 1 - Uncensored", else None."""
+    """(season, suffix) for a folder like "Season 1 - Korean" / "Season 1 - Hyper Sexy" / "Season 1 - Thai Fandub",
+    else None. Any suffix: it's only a version when another folder of the same season sits next to it
+    (season_version_groups); alone it's a named season ("Season 2 - The Evil Eye"). It used to need a known word
+    (version / language list), so "Season 1 - Hyper Sexy" didn't pair with "Season 1 - Normal" (user: a show naming
+    it differently, or a language not in the list, mustn't break it; Nov 2026)."""
     m = SEASON_VERSION_RE.match(name.strip())
-    if m and is_version_folder(m.group(2).strip()):
-        return int(m.group(1)), m.group(2).strip()
-    return None
+    return (int(m.group(1)), m.group(2).strip()) if m else None
 
 
 def season_version_groups(show_dir):
     """{season: {version: folder}} for seasons kept as side-by-side folders ("Season 1 - Korean" and
-    "Season 1 - Japanese", the user's Tomb Raider King); only seasons with two or more."""
+    "Season 1 - Japanese", the user's Tomb Raider King); only seasons with two or more. The organizer never makes
+    two folders for one season (season_dir reuses the one there; a split season's parts share it), so two of them
+    are versions whatever they're called; a plain "Season 1" next to "Season 1 - Uncensored" is one too ("Main")."""
     groups = {}
     try:
         for c in Path(show_dir).iterdir():
-            sv = season_version(c.name) if c.is_dir() and not is_link(c) else None
+            if not c.is_dir() or is_link(c):
+                continue
+            sv = season_version(c.name)
             if sv:
                 groups.setdefault(sv[0], {})[sv[1]] = c
+            else:
+                m = PLAIN_SEASON_RE.match(c.name.strip())
+                if m:
+                    groups.setdefault(int(m.group(1)), {})["Main"] = c
     except OSError:
         pass
     return {n: g for n, g in groups.items() if len(g) > 1}
@@ -1585,29 +1730,76 @@ GENERIC_FOLDERS = {"anime", "downloads", "download", "completed", "complete", "t
                    "new", "tv", "videos", "seeding"}
 
 
-def batch_title(video, library):
-    """The show a batch folder is named after ("[Group] Show (BD 1080p)/03 - Episode Title.mkv"): some batches name
-    their files after the episodes. The nearest folder above the file that holds two or more videos and has a
-    title (not "Season 2", not your downloads folder). None otherwise."""
+# "01 - Wonderful Days" / "E01 - ..." / "Episode 3 - ...": a file named after its episode, the number in front
+LEAD_EP_RE = re.compile(r"\s*(?:E|EP|Episode\s*)?(\d{1,3})(?:v\d)?(?!\d)", re.IGNORECASE)
+# Folders inside a batch that say what's in them ("[Group] Show/TV/...", ".../OAD/Extras/No Credits/...")
+KIND_FOLDER_RE = re.compile(r"(?i)^(?:(?P<tv>tv(?:\s+series)?|series)|(?P<ova>ova|oad|oav|ovas|oads)|"
+                            r"(?P<movie>movies?|films?|gekijouban)|(?P<special>specials?|sp))$")
+EXTRA_FOLDER_RE = re.compile(r"(?i)^(?:extras?|bonus(?:es)?|bonus\s+\w+|omake|no\s*credits?|non[- ]?credits?|nc|"
+                             r"creditless|clean|menus?|bd\s+menus?|pvs?|cms?|pvs?\s*(?:&|and)\s*cms?|trailers?|"
+                             r"previews?|promos?|specials?\s+features?|features?)$")
+
+
+def batch_context(video, library):
+    """What the folders above a file in a batch say: (show title, kind, in_extras). A batch can hold a show's TV
+    series AND its OVAs, each with extras ("[ScarletNeko] Kiss x Sis/TV/01 - Wonderful Days.mkv",
+    ".../OAD/Extras/No Credits/Ending v1.mkv", Nov 2026): the title comes from the nearest folder that has a title
+    and two or more videos (not "Season 2", not your downloads folder); kind = "TV" / "OVA" / "MOVIE" / "SPECIAL"
+    from a folder named so on the way up; in_extras = the file sits in an Extras / No Credits / Menu / PVs folder.
+    Up to 6 folders up (it used to stop at 3 and at a folder called "TV")."""
     roots = {os.path.normcase(str(library))}
     try:
         s = json.loads((SCRIPT_DIR / "gui_settings.json").read_text(encoding="utf-8"))
         roots |= {os.path.normcase(str(Path(s[k]))) for k in ("downloads", "library") if s.get(k)}
     except (OSError, ValueError):
         pass
-    for folder in list(video.parents)[:3]:
-        if not folder.name or os.path.normcase(str(folder)) in roots or folder.name.lower() in GENERIC_FOLDERS:
-            return None
-        ftitle = anitopy_parse(folder.name).get("anime_title") or ""
+    kind, extras = None, False
+    for folder in list(video.parents)[:6]:
+        name = folder.name
+        if not name or os.path.normcase(str(folder)) in roots:
+            break
+        k = KIND_FOLDER_RE.match(name.strip())
+        if k:
+            kind = kind or next(g for g, v in k.groupdict().items() if v).upper()
+            continue
+        if EXTRA_FOLDER_RE.match(name.strip()):
+            extras = True
+            continue
+        if name.lower() in GENERIC_FOLDERS:
+            break
+        ftitle = anitopy_parse(name).get("anime_title") or ""
         ftitle = ftitle if isinstance(ftitle, str) else ftitle[0]
-        if not ftitle or SEASON_DIR_RE.fullmatch(folder.name) or generic_title(folder.name):
-            continue   # "Season 2" / "Extras" / "Openings & Endings" inside the batch: look one level up
+        if not ftitle or SEASON_DIR_RE.fullmatch(name) or generic_title(name):
+            continue   # "Season 2" / "Openings & Endings" inside the batch: look one level up
         try:
             videos = sum(1 for f in folder.rglob("*") if f.suffix.lower() in VIDEO_EXTS)
         except OSError:
-            return None
-        return ftitle if videos >= 2 else None
-    return None
+            break
+        # one video is enough below a TV / OVA / Extras folder: that's a batch's layout, and the last file of a
+        # batch is alone once the others moved (Kiss x Sis's PV was left behind, Nov 2026)
+        return (ftitle if videos >= 2 or kind or extras else None), kind, extras
+    return None, kind, extras
+
+
+def batch_title(video, library):
+    """The show a batch folder is named after ("[Group] Show (BD 1080p)/03 - Episode Title.mkv"): some batches name
+    their files after the episodes. None otherwise (batch_context has the details)."""
+    return batch_context(video, library)[0]
+
+
+def tv_entry_for(entry, title, hint, cache):
+    """A batch's "TV" folder, but the name found the OVA ("Kiss x Sis" is the OVA on AniList, the series is
+    "Kiss x Sis (TV)"): the TV entry. The show Kura downloaded it for first, then "<title> (TV)" / "<title> TV",
+    then the one TV series among its relations. None when nothing says."""
+    if hint and hint.get("format") in TV_FORMATS:
+        return hint
+    for name in (f"{title} (TV)", f"{title} TV"):
+        e, _ = lookup(name, False, cache)
+        if e and e.get("format") in TV_FORMATS and title_fits(title, e):
+            return e
+    info = media_relations(entry["id"], cache) or {}
+    tvs = {n["id"]: n for _t, n in info.get("relations") or [] if (n or {}).get("format") in TV_FORMATS and n.get("id")}
+    return next(iter(tvs.values())) if len(tvs) == 1 else None
 
 
 def title_fits(title, entry):
@@ -1666,8 +1858,99 @@ def own_entry(entry, kind, n, cache):
     return None
 
 
+SPECIAL_WORD = re.compile(r"(?<![a-z])(special|specials|sp|ova|oad|oav)(?![a-z])", re.IGNORECASE)
+S00_TOKEN = re.compile(r"S0*0E(\d+)", re.IGNORECASE)
+
+
+def _label_words(text):
+    """Lowercase words, plurals cut ("Specials" = "special")."""
+    return [w[:-1] if len(w) > 3 and w.endswith("s") else w for w in re.findall(r"[a-z0-9]+", text.lower())]
+
+
+def season_zero_place(video, entry, cache):
+    """Where an "S00Exx" file goes. Season 0 is TheTVDB's numbering, not AniList's: Manyu Scroll's S00 has 4
+    specials and 3 picture dramas taking turns (specials at 1, 3, 5, 7), while AniList keeps them as two entries of
+    their own ("Manyuu Hikenchou Specials" 1-4, "Manyuu Hikenchou Picture Drama" 1-3). Each season-0 file beside
+    this one goes to the Special / OVA entry whose name's own words ("Picture Drama", "Specials") its name has
+    (with one such entry: also every file when they're exactly its episode count); the file is that entry's
+    episode by its place among them. ("own", entry, n), or None (can't tell: the show's Specials folder)."""
+    info = media_relations(entry["id"], cache)
+    cands = [x for t, x in (info or {}).get("relations", [])
+             if t in OWN_ENTRY_RELATIONS and x.get("format") in ("SPECIAL", "OVA")]
+    if not cands:
+        return None
+    parent = set(_label_words(" ".join(filter(None, [entry.get("romaji"), entry.get("english")]))))
+    marks = {}   # entry id -> the words that set it apart from the show ("picture drama")
+    for c in cands:
+        for t in filter(None, [c.get("romaji"), c.get("english")]):
+            own_words = [w for w in _label_words(t) if w not in parent]
+            if own_words:
+                marks.setdefault(c["id"], own_words)
+    sibs = []
+    try:
+        for f in video.parent.iterdir():
+            if f.suffix.lower() in VIDEO_EXTS:
+                _, s, _, ep = parse(f.name)
+                m = S00_TOKEN.search(f.name)
+                if s == 0 and m and episode_number(ep):
+                    sibs.append((episode_number(ep), f.name, _label_words(Path(f.name[m.end():]).stem)))
+    except OSError:
+        return None
+    sibs.sort()
+
+    def which(words):
+        hits = [c for c in cands if marks.get(c["id"]) and
+                any(words[i:i + len(marks[c["id"]])] == marks[c["id"]] for i in range(len(words)))]
+        return hits[0] if len(hits) == 1 else None
+    groups = {}
+    for n, name, words in sibs:
+        c = which(words)
+        if c:
+            groups.setdefault(c["id"], (c, []))[1].append(name)
+    if len(cands) == 1 and not groups:   # unnamed files: all of them, when they're exactly the entry's count
+        groups[cands[0]["id"]] = (cands[0], [name for _, name, _ in sibs])
+    for c, names in groups.values():
+        if video.name in names:
+            count = episode_count(c["id"], cache)
+            if not count or len(names) > count:
+                return None
+            if len(names) == count:   # the whole entry: by place
+                return "own", c, names.index(video.name) + 1
+            # some of it (a single download of picture drama 4): the number its name ends with, else can't tell
+            m = S00_TOKEN.search(video.name)
+            tail = re.search(r"(\d+)\s*$", Path(video.name[m.end():]).stem) if m else None
+            if tail and 1 <= int(tail.group(1)) <= count:
+                return "own", c, int(tail.group(1))
+            return None
+    return None
+
+
+def season_zero_name(name, n=None):
+    """"Show - S00E05 - Special - Title.mkv" → "Show - S01E03 - Title.mkv" (n given: that entry's episode n) or
+    "Show - Title.mkv" (an extra). The "Special" word goes too: the folder says it."""
+    m = S00_TOKEN.search(name)
+    if not m:
+        return None
+    rest = re.sub(r"^\s*-?\s*(?:special|specials|sp|ova|oad|oav)\s*-\s*", " - ", name[m.end():], flags=re.IGNORECASE)
+    head = name[:m.start()]
+    if n is None:
+        new = (head.rstrip(" -") + " - " + rest.lstrip(" -")) if head.strip(" -") else rest.lstrip(" -")
+    else:
+        new = head + f"S01E{n:02d}" + (rest if rest.startswith(" - ") or not rest.strip() else rest)
+    new = re.sub(r"\s{2,}", " ", new).strip()
+    return new if new and new != name and Path(new).stem.strip(" -") else None
+
+
 def sort_file(video, library, cache, dry):
     title, season, types, episode = parse(video.name)
+    ctx_title, ctx_kind, ctx_extras = batch_context(video, library)
+    if ctx_title and not types & EXTRA_TYPES and (ctx_extras or (
+            ctx_kind == "TV" and episode is None and not LEAD_EP_RE.match(video.stem))):
+        # in the batch's Extras / No Credits / Menu folder, or a TV series' folder with no episode number (a TV
+        # series has no movies): an extra ("Yui Kaori Offshot Collection" landed in Movies, Nov 2026)
+        types.add("EXTRA")
+    # (a second copy of an episode, "09 - Title (Censored Ver.)", stays in the season next to the other: the user
+    # wants a version picker on the episode, Nov 2026)
     if season is None and episode is not None:
         season = folder_season(video, title, library)
         if season:
@@ -1678,14 +1961,23 @@ def sort_file(video, library, cache, dry):
     generic = generic_title(title)
     entry, forced_season = (None, None) if generic else lookup(title, want_movie, cache)
     lead_named = False
-    if entry is None or not title_fits(title, entry):
+    # in a batch's Extras folder the batch's show wins over a word of the file's name ("Live Ending" in Kiss x Sis's
+    # No Credits folder matched Date A Live, Nov 2026)
+    stray = bool(entry and ctx_extras and ctx_title and not title_fits(ctx_title, entry))
+    if entry is None or stray or not title_fits(title, entry):
         # named after its episode, not the show ("03 - The Beginning.mkv"): the batch folder's name says which show
-        btitle = batch_title(video, library)
+        btitle = ctx_title
         if btitle and folder_key(btitle) != folder_key(title):
-            lead = re.match(r"\s*(?:E|EP|Episode\s*)?(\d{1,3})(?:v\d)?(?!\d)", video.stem, re.IGNORECASE)
-            if episode is None and lead:   # "01 - Maomao" (anitopy takes it all for a title): episode 1, not a movie
+            lead = LEAD_EP_RE.match(video.stem)
+            if episode is None and lead and not types & EXTRA_TYPES:   # "01 - Maomao" (anitopy takes it all for a title): episode 1, not a movie
                 episode, want_movie, lead_named = lead.group(1), False, True
             bentry, bseason = lookup(btitle, want_movie, cache)
+            def named(e):   # its own title, not just one of its synonyms
+                return bool(e) and plain_title(btitle) in {plain_title(n) for n in (e.get("romaji"), e.get("english")) if n}
+            if not named(bentry):   # a movie's batch: its trailer looked for a TV show and found a drinks commercial
+                other, oseason = lookup(btitle, not want_movie, cache)   # that lists "Your Name." as a synonym
+                if named(other) or (other and title_fits(btitle, other) and not (bentry and title_fits(btitle, bentry))):
+                    bentry, bseason = other, oseason
             if bentry:
                 log.info(f"  ('{title}' doesn't look like the show's name: the batch folder says '{btitle}')")
                 entry, forced_season, title = bentry, bseason, btitle
@@ -1704,6 +1996,21 @@ def sort_file(video, library, cache, dry):
             log.info(f"  ('{title}' isn't on AniList as written: Kura downloaded it for #{hid} "
                      f"'{preferred_name(hentry)}')")
             entry = hentry
+            lead = LEAD_EP_RE.match(video.stem)
+            if episode is None and lead and not types & EXTRA_TYPES:   # "01 - Wonderful Days": episode 1, not a movie
+                episode, want_movie, lead_named = lead.group(1), False, True
+    # the batch's own folders say TV or OVA (one batch with both, "[ScarletNeko] Kiss x Sis/TV" + "/OAD"): the
+    # name "Kiss x Sis" found the OVA, so the TV folder's files go to the TV entry, and an OVA folder's files of a
+    # TV entry are OVAs (own_entry finds AniList's entry for them below)
+    if entry and ctx_kind == "TV" and entry.get("format") not in TV_FORMATS and not want_movie:
+        hid = hint_for(video)
+        tv = tv_entry_for(entry, ctx_title or title, fetch_by_id(hid, cache) if hid else None, cache)
+        if tv and tv["id"] != entry["id"]:
+            log.info(f"  (in the batch's TV folder: #{tv['id']} '{preferred_name(tv)}', not the "
+                     f"{(entry.get('format') or '').lower()} #{entry['id']})")
+            entry, forced_season = tv, None
+    elif entry and ctx_kind == "OVA" and entry.get("format") in TV_FORMATS and "MOVIE" not in types:
+        types.add("OVA")
     if generic:   # "OP.mkv" with nothing around it that says which show: better left than sorted into a random one
         log.info(f"{video.name}\n  '{title}' doesn't say which show and no batch folder does either: left where it is")
         if PLAN is not None:
@@ -1741,6 +2048,22 @@ def sort_file(video, library, cache, dry):
             # its subfolder follows AniList's format, so "13 (Special)" and "14 (OVA)" of one entry stay together
             types = (set(types) - {"OVA", "OAD", "OAV", "SPECIAL", "SPECIALS", "SP"}) | (
                 {"SPECIAL"} if own["format"] == "SPECIAL" else {"OVA"} if own["format"] == "OVA" else set())
+    s00_name = None
+    if entry and season == 0 and not own_folder and fmt in TV_FORMATS and not types & (EXTRA_TYPES - {
+            "OVA", "OAD", "OAV", "SPECIAL", "SPECIALS", "SP"}):
+        try:
+            place = season_zero_place(video, entry, cache)
+        except Exception:
+            log.exception("  couldn't check the show's specials on AniList")
+            place = None
+        if place and place[0] == "own":
+            own, n0 = place[1], place[2]
+            log.info(f"  (season 0 is TheTVDB's numbering: AniList has these specials as #{own['id']} "
+                     f"'{preferred_name(own)}', this is its episode {n0}, in a folder of its own)")
+            entry, season, own_folder = own, None, True
+            types = (set(types) - {"OVA", "OAD", "OAV", "SPECIAL", "SPECIALS", "SP"}) | (
+                {"OVA"} if own["format"] == "OVA" else {"SPECIAL"})
+            s00_name = season_zero_name(video.name, n0)
     # a later season named on its own ("High School DxD NEW - 01", "Queen's Blade Rebellion - 01"): only TV seasons
     # go in a show's folder, so it's that season of the show, in the show's folder (not a folder of its own)
     first = None
@@ -1811,6 +2134,8 @@ def sort_file(video, library, cache, dry):
     if version is not None:
         dest_dir = version
 
+    if s00_name and not renamed:   # Kura and Jellyfin read the AniList entry's number (or no number for an extra)
+        renamed = (s00_name, None, None)
     name = renamed[0] if renamed else video.name
     if lead_named and entry:   # "01 - Maomao.mkv" → "The Apothecary Diaries - 01 - Maomao.mkv": Kura and Jellyfin can read it
         named = f"{safe_name(preferred_name(entry))} - {video.name}"
@@ -2409,6 +2734,16 @@ def main():
         if not paths:
             log.info("Not inside ONLY_PROCESS_INSIDE, nothing to do.")
             return
+
+    if args.paths:   # a batch Kura is playing one episode of (Play now): the rest waits, so it only looks finished
+        held = streaming_holds()
+        keep = [p for p in paths if not any(os.path.normcase(os.path.abspath(p)) == h
+                                            or os.path.normcase(os.path.abspath(p)).startswith(h + os.sep) for h in held)]
+        for p in set(paths) - set(keep):
+            log.info(f"Kura is playing one episode of this torrent while the rest waits; it's filed when it's done: {p}")
+        if not keep:
+            return
+        paths = keep
 
     cache = load_cache()
     load_hints()

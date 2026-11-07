@@ -118,6 +118,7 @@ def main():
            "--contents-directory", "kura_runtime",     # the exe's support files, next to it
            "--paths", str(HERE),                        # anime_organizer, anilist_account, torrents, player...
            "--add-binary", f"{HERE / 'mpv' / 'libmpv-2.dll'};.",   # the built-in player's engine
+           "--hidden-import", "libtorrent", "--collect-binaries", "libtorrent",   # Play now's torrent engine (engine.py)
            "--exclude-module", "tkinter",
            "--distpath", str(work / "dist"), "--workpath", str(work / "build"), "--specpath", str(work)]
     print("Building (this takes a few minutes)...")

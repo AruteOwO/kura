@@ -188,7 +188,7 @@ def gql(query, variables=None, token=None, tries=3):
                 payload = json.load(resp)
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                time.sleep(int(e.headers.get("Retry-After", 60)))
+                org.rate_limited(int(e.headers.get("Retry-After", 60)))   # the next _throttle waits it out
                 continue
             try:
                 msg = (json.loads(e.read()).get("errors") or [{}])[0].get("message") or ""

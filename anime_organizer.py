@@ -2149,6 +2149,12 @@ def sort_file(video, library, cache, dry):
         log.info(f"  -> {dest_dir}" + (f" as {name}" if renamed else ""))
         if renamed and renamed[1] and not dry:
             remember_start(show_dir, renamed[1], renamed[2])
+        if entry and not dry:   # the folder's own name → this entry: Kura's library knows the folder even when the
+            # show isn't on your AniList list (it only had the searched name, "itadaki! seieki♥", not "Vampire
+            # Vixen": 14 hentai shows went missing from Kura, Nov 2026)
+            fkey = f"{show_dir.name.lower()}|{'movie' if is_movie else 'show'}"
+            if not isinstance(cache.get(fkey), dict) and not isinstance(cache.get(f"{show_dir.name.lower()}|show"), dict):
+                cache[fkey] = entry
     if dry and PLAN is not None:
         PLAN.append({"src": str(video), "dest": str(dest_dir), "name": name, "show": show_dir.name,
                      "folder": str(dest_dir.relative_to(library)) if dest_dir.is_relative_to(library) else str(dest_dir),

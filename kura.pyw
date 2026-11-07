@@ -4291,8 +4291,12 @@ class LibraryPage(Page):
         self.root_time[root] = scanned_at or time.time()
         self.shown_root = root
         on = acct.ADULT["on"]
-        hidden = [s for s in shows if index_adult(s["index"], self.account) != on]
-        shows = [s for s in shows if index_adult(s["index"], self.account) == on]
+        # a show Kura can't match (no AniList entry) stays on the side whose library it's in: it used to count as
+        # "not 18+" and vanish from the Hentai side, and the Anime side never scans I:\Hentai (user, Nov 2026)
+        def belongs(s):
+            return index_adult(s["index"], self.account) == on if (s.get("index") or {}).get("mid") else True
+        hidden = [s for s in shows if not belongs(s)]
+        shows = [s for s in shows if belongs(s)]
         self.hidden_other = len(hidden)
         self.learn_adult(self.root_cache[root])
         self.skeleton.stop()

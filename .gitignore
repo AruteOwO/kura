@@ -24,3 +24,6 @@ update/
 # Python
 __pycache__/
 *.pyc
+
+# Taiga's anime-relations rules (downloaded by Kura)
+anime_relations.txt

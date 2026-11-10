@@ -894,6 +894,7 @@ class PlayerTitleStrip(QWidget):
 def default_settings():
     return {
         "library": str(org.LIBRARY_DIR or "") if org else "",
+        "library_extra": [],   # read-only library folders on other drives (Settings → Folders)
         "downloads": str(org.ONLY_PROCESS_INSIDE or "") if org else "",
         "mode": org.MODE if org else "move",
         "language": org.TITLE_LANGUAGE if org else "english",
@@ -950,6 +951,7 @@ def default_settings():
         "progress_mode": "auto",         # "auto" | "ask" | "off"
         "progress_delay": 120,           # seconds an episode must be recognized first
         "progress_wait_close": False,    # update only once the player closes
+        "list_undo": True,               # Undo after you change a show's status
         "progress_percent": 80,          # built-in player: counts as watched at this point
         # Discord Rich Presence
         "discord_enabled": False,
@@ -1929,10 +1931,10 @@ SEASON_RE =re.compile(r"season\s*0*(\d+)(?:\s*[-\u2013\u2014:]\s*.*)?", re.IGNOR
 SKIP_DIRS = {"$recycle.bin", "system volume information"}
 
 
-def scan_show(d):
+def scan_show(d, companions=()):
     seasons, extras, episodes, related = 0, [], 0, 0
     try:
-        for c in d.iterdir():
+        for c in [x for folder in (d, *companions) for x in folder.iterdir()]:
             if not c.is_dir():
                 episodes += c.suffix.lower() in org.VIDEO_EXTS
                 continue
@@ -2025,6 +2027,65 @@ def media_holder(show_dir):
     return next((c for c in subs if any(local_videos(c))), None)
 
 
+# ---- extra library folders (Settings → Library folders, the user's pick A2, Nov 10 2026): read-only folders on other
+# drives whose shows are in the Library too. New downloads still go to the main one; Kura never moves, renames or
+# recycles anything in them. A show whose folder name is in two of them is one show (the main one's folder first).
+
+def extra_roots(settings=None, connected=True):
+    """The extra library folders (Anime side only). connected: only the ones that are there right now."""
+    s = settings if settings is not None else (APP.get("settings") or {})
+    if acct.ADULT["on"]:
+        return []
+    out = []
+    for p in s.get("library_extra") or []:
+        try:
+            if p and (not connected or Path(p).is_dir()):
+                out.append(Path(p))
+        except OSError:
+            pass
+    return out
+
+
+def short_root(path, room=30):
+    """A library folder's name that fits a pill: "E:\\Old Anime" as it is, a long one as "C:\\…\\Anime" (no cut-off
+    text; the full path goes in the tooltip)."""
+    path = str(path)
+    if len(path) <= room:
+        return path
+    p = Path(path)
+    return f"{p.drive}\\…\\{p.name}" if p.drive and p.name else path[:room - 1] + "…"
+
+
+def is_read_only(path):
+    """A file or folder inside an extra (read-only) library folder."""
+    try:
+        p = os.path.normcase(os.path.abspath(str(path)))
+    except (TypeError, ValueError):
+        return False
+    for r in extra_roots(connected=False):
+        root = os.path.normcase(os.path.abspath(str(r))).rstrip("\\/")
+        if p == root or p.startswith(root + os.sep):
+            return True
+    return False
+
+
+def companion_dirs(show_dir):
+    """The same show's folder in the other library folders (a show split across drives)."""
+    if not show_dir:
+        return []
+    s = APP.get("settings") or {}
+    roots = ([Path(s["library"])] if s.get("library") else []) + extra_roots(s)
+    out = []
+    for r in roots:
+        d = r / show_dir.name
+        try:
+            if os.path.normcase(str(d)) != os.path.normcase(str(show_dir)) and d.is_dir():
+                out.append(d)
+        except OSError:
+            pass
+    return out
+
+
 def season_folders(show_dir):
     folders = {}
     loose = False
@@ -2041,6 +2102,14 @@ def season_folders(show_dir):
                 loose = True
     except OSError:
         pass
+    for comp in companion_dirs(show_dir):   # seasons kept on another drive (the main folder's own win)
+        try:
+            for c in comp.iterdir():
+                m = SEASON_RE.fullmatch(c.name)
+                if m and c.is_dir() and not org.is_link(c) and int(m.group(1)) not in folders:
+                    folders[int(m.group(1))] = c
+        except OSError:
+            pass
     if not folders and (loose or org.version_dirs(show_dir)):
         folders[1] = show_dir   # episodes right in the show folder (One Piece) or in version folders there
     for n, g in groups.items():   # "Season 1 - Korean" + "Season 1 - Japanese": one season, two versions
@@ -2163,10 +2232,11 @@ class LibraryScanner(QThread):
     listed = Signal(int, list)
     cover = Signal(int, str, QImage)
 
-    def __init__(self, scan_id, library, list_media=None, title_ids=None, shows=None):
+    def __init__(self, scan_id, library, list_media=None, title_ids=None, shows=None, extras=()):
         super().__init__()
         self.scan_id = scan_id
         self.library = Path(library)
+        self.extras = [Path(x) for x in extras]   # read-only library folders, after the main one
         self.list_media = list_media or {}
         self.title_ids = title_ids or {}
         self.known = shows   # covers only, for shows already listed (switching sides restores the list)
@@ -2180,17 +2250,23 @@ class LibraryScanner(QThread):
         self.load_covers(shows, cache)
 
     def scan(self):
-        try:
-            dirs = sorted((p for p in self.library.iterdir()
-                           if p.is_dir() and not org.is_link(p) and not p.name.startswith(".")
-                           and p.name.lower() not in SKIP_DIRS), key=lambda p: p.name.lower())
-        except OSError:
-            dirs = []
+        found = {}   # folder name → [show folders]: the first root's one is the show, the others its companions
+        for root in [self.library, *self.extras]:
+            try:
+                for p in root.iterdir():
+                    if p.is_dir() and not org.is_link(p) and not p.name.startswith(".") \
+                            and p.name.lower() not in SKIP_DIRS:
+                        found.setdefault(p.name.lower(), []).append(p)
+            except OSError:
+                continue
+        dirs = sorted(found.values(), key=lambda ds: ds[0].name.lower())
         cache = _read_json(org.CACHE_FILE)
         details = details_by_id()
         shows = []
-        for d in dirs:
-            s = scan_show(d)
+        for ds in dirs:
+            d = ds[0]
+            s = scan_show(d, ds[1:])
+            s["roots"] = [str(x.parent) for x in ds]
             try:
                 s["index"] = library_index(d, cache, details, self.list_media, self.title_ids)
             except Exception:
@@ -3281,6 +3357,11 @@ class DetailLoader(QThread):
             subs = sorted(show_dir.iterdir() if show_dir else [], key=lambda p: p.name.lower())
         except OSError:
             subs = []
+        for comp in companion_dirs(show_dir):   # the same show on another library drive: its seasons too
+            try:
+                subs += sorted(comp.iterdir(), key=lambda p: p.name.lower())
+            except OSError:
+                pass
         mine = org.FOLDER_SEASONS.get(show_dir.name.lower(), {}) if show_dir else {}   # Edit info: "counts as"
         for c in subs:
             if not c.is_dir() or org.is_link(c) or c.name in (org.SPINOFF_FOLDER, org.SIDE_STORY_FOLDER) or c in grouped:
@@ -3532,6 +3613,51 @@ class Toggle(QCheckBox):
         p.drawEllipse(QRectF(x, r.y() + 3, 16, 16))
 
 
+class IntervalInput(QWidget):
+    """A number you type, then minutes or hours (the feed check: user, Nov 10 2026). minutes() = the value."""
+    changed = Signal(int)
+
+    def __init__(self, minutes):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        minutes = max(1, int(minutes or 15))
+        hours = minutes >= 60 and minutes % 60 == 0
+        self.num = QSpinBox()
+        self.num.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.num.setAlignment(Qt.AlignCenter)
+        self.num.setFixedWidth(64)
+        self.num.setRange(*((1, 24) if hours else (5, 1440)))
+        self.num.setValue(minutes // 60 if hours else minutes)
+        self.unit = Segmented([("min", "minutes"), ("hour", "hours")], "hour" if hours else "min")
+        self.cur_unit = self.unit.value()
+        self.num.valueChanged.connect(lambda _v: self.changed.emit(self.minutes()))
+        self.unit.changed.connect(self.switch_unit)
+        h.addWidget(self.num)
+        h.addWidget(self.unit)
+
+    def switch_unit(self, unit):
+        """The same time in the other unit (2 hours → 120 minutes), so the box always says what's saved."""
+        if unit == self.cur_unit:   # the one already picked, clicked again
+            return
+        self.cur_unit = unit
+        n = self.num.value()
+        self.num.blockSignals(True)
+        if unit == "hour":
+            self.num.setRange(1, 24)
+            self.num.setValue(max(1, round(n / 60)))
+        else:
+            self.num.setRange(5, 1440)
+            self.num.setValue(n * 60)
+        self.num.blockSignals(False)
+        self.changed.emit(self.minutes())
+
+    def minutes(self):
+        return self.num.value() * (60 if self.unit.value() == "hour" else 1)   # 5 minutes to a day
+
+
 class Segmented(QFrame):
     changed = Signal(str)
 
@@ -3633,6 +3759,7 @@ INDEX_ROLE, STATUS_ROLE, NEW_ROLE, PROG_ROLE = Qt.UserRole + 4, Qt.UserRole + 5,
 MID_ROLE, NOTDL_ROLE, MEDIA_ROLE = Qt.UserRole + 8, Qt.UserRole + 9, Qt.UserRole + 10
 ADDED_ROLE, LATEST_ROLE, META_ROLE = Qt.UserRole + 11, Qt.UserRole + 12, Qt.UserRole + 13   # Library filters / sort
 FAV_ROLE = Qt.UserRole + 14   # one of your AniList favorites (Library "Favorites" chip, heart on the cover)
+ROOTS_ROLE = Qt.UserRole + 15   # the library folders a show is in (the Filters' Folder section)
 
 
 def show_all_toggle(settings, key, on_change):
@@ -3852,6 +3979,7 @@ class LibraryFilter(QSortFilterProxyModel):
         super().__init__(parent)
         self.view = "ALL"
         self.statuses, self.formats, self.genres = set(), set(), set()
+        self.folders = set()   # library folders (only offered with extra library folders)
         self.years = (None, None)
         self.sort_key = "title"
 
@@ -3862,7 +3990,8 @@ class LibraryFilter(QSortFilterProxyModel):
 
     def active(self):
         """How many pop-over filters are on (the Filters button's count)."""
-        return len(self.statuses) + len(self.formats) + len(self.genres) + (1 if any(self.years) else 0)
+        return (len(self.statuses) + len(self.formats) + len(self.genres) + len(self.folders)
+                + (1 if any(self.years) else 0))
 
     def filterAcceptsRow(self, row, parent):
         idx = self.sourceModel().index(row, 0, parent)
@@ -3878,6 +4007,10 @@ class LibraryFilter(QSortFilterProxyModel):
             return False
         if self.genres and not self.genres <= set(meta.get("genres") or ()):
             return False
+        if self.folders:
+            roots = {os.path.normcase(r) for r in idx.data(ROOTS_ROLE) or ()}
+            if not roots & {os.path.normcase(f) for f in self.folders}:
+                return False
         lo, hi = self.years
         if lo or hi:
             y = meta.get("year")
@@ -3944,6 +4077,8 @@ class LibraryFilterPopup(QFrame):
                                 f" padding: 3px 10px; font-size: 9pt; color: {C['text']}; }}"
                                 f" QPushButton:checked {{ background: rgba({accent_rgb()},0.30); border-color: {C['accent']}; }}")
                 b.toggled.connect(lambda on, k=key, s=chosen: (s.add(k) if on else s.discard(k), self.changed.emit()))
+                if text != key:   # a shortened folder name: the whole path on hover
+                    b.setToolTip(str(key))
                 flow.addWidget(b)
             lay.addWidget(w)
 
@@ -3951,6 +4086,11 @@ class LibraryFilterPopup(QFrame):
             pills(left, "Your list", LIB_STATUS_TEXT.items(), f.statuses)
             left.addSpacing(8)
         pills(left, "Format", LIB_FORMAT_TEXT.items(), f.formats)
+        extras = extra_roots(page.settings)
+        if extras and page.settings.get("library"):   # several library folders: which drive (user, Nov 10 2026)
+            left.addSpacing(8)
+            pills(left, "Folder", [(str(r), short_root(r)) for r in [Path(page.settings["library"]), *extras]],
+                  f.folders)
         left.addStretch(1)
 
         pills(right, "Genre", [(g, g) for g in page.genre_list()], f.genres)
@@ -4238,7 +4378,7 @@ class LibraryPage(Page):
                     if t:
                         title_ids.setdefault(org.safe_name(t).lower(), mid)
         self.scan_sig = self.list_sig(lib, list_media)
-        scanner = LibraryScanner(self.scan_id, lib, list_media, title_ids)
+        scanner = LibraryScanner(self.scan_id, lib, list_media, title_ids, extras=extra_roots(self.settings))
         scanner.listed.connect(self.on_listed)
         scanner.cover.connect(self.on_cover)
         scanner.finished.connect(lambda s=scanner: self.scanners.discard(s))
@@ -4252,7 +4392,7 @@ class LibraryPage(Page):
     @staticmethod
     def list_sig(lib, list_media):
         try:
-            return lib, hash(json.dumps(list_media, sort_keys=True, default=str))
+            return lib, hash(json.dumps([list_media, [str(r) for r in extra_roots()]], sort_keys=True, default=str))
         except Exception:
             return None
 
@@ -4310,6 +4450,7 @@ class LibraryPage(Page):
             it.setData(s["path"], PATH_ROLE)
             it.setData(s["subtitle"], SUB_ROLE)
             it.setData(s["index"], INDEX_ROLE)
+            it.setData(s.get("roots") or [str(Path(s["path"]).parent)], ROOTS_ROLE)
             if old_covers.get(s["path"]) is not None:
                 it.setData(old_covers[s["path"]], COVER_ROLE)   # no flicker on refresh
             self.model.appendRow(it)
@@ -4527,6 +4668,7 @@ class LibraryPage(Page):
         f.statuses.clear()
         f.formats.clear()
         f.genres.clear()
+        f.folders.clear()
         f.years = (None, None)
         self.refilter()
 
@@ -4553,7 +4695,8 @@ class LibraryPage(Page):
         f = self.proxy
         parts = ([(LIB_STATUS_TEXT[s], lambda s=s: f.statuses.discard(s)) for s in sorted(f.statuses)]
                  + [(LIB_FORMAT_TEXT[x], lambda x=x: f.formats.discard(x)) for x in sorted(f.formats)]
-                 + [(g, lambda g=g: f.genres.discard(g)) for g in sorted(f.genres)])
+                 + [(g, lambda g=g: f.genres.discard(g)) for g in sorted(f.genres)]
+                 + [(short_root(x), lambda x=x: f.folders.discard(x)) for x in sorted(f.folders)])
         lo, hi = f.years
         if lo or hi:
             text = f"{lo}–{hi}" if lo and hi else f"From {lo}" if lo else f"Until {hi}"
@@ -5673,6 +5816,14 @@ class SettingsPage(Page):
         self.path_row(fl, "Downloads", "Optional. Adds a \"Sort downloads\" button to Tools → Organize, and is where torrents go when "
                       "a show has no library folder yet.", "downloads")
         col.addWidget(folders)
+        col.addSpacing(14)
+        self.lib_folders = QWidget()
+        self.lib_folders.setStyleSheet("background: transparent;")
+        self.lib_folders_lay = QVBoxLayout(self.lib_folders)
+        self.lib_folders_lay.setContentsMargins(0, 0, 0, 0)
+        self.lib_folders_lay.setSpacing(10)
+        col.addWidget(self.lib_folders)
+        self.build_library_folders()
         self.build_about()
 
         col = self.sec_cols["sorting"]
@@ -6666,6 +6817,133 @@ class SettingsPage(Page):
         edit.setMinimumWidth(width)
         edit.editingFinished.connect(lambda: self.set(key, edit.text().strip()))
         self.row(layout, title, label(desc, "faint", wrap=True), edit)
+
+    # ---- library folders (the user's pick A2, Nov 10 2026: a card per drive with its free space)
+    def build_library_folders(self):
+        lay = self.lib_folders_lay
+        clear_layout(lay)
+        head = QHBoxLayout()
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(label("LIBRARY FOLDERS", "section"))
+        text.addWidget(label("Every show in these folders is in your Library. New downloads go to the main one; the "
+                             "others are read only, so Kura never moves, renames or deletes anything there.",
+                             "faint", wrap=True))
+        head.addLayout(text, 1)
+        add = QPushButton(" Add a folder")
+        add.setObjectName("primary")
+        add.setIcon(glyph_icon("create_new_folder", "#ffffff", "#ffffff"))
+        add.setCursor(Qt.PointingHandCursor)
+        add.clicked.connect(self.add_library_folder)
+        head.addWidget(add, 0, Qt.AlignBottom)
+        lay.addLayout(head)
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        main = self.settings.get("library") or ""
+        roots = ([(main, True)] if main else []) + [(x, False) for x in self.settings.get("library_extra") or []]
+        for i, (root, is_main) in enumerate(roots):
+            grid.addWidget(self.drive_card(root, is_main), i // 3, i % 3)
+        for c in range(3):
+            grid.setColumnStretch(c, 1)
+        lay.addLayout(grid)
+        lay.addWidget(label("Removing a folder only takes it out of Kura's Library. Your files stay where they are.",
+                            "faint", wrap=True))
+
+    def drive_card(self, root, is_main):
+        box = QFrame()
+        box.setObjectName("drivecard")
+        box.setStyleSheet(f"QFrame#drivecard {{ background: {C['surface']}; border: 1px solid "
+                          f"{C['accent'] if is_main else C['border']}; border-radius: 14px; }}"
+                          " QLabel { background: transparent; }")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(10)
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        here = Path(root).is_dir()
+        top.addWidget(glyph_label("folder_special" if is_main else "folder" if here else "folder_off",
+                                  C["accent_hi"] if is_main else C["muted"] if here else C["bad"], 24))
+        names = QVBoxLayout()
+        names.setSpacing(1)
+        name = QLabel(short_root(root, 26))
+        name.setToolTip(root)
+        name.setStyleSheet(f"color: {C['text']}; font-weight: 700;")
+        names.addWidget(name)
+        drive = Path(root).drive or root
+        names.addWidget(label(f"Drive {drive}" if here else "Not connected: its shows are hidden until it's back",
+                              "faint", wrap=True))
+        top.addLayout(names, 1)
+        tag = QLabel("Main" if is_main else "Read only")
+        tag.setStyleSheet(f"background: {'rgba(%s,0.25)' % accent_rgb() if is_main else C['surface2']};"
+                          f" color: {C['text']}; border-radius: 9px; padding: 2px 9px; font-size: 8.5pt;")
+        top.addWidget(tag, 0, Qt.AlignTop)
+        v.addLayout(top)
+        if here:
+            try:
+                du = shutil.disk_usage(root)
+                share = du.used / du.total if du.total else 0
+            except OSError:
+                du, share = None, 0
+            if du:
+                bar = QFrame()
+                bar.setFixedHeight(8)
+                low = du.free < 0.1 * du.total
+                fill = C["warn"] if low else C["accent"]
+                bar.setStyleSheet(f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {fill}, "
+                                  f"stop:{max(0.001, share - 0.001):.3f} {fill}, stop:{share:.3f} {C['surface2']}, "
+                                  f"stop:1 {C['surface2']}); border-radius: 4px;")
+                v.addWidget(bar)
+                nums = QHBoxLayout()
+                nums.addWidget(label(f"{human(du.used)} used", "faint"))
+                nums.addStretch(1)
+                free = label(f"{human(du.free)} free", "faint")
+                if low:
+                    free.setStyleSheet(f"color: {C['warn']};")
+                nums.addWidget(free)
+                v.addLayout(nums)
+            try:
+                count = sum(1 for d in Path(root).iterdir() if d.is_dir() and not d.name.startswith((".", "$")))
+            except OSError:
+                count = 0
+            v.addWidget(label(f"{count} show folder{'s' if count != 1 else ''}"
+                              + (" · new downloads land here" if is_main else ""), "muted"))
+        btn = QPushButton("Change folder" if is_main else "Remove from Kura")
+        btn.setCursor(Qt.PointingHandCursor)
+        if is_main:
+            btn.clicked.connect(self.change_main_library)
+        else:
+            btn.clicked.connect(lambda _=False, r=root: self.remove_library_folder(r))
+        v.addWidget(btn, 0, Qt.AlignLeft)
+        v.addStretch(1)
+        return box
+
+    def change_main_library(self):
+        d = QFileDialog.getExistingDirectory(self, "Library", self.settings.get("library") or "")
+        if d:
+            self.set("library", str(Path(d)))
+            if getattr(self, "path_edits", {}).get("library") is not None:
+                self.path_edits["library"].setText(str(Path(d)))
+            self.build_library_folders()
+
+    def add_library_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Add a library folder", "")
+        if not d:
+            return
+        d = str(Path(d))
+        main = self.settings.get("library") or ""
+        have = [os.path.normcase(x) for x in [main, *(self.settings.get("library_extra") or [])] if x]
+        if os.path.normcase(d) in have:
+            tell(self, "Add a folder", "That folder is already in your Library.")
+            return
+        if main and os.path.normcase(d).startswith(os.path.normcase(main.rstrip("\\/")) + os.sep):
+            tell(self, "Add a folder", "That folder is inside your main library already.")
+            return
+        self.set("library_extra", [*(self.settings.get("library_extra") or []), d])
+        self.build_library_folders()
+
+    def remove_library_folder(self, root):
+        self.set("library_extra", [x for x in self.settings.get("library_extra") or [] if x != root])
+        self.build_library_folders()
 
     def path_row(self, layout, title, desc, key):
         edit = QLineEdit(self.settings.get(key) or "")
@@ -12832,6 +13110,14 @@ def build_matcher(library, account):
                 local[sid] = set(idx["local"].get(sid, {}))
     for mid, m in list_media.items():
         remember(mid, m)
+    # the name before the colon, as release groups shorten it ("Nia Liston" for "Nia Liston: The Merciless Maiden"),
+    # only where no real title has it; the first season first (Mushoku Tensei = season 1)
+    for mid in sorted(list_media):
+        t = list_media[mid].get("title") or {}
+        for x in (t.get("english"), t.get("romaji")):
+            short = tor.norm(x.split(":")[0]) if x and ":" in x else ""
+            if len(short) >= 6 and " " in short:
+                names.setdefault(short, mid)
     for key, al in ((APP.get("settings") or {}).get("torrent_aliases") or {}).items():
         if al.get("mid"):   # names you added and spellings Kura learned (Torrents → a show's name chips)
             names[tor.norm(al.get("text") or key)] = al["mid"]
@@ -12845,7 +13131,13 @@ def build_matcher(library, account):
         return {"title": titles.get(mid), "status": e["status"] if e else None,
                 "progress": (e or {}).get("progress") or 0, "airing": airing.get(mid),
                 "in_library": mid in lib_ids, "local": local.get(mid, set())}
-    return tor.Matcher(names, seasons, totals, close=follow), describe, titles
+    parts = set()
+    for mid in seasons:
+        t = media_info(mid, cache, details, list_media)
+        t = t.get("title") or t
+        if org.is_part({"english": t.get("english"), "romaji": t.get("romaji")}):
+            parts.add(mid)
+    return tor.Matcher(names, seasons, totals, close=follow, parts=parts), describe, titles
 
 
 class FeedLoader(QThread):
@@ -15240,18 +15532,17 @@ class TorrentSettingsDialog(KuraDialog):
         self.auto_check = Toggle(self.s.get("torrent_auto_check", False))
         option_row(col, "Check new torrents automatically", "Runs in the background while Kura is open.",
                    self.auto_check)
-        self.interval = QSpinBox()
-        self.interval.setRange(5, 1440)
-        self.interval.setSuffix("  minutes")
-        self.interval.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.interval.setFixedWidth(130)
-        self.interval.setAlignment(Qt.AlignCenter)
-        self.interval.setValue(int(self.s.get("torrent_interval_min") or 15))
+        self.interval = IntervalInput(self.s.get("torrent_interval_min") or 15)
         option_row(col, "Interval", "How often the feed is checked.", self.interval)
         self.new_action = Segmented([("notify", "Notify me"), ("download", "Download immediately")],
                                     self.s.get("torrent_new_action", "notify"))
         option_row(col, "When there are new torrents", "Notify shows a message; Download sends the selected "
                    "releases to your torrent app right away.", self.new_action)
+        self.planning_dl = Toggle(tor.downloads_planning(self.filters))
+        self.planning_dl.toggled.connect(self.toggle_planning)
+        option_row(col, "Also download shows on your Planning list",
+                   "Off: only shows you're watching. This changes the Select filters on the Filters tab.",
+                   self.planning_dl)
         self.catchup_t = Toggle(self.s.get("torrent_catchup", True))
         option_row(col, "Look for episodes the feed missed",
                    "The feed only holds the newest releases. When an episode of a show you're watching has aired and "
@@ -15496,7 +15787,16 @@ class TorrentSettingsDialog(KuraDialog):
         text = one if len(ids) == 1 else f"{len(ids)} anime"
         return f"All except {text}" if f.get("anime_mode") == "except" else text
 
+    def toggle_planning(self, on):
+        tor.set_downloads_planning(self.filters, on)
+        if hasattr(self, "ftree"):
+            self.fill_filters()
+
     def fill_filters(self, select=None):
+        if hasattr(self, "planning_dl"):   # an edited / reset filter or another profile: the switch follows
+            self.planning_dl.blockSignals(True)
+            self.planning_dl.setChecked(tor.downloads_planning(self.filters))
+            self.planning_dl.blockSignals(False)
         self.ftree.blockSignals(True)
         self.ftree.clear()
         for f in self.filters:
@@ -15658,7 +15958,7 @@ class TorrentSettingsDialog(KuraDialog):
         s["torrent_feed"] = self.feed.text().strip() or tor.DEFAULT_FEED
         s["torrent_search_feed"] = self.search_feed.text().strip() or tor.DEFAULT_SEARCH_FEED
         s["torrent_auto_check"] = self.auto_check.isChecked()
-        s["torrent_interval_min"] = self.interval.value()
+        s["torrent_interval_min"] = self.interval.minutes()
         s["torrent_new_action"] = self.new_action.value()
         s["torrent_catchup"] = self.catchup_t.isChecked()
         s["torrent_fallback"] = self.fallback.isChecked()
@@ -18395,7 +18695,7 @@ class NowPlaying(QObject):
         self.builtin = None          # last report from Kura's player
         self.missing_since = None
         self.last_tick = time.time()
-        self._matcher = (0, None, None)
+        self._matcher, self._matcher_sig = (0, None, None), None
         self.jelly, self.jelly_at, self.jelly_error, self.jelly_poller = [], 0, "", None
         self.cr_latest, self.cr_at, self.cr_poller, self.cr_client = None, 0, None, None
         self.presence = None
@@ -18422,9 +18722,14 @@ class NowPlaying(QObject):
         self._matcher = (0, None, None)
 
     def matcher(self):
-        if time.time() - self._matcher[0] > 300 or self._matcher[1] is None:
+        # also rebuilt when the library scan or your AniList list arrives: the first poll (5 s after start) came
+        # before the library had loaded, and that matcher, with no seasons and no folder names, was kept for 5
+        # minutes (VLC / mpv weren't picked up after opening Kura, user Nov 10 2026)
+        sig = (sum(1 for i in self.library.indexes().values() if i) if self.library else 0,
+               len(self.account.entries) if self.account and self.account.connected else 0)
+        if time.time() - self._matcher[0] > 300 or self._matcher[1] is None or sig != self._matcher_sig:
             m, _, titles = build_matcher(self.library, self.account)
-            self._matcher = (time.time(), m, titles)
+            self._matcher, self._matcher_sig = (time.time(), m, titles), sig
         return self._matcher[1], self._matcher[2]
 
     def title_of(self, mid, fallback=""):
@@ -18438,8 +18743,12 @@ class NowPlaying(QObject):
         """'[Group] Title S2 - 05 (1080p)' -> {mid, ep, title, group, source} or None."""
         p = tor.parse_release(text)
         ep = p["episodes"][-1] if p["episodes"] else None
-        mid, ep = self.matcher()[0].match(p["name"], p["season"], ep)
+        matcher = self.matcher()[0]
+        mid, ep = matcher.match(p["name"], p["season"], ep)
         if not mid or not ep:
+            return None
+        total = matcher.totals.get(mid)
+        if total and ep > total:   # past the season's end with no chain or rule to follow: don't guess
             return None
         return {"mid": mid, "ep": ep, "title": self.title_of(mid, p["name"]),
                 "group": p["group"], "source": source}
@@ -19376,6 +19685,10 @@ class PlaybackSettingsDialog(KuraDialog):
         self.wait_close = Toggle(self.s.get("progress_wait_close", False))
         option_row(col, "Wait for the player to close", "Update only when you stop watching, not partway through.",
                    self.wait_close)
+        self.list_undo = Toggle(self.s.get("list_undo", True))
+        option_row(col, "Offer Undo when I change a show's status",
+                   "A message with an Undo button after Watching, Planning, Completed... (not after episode updates).",
+                   self.list_undo)
         col.addStretch(1)
         return page
 
@@ -19727,6 +20040,7 @@ class PlaybackSettingsDialog(KuraDialog):
             "recog_ignore_ahead": self.ahead.isChecked(), "progress_mode": self.mode.value(),
             "progress_delay": self.delay.value(), "progress_percent": self.percent.value(),
             "progress_wait_close": self.wait_close.isChecked(),
+            "list_undo": self.list_undo.isChecked(),
             "recog_players": self.use_players.isChecked(), "recog_player_list": self.player_list.unchecked(),
             "recog_browsers": self.use_browsers.isChecked(), "recog_sites": self.site_list.unchecked(),
             "recog_crunchyroll": self.use_crunchy.isChecked(),
@@ -20737,6 +21051,11 @@ class CrunchyrollTool(QWidget):
             total = m.get("episodes")
             got = max(p["eps"])
             new_p = min(got, total) if total else got
+            aired = aired_count(m)
+            if aired is not None:   # never past what has aired (a not-yet-aired Part 2 came out Completed)
+                if aired == 0:
+                    continue
+                new_p = min(new_p, aired)
             cur_s, cur_p = e.get("status"), e.get("progress") or 0
             if cur_s == "COMPLETED" or (cur_s in ("CURRENT", "REPEATING") and cur_p >= new_p):
                 current += 1   # already there (never lowered, a completed show is left alone)
@@ -22333,6 +22652,11 @@ def recycle(paths):
     deleted for good). Returns "" or the error."""
     if os.name != "nt":
         return "only on Windows"
+    locked = [p for p in paths if is_read_only(p)]
+    if locked:   # extra library folders are read only: Kura never deletes there
+        paths = [p for p in paths if p not in locked]
+        if not paths:
+            return "That's in a read-only library folder (Settings → Library folders), so Kura leaves it alone"
     import ctypes
     from ctypes import wintypes
 
@@ -23373,11 +23697,11 @@ class KickoffPage(Page):
                 pass
 
     def start(self, mid, media):
-        self.account.save(mid, media, status="CURRENT", progress=0)
+        self.account.save(mid, media, undo=True, status="CURRENT", progress=0)
         self.mark(mid, "Watching")
 
     def plan(self, mid, media):
-        self.account.save(mid, media, status="PLANNING")
+        self.account.save(mid, media, undo=True, status="PLANNING")
         self.mark(mid, "Added to Planning")
 
     def mark(self, mid, text):
@@ -26511,12 +26835,17 @@ class LivePreview(QFrame):
                            " font-size: 8pt; font-weight: 800;")
         live.adjustSize()
         live.move(10, 10)
-        muted = QLabel(icon_html("volume_off", 14, "white") + "&nbsp;Preview", self.box)
-        muted.setTextFormat(Qt.RichText)
-        muted.setStyleSheet("background: rgba(15,17,21,0.8); color: white; border-radius: 6px; padding: 3px 8px; font-size: 8.5pt;")
-        muted.adjustSize()
-        muted.move(480 - muted.width() - 10, 270 - muted.height() - 10)
-        self.badges = (live, muted)
+        # sound on / off (only the icon: user, Nov 7 2026; it was a label that looked like a button and did nothing)
+        self.mute_btn = QPushButton(self.box)
+        self.mute_btn.setCursor(Qt.PointingHandCursor)
+        self.mute_btn.setFixedSize(32, 32)
+        self.mute_btn.setIconSize(QSize(14, 14))
+        self.mute_btn.setStyleSheet("QPushButton { background: rgba(15,17,21,0.8); border: none; border-radius: 16px;"
+                                    " padding: 0px; } QPushButton:hover { background: rgba(15,17,21,0.95); }")
+        self.mute_btn.move(480 - 32 - 10, 270 - 32 - 10)
+        self.mute_btn.clicked.connect(self.toggle_mute)
+        self.update_mute()
+        self.badges = (live, self.mute_btn)
         h.addWidget(self.box)
         col = QVBoxLayout()
         col.setSpacing(8)
@@ -26572,7 +26901,23 @@ class LivePreview(QFrame):
         else:
             self.video.stop()
 
+    def sound_off(self):
+        return self.page.settings.get("live_preview_muted", True)
+
+    def update_mute(self):
+        off = self.sound_off()
+        self.mute_btn.setIcon(glyph_icon("" if off else "", "white", "white", px=14))
+        self.mute_btn.setToolTip("Unmute" if off else "Mute")
+
+    def toggle_mute(self):
+        s = self.page.settings
+        s["live_preview_muted"] = not self.sound_off()
+        save_settings(s)
+        self.update_mute()
+        self.video.set_muted(s["live_preview_muted"])
+
     def reveal(self):
+        self.video.set_muted(self.sound_off())   # a clip always starts muted
         self.video.setGeometry(0, 0, 480, 270)
         self.video.raise_()
         for b in self.badges:
@@ -27636,7 +27981,7 @@ class MetaCacher(QThread):
 
 def library_folders(settings, adult_too=True):
     """Every show folder in the Anime library (and the Hentai one, when that side is on)."""
-    roots = [anime_library(settings)]
+    roots = [anime_library(settings), *extra_roots(settings)]
     if adult_too and settings.get("adult_enabled"):
         roots.append(adult_value(settings, "library"))
     out = []
@@ -34779,6 +35124,7 @@ class MainWindow(QMainWindow):
             self.account.entry_changed.connect(page.mark_dirty)
             self.library.updated.connect(page.mark_dirty)
         self.account.entry_changed.connect(self.on_entry_changed)
+        self.account.undoable.connect(self.offer_undo)
         self.setup_tray()
         self.account.message.connect(self.notify)
         self.account.message.connect(self.organize.append_log)
@@ -34891,7 +35237,9 @@ class MainWindow(QMainWindow):
         self.player_overlay = None   # when it's inside Kura
         self.player_popout = None    # when it's in its own window
         self.now_playing = NowPlaying(self.settings, self.account, self.library)
-        self.now_playing.notify.connect(self.notify)
+        # Taiga's anime-relations rules (continuous numbering → the right season), fetched again once a day
+        threading.Thread(target=tor.refresh_relations, daemon=True).start()
+        self.now_playing.notify.connect(self.recog_notify)
         self.now_playing.ask.connect(self.ask)
         self.settings_page.open_playback.connect(self.open_playback_settings)
         self.pending_ask = None
@@ -35046,7 +35394,7 @@ class MainWindow(QMainWindow):
             text = (f"Now airing: {title}, the sequel to {x['from_title']}" if x in started else
                     f"Sequel announced: {title} ({when_}), after {x['from_title']}")
             self.notify_action(text, "Add to Planning",
-                               lambda mid=m["id"], mm=m: self.account.save(mid, mm, status="PLANNING"),
+                               lambda mid=m["id"], mm=m: self.account.save(mid, mm, undo=True, status="PLANNING"),
                                mid=m["id"], kind="sequel", sub=when_ or "", act={"media": m["id"]})
         if len(new) + len(started) > 3:
             self.remember_note(f"{len(new) + len(started) - 3} more sequel updates on the Kickoff page", "sequel",
@@ -36586,6 +36934,19 @@ class MainWindow(QMainWindow):
         elif self.tray.isVisible():
             self.tray.showMessage(APP_NAME, text, self.windowIcon(), 8000)
 
+    def offer_undo(self, text, restore):
+        """A status you just changed, with Undo (Settings → Playback → AniList progress can turn it off)."""
+        if self.settings.get("list_undo", True) and self.isVisible() and not self.isMinimized():
+            self.toast.show_action(text, "Undo", restore, ms=8000)
+
+    def recog_notify(self, text):
+        """Recognition's messages. You're in another player or a browser then, with Kura behind it: an in-app
+        message there was never seen (user, Nov 10 2026: "Kura doesn't pick it up like Taiga does"), so it's a
+        Windows notification unless Kura is the window you're using. "Now playing" goes in the bell too."""
+        self.notify(text, keep=True if text.startswith("Now playing") else None)
+        if not self.isActiveWindow() and self.isVisible() and not self.isMinimized() and self.tray.isVisible():
+            self.tray.showMessage(APP_NAME, text, self.windowIcon(), 8000)
+
     def quit_app(self):
         self.quitting = True
         if self.job is not None:   # closeEvent will explain; make sure the window is visible for that
@@ -37582,6 +37943,25 @@ class SetupFlow(QFrame):
         v.addLayout(self.folder_row("library", "folder", self.count_library))
         self.found = label("", "faint", wrap=True)
         v.addWidget(self.found)
+        # anime on other drives (a friend's "I don't have all of my anime on the one drive", Nov 10 2026)
+        more = QFrame()
+        more.setObjectName("setupmore")
+        more.setStyleSheet(f"QFrame#setupmore {{ background: rgba(255,255,255,0.03); border: 1px solid {C['border']};"
+                           f" border-radius: 12px; }}")
+        mv = QVBoxLayout(more)
+        mv.setContentsMargins(14, 12, 14, 12)
+        mv.setSpacing(8)
+        t = QLabel("Anime on other drives too?")
+        t.setStyleSheet(f"color: {C['text']}; font-weight: 600;")
+        mv.addWidget(t)
+        mv.addWidget(label("Add them and they show up in your Library as well. Kura only reads these folders and never "
+                           "moves anything in them.", "muted", wrap=True))
+        self.extra_box = QWidget()
+        self.extra_box.setStyleSheet("background: transparent;")
+        self.extra_flow = FlowLayout(self.extra_box, spacing=6)
+        mv.addWidget(self.extra_box)
+        v.addWidget(more)
+        self.fill_extra_folders()
         v.addWidget(label("NEW DOWNLOADS LAND IN", "faint"))
         v.addLayout(self.folder_row("downloads", "download"))
         sort = QHBoxLayout()
@@ -37596,6 +37976,50 @@ class SetupFlow(QFrame):
         v.addLayout(self.nav())
         self.count_library()
         return w
+
+    def fill_extra_folders(self):
+        flow = self.extra_flow
+        while flow.count():
+            it = flow.takeAt(0)
+            if it and it.widget():
+                it.widget().deleteLater()
+        for root in self.s.get("library_extra") or []:
+            try:
+                n = sum(1 for d in Path(root).iterdir() if d.is_dir() and not d.name.startswith((".", "$")))
+            except OSError:
+                n = 0
+            chip = QPushButton(f"{short_root(root)} · {n} show{'s' if n != 1 else ''}  ")
+            chip.setIcon(glyph_icon("close", C["muted"], C["text"], px=14))
+            chip.setLayoutDirection(Qt.RightToLeft)   # the × after the text
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setToolTip(f"{root}\nClick to remove this folder")
+            chip.setStyleSheet(f"QPushButton {{ background: {C['surface2']}; border: none; border-radius: 11px;"
+                               f" padding: 4px 8px 4px 11px; color: {C['text']}; }}"
+                               f" QPushButton:hover {{ background: {C['hover']}; }}")
+            chip.clicked.connect(lambda _=False, r=root: (
+                self.s.__setitem__("library_extra", [x for x in self.s.get("library_extra") or [] if x != r]),
+                self.fill_extra_folders()))
+            flow.addWidget(chip)
+        add = QPushButton(" Add a folder")
+        add.setIcon(glyph_icon("add", C["accent_hi"], C["text"], px=16))
+        add.setCursor(Qt.PointingHandCursor)
+        add.setStyleSheet(f"QPushButton {{ background: transparent; border: 1px dashed {C['accent']}; border-radius: 11px;"
+                          f" padding: 4px 12px; color: {C['accent_hi']}; }}"
+                          f" QPushButton:hover {{ background: rgba({accent_rgb()},0.15); }}")
+        add.clicked.connect(self.add_extra_folder)
+        flow.addWidget(add)
+        self.extra_box.updateGeometry()
+
+    def add_extra_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Add a library folder", "")
+        if not d:
+            return
+        d = str(Path(d))
+        main = self.s.get("library") or ""
+        have = [os.path.normcase(x) for x in [main, *(self.s.get("library_extra") or [])] if x]
+        if os.path.normcase(d) not in have:
+            self.s["library_extra"] = [*(self.s.get("library_extra") or []), d]
+        self.fill_extra_folders()
 
     def count_library(self):
         lib = Path(self.s.get("library") or "")
@@ -37741,9 +38165,10 @@ class SetupFlow(QFrame):
         ex.setHorizontalSpacing(16)
         ex.setVerticalSpacing(8)
         self.startup_on = get_startup()
+        self.want_planning = False   # (new installs download only what you're watching)
         items = [("Start with Windows (in the tray)", self.startup_on, self.set_startup_choice),
-                 ("Check for new episodes every 15 min", bool(self.s.get("torrent_auto_check")),
-                  lambda on: self.s.__setitem__("torrent_auto_check", on))]
+                 ("Also download shows on my Planning list", False,
+                  lambda on: setattr(self, "want_planning", on))]
         for i, (text, val, fn) in enumerate(items):
             row = QHBoxLayout()
             row.setSpacing(10)
@@ -37753,6 +38178,19 @@ class SetupFlow(QFrame):
             row.addWidget(label(text, "muted"), 1)
             ex.addLayout(row, i // 2, i % 2)
         v.addLayout(ex)
+        # how often to look for new episodes, chosen here (user, Nov 10 2026: setup said "every 15 min" and that
+        # was it; the interval was only in Settings)
+        chk = QHBoxLayout()
+        chk.setSpacing(10)
+        tg = Toggle(bool(self.s.get("torrent_auto_check")))
+        tg.toggled.connect(lambda on: self.s.__setitem__("torrent_auto_check", on))
+        chk.addWidget(tg)
+        chk.addWidget(label("Check for new episodes every", "muted"))
+        every = IntervalInput(self.s.get("torrent_interval_min") or 15)
+        every.changed.connect(lambda n: self.s.__setitem__("torrent_interval_min", n))
+        chk.addWidget(every)
+        chk.addStretch(1)
+        v.addLayout(chk)
         v.addStretch(1)
         v.addLayout(self.nav(next_text="Start Kura", extra=label("Next: Kura gets everything ready", "faint")))
         return w
@@ -37770,6 +38208,13 @@ class SetupFlow(QFrame):
             pass
         save_settings(s)
         apply_settings(s)
+        if getattr(self, "want_planning", False):
+            try:
+                enabled, filters = torrent_filters(s)
+                tor.set_downloads_planning(filters, True)
+                tor.save_filters(enabled, filters)
+            except OSError:
+                klog.exception("Setup: Planning downloads")
         self.finished.emit()
 
 

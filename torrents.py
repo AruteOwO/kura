@@ -271,6 +271,11 @@ def _parse_release(title):
 _FOUND = {}   # (normalised title, matcher's names) → AniList id: kept across matchers (made on every refilter)
 
 
+# anime-relations (Taiga's episode redirects) live in the organizer, which sorts by them too
+parse_relations, relation_rules, refresh_relations, redirect_episode = (org.parse_relations, org.relation_rules,
+                                                                       org.refresh_relations, org.redirect_episode)
+
+
 class Matcher:
     """Turns a parsed release (title + season + episode) into an AniList id and episode.
 
@@ -279,10 +284,12 @@ class Matcher:
     totals:  AniList id -> episode count
     """
 
-    def __init__(self, names, seasons, totals, close=None):
+    def __init__(self, names, seasons, totals, close=None, parts=None):
         """close: AniList ids worth a near match (shows you watch, plan or have): groups spell titles their own
-        way ("Daiseijo" for AniList's "Dai Seijo", "Hitakakusu" for "Hita Kakusu")."""
+        way ("Daiseijo" for AniList's "Dai Seijo", "Hitakakusu" for "Hita Kakusu").
+        parts: AniList ids that are the second half of a season ("Part 2", "2nd Cour"): "S3" doesn't count them."""
         self.names, self.seasons, self.totals = names, seasons, totals
+        self.parts = set(parts or ())
         self.compact = {}
         for k, mid in names.items():
             self.compact.setdefault(k.replace(" ", ""), mid)
@@ -323,12 +330,13 @@ class Matcher:
         return mid
 
     def match(self, name, season, episode):
-        key = norm(name)
+        key = base = norm(name)
         mid = self.lookup(key)
         if mid is None:   # "Title Season 2" / "Title 2nd Season" / "Title S2" spelled out in the name
             m = re.match(r"(.+?) (?:season (\d+)|(\d+)(?:st|nd|rd|th) season|s(\d+))$", key)
             if m:
-                mid = self.lookup(m.group(1))
+                base = m.group(1)
+                mid = self.lookup(base)
                 season = season or int(next(g for g in m.groups()[1:] if g))
         if mid is None:
             return None, episode
@@ -336,17 +344,49 @@ class Matcher:
         # "Title S2 - 05" where the name matched season 1: move to the second season.
         # If that season isn't known, don't guess (it would count as a season 1 episode).
         if season and season > 1 and chain[0] == mid:
-            if season > len(chain) or not chain[season - 1]:
-                return None, episode
-            mid = chain[season - 1]
+            # "Part 2" entries belong to the season before (Spy x Family S3 is AniList's 4th entry: S1, S1 Part 2,
+            # S2, S3; recognized as Season 2 before, Nov 10 2026)
+            heads = [c for c in chain if c and c not in self.parts]
+            if season <= len(heads):
+                mid = heads[season - 1]
+            else:   # no chain known (no library folder): the season's own title on your list ("Spy x Family Season 3")
+                mid = self.season_entry(base, season)
+                if mid is None:
+                    return None, episode
+                chain = self.seasons.get(mid) or [mid]
+        # Taiga's anime-relations rules first: they know where continuous numbering goes without any library
+        hop = redirect_episode(mid, episode) if episode else None
+        if hop:
+            return hop
         # Continuous numbering: episode 27 of a 26-episode season is the next season's episode 1
         if episode and mid in chain:
             i = chain.index(mid)
+            # a later season counted on from season 1 (Crunchyroll's Apothecary Diaries "Season 3" is 49, 50...): past
+            # its own count and past every season before it, the count starts at season 1. Counting on from season 3
+            # sent 49 into a Part 2 that hadn't aired (user, Nov 7 2026)
+            before = [self.totals.get(c) for c in chain[:i]]
+            if i and self.totals.get(mid) and episode > self.totals[mid] and all(before) and episode > sum(before):
+                episode -= sum(before)
             while i < len(chain) - 1 and self.totals.get(chain[i]) and episode > self.totals[chain[i]]:
                 episode -= self.totals[chain[i]]
                 i += 1
                 mid = chain[i]
         return mid, episode
+
+    def season_entry(self, base, n):
+        """An AniList id for "<title> season n" by the season's own title: "Season 3", "3rd Season", "3", or a
+        title that goes on after it ("Ore dake Level Up na Ken Season 2 Arise from the Shadow", only when one
+        show fits)."""
+        nth = {1: "1st", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
+        for k in (f"{base} season {n}", f"{base} {nth} season", f"{base} {n}", f"{base} s{n}"):
+            mid = self.names.get(k)
+            if mid is not None:
+                return mid
+        for pre in (f"{base} season {n} ", f"{base} {nth} season "):
+            hits = {mid for k, mid in self.names.items() if k.startswith(pre)}
+            if len(hits) == 1:
+                return hits.pop()
+        return None
 
 
 # ---------------------------------------------------------------- choosing what to download
@@ -417,6 +457,35 @@ def default_filters(quality="1080p"):
         _f("Prefer new versions", "prefer", [("episode_version", "gt", "1")]),
     ]
     return filters
+
+
+def downloads_planning(filters):
+    """Whether your filters select new episodes of shows on your Planning list."""
+    return any(f.get("enabled", True) and f.get("action") == "select" and
+               any(c.get("element") == "my_status" and c.get("op") == "is" and c.get("value") == "Planning"
+                   for c in f.get("conditions") or [])
+               for f in filters)
+
+
+def set_downloads_planning(filters, on):
+    """Turn Planning shows on or off for downloads, in place: on adds the "Select planning" preset; off takes
+    "Planning" out of every Select filter (your own "Select Watching" with Planning in it keeps Watching) and drops a
+    filter left with nothing (Settings → Torrents and setup, user Nov 10 2026: a user with 500+ Planning shows)."""
+    if on:
+        if not downloads_planning(filters):
+            filters.append(json.loads(json.dumps(next(p[2] for p in PRESETS if p[2]["name"] == "Select planning"))))
+        return
+    for f in list(filters):
+        if f.get("action") != "select":
+            continue
+        conds = f.get("conditions") or []
+        keep = [c for c in conds if not (c.get("element") == "my_status" and c.get("op") == "is"
+                                         and c.get("value") == "Planning")]
+        if len(keep) != len(conds):
+            if keep:
+                f["conditions"] = keep
+            else:
+                filters.remove(f)
 
 
 PRESETS = [  # (title, description, filter)

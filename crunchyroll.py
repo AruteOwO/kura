@@ -189,9 +189,22 @@ class Crunchyroll:
         return self._request(url, headers={"Authorization": f"Bearer {self.access}"})
 
     # ---- your data
+    def profile_id(self):
+        """Whose history and watchlist: the Crunchyroll profile this sign-in is for (accounts can have several,
+        "Who's watching?"). It's in the access token. The account id only equals the main profile's: a sign-in
+        made on another profile got 403 content.get_watch_history_v2.forbidden (a user's "Rob" profile, Nov 10 2026)."""
+        if not self.access or time.time() >= self.expires:
+            self._ensure()
+        try:
+            part = self.access.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+            return claims.get("profile_id") or self.creds["account_id"]
+        except (IndexError, ValueError, AttributeError):
+            return self.creds["account_id"]
+
     def history_pages(self, locale="en-US", page_size=100):
         """Watch history, newest first, one page at a time (Crunchyroll uses a cursor)."""
-        url = f"/content/v2/{self.creds['account_id']}/watch-history"
+        url = f"/content/v2/{self.profile_id()}/watch-history"
         params = {"page_size": page_size, "locale": locale}
         seen = set()
         while url and url not in seen:
@@ -236,7 +249,7 @@ class Crunchyroll:
         """Series on your Crunchyroll watchlist: [{series_id, title, never_watched}]."""
         out, start = {}, 0
         while True:
-            body = self.get(f"/content/v2/discover/{self.creds['account_id']}/watchlist",
+            body = self.get(f"/content/v2/discover/{self.profile_id()}/watchlist",
                             {"order": "desc", "n": 100, "start": start, "locale": locale})
             items = body.get("data") or []
             for i in items:
@@ -253,7 +266,7 @@ class Crunchyroll:
 
     def latest(self, locale="en-US"):
         """The most recent play (for "now watching")."""
-        body = self.get(f"/content/v2/{self.creds['account_id']}/watch-history", {"page_size": 1, "locale": locale})
+        body = self.get(f"/content/v2/{self.profile_id()}/watch-history", {"page_size": 1, "locale": locale})
         items = [e for e in (parse_item(i) for i in body.get("data") or []) if e]
         return items[0] if items else None
 

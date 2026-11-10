@@ -333,6 +333,7 @@ class Account(QObject):
     changed = Signal()            # signed in/out or the whole list reloaded
     entry_changed = Signal(int)   # one entry edited (media id)
     message = Signal(str)         # something to tell the user (errors mostly)
+    undoable = Signal(str, object)   # a status you just changed: what it says, and a function that puts it back
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -446,9 +447,11 @@ class Account(QObject):
         self._run(lambda: (gql(QUERY_VIEWER, token=token)["Viewer"], fetch_list(token, uid)), done)
 
     # ---- editing
-    def save(self, media_id, media=None, **fields):
+    def save(self, media_id, media=None, undo=False, **fields):
         """Change your entry for one show. The app updates at once; AniList gets the
-        change after a short pause so quick clicks become one request."""
+        change after a short pause so quick clicks become one request. undo=True (a status you picked): Kura
+        offers Undo, which puts the entry back as it was (a user set a show to Watching by accident, Nov 10 2026)."""
+        before = self._snapshot(media_id) if undo else None
         e = self.entries.get(media_id)
         if e is None:
             e = self.entries[media_id] = {"mediaId": media_id, "status": None, "progress": 0, "score": 0,
@@ -469,6 +472,30 @@ class Account(QObject):
             timer.setInterval(900)
             timer.timeout.connect(lambda m=media_id: self._commit(m))
         timer.start()
+        if undo and fields.get("status") != (before or {}).get("status"):
+            t = (e.get("media") or {}).get("title") or {}
+            name = t.get("english") or t.get("romaji") or "This show"
+            self.undoable.emit(f"{name}: {STATUS_NAMES.get(fields.get('status'), 'changed')}",
+                               lambda: self._restore(media_id, before))
+
+    UNDO_KEYS = ("status", "progress", "repeat", "startedAt", "completedAt")
+
+    def _snapshot(self, media_id):
+        """The entry before a change (None: not on your list)."""
+        e = self.entries.get(media_id)
+        if not e or not e.get("status"):
+            return None
+        return json.loads(json.dumps({k: e.get(k) for k in self.UNDO_KEYS}))
+
+    def _restore(self, media_id, before):
+        if before is None:   # it wasn't on your list: off it again
+            self.remove(media_id)
+            return
+        blank = {"year": None, "month": None, "day": None}
+        fields = {k: v for k, v in before.items() if v is not None}
+        for k in ("startedAt", "completedAt"):
+            fields[k] = before.get(k) if (before.get(k) or {}).get("year") else blank
+        self.save(media_id, None, **fields)
 
     def _commit(self, media_id):
         fields = self.pending.pop(media_id, None)
@@ -516,7 +543,7 @@ class Account(QObject):
             fields["startedAt"] = today()
         self.save(media_id, media, **fields)
 
-    def set_status(self, media_id, status, media=None):
+    def set_status(self, media_id, status, media=None, undo=True):
         e = self.entries.get(media_id) or {}
         media = media or e.get("media") or {}
         fields = {"status": status}
@@ -529,7 +556,7 @@ class Account(QObject):
             fields["startedAt"] = today()
         if status == "REPEATING":
             fields["progress"] = 0
-        self.save(media_id, media, **fields)
+        self.save(media_id, media, undo=undo, **fields)
 
     def remove(self, media_id):
         e = self.entries.pop(media_id, None)

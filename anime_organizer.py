@@ -1310,11 +1310,136 @@ def folder_offset(entry, cache, show_dir, season, numbers):
     return fits.pop() if len(fits) == 1 else None
 
 
+def anilist_starts(entry, cache):
+    """{season: its first continuous number} from AniList's episode counts ("Part 2" joined to the season before),
+    for seasons 2 and up whose earlier seasons all have a count."""
+    out, total = {}, 0
+    for k, parts in enumerate(numbered_seasons(entry, cache) or [], 1):
+        if k > 1:
+            out[k] = total + 1
+        counts = [episode_count(e["id"], cache) for e in parts]
+        if not all(counts):
+            break
+        total += sum(counts)
+    return out
+
+
+# ---------------------------------------------------------------- anime-relations (Taiga's episode redirects)
+# Taiga's community file (github.com/erengy/anime-relations, public domain): "161645:49-60 -> 195516:1-12" sends a
+# continuously numbered episode to its own season without knowing your library (Kura only learned season chains
+# from library folders, so a new user's "Kusuriya no Hitorigoto - 50" was Season 1 episode 50; Nov 10 2026).
+RELATIONS_URL = "https://raw.githubusercontent.com/erengy/anime-relations/master/anime-relations.txt"
+RELATIONS_FILE = SCRIPT_DIR / "anime_relations.txt"
+_RELATIONS = {"mtime": None, "rules": {}}
+_RULE = re.compile(r"^-\s*([^:\s]+):([\d?]+(?:-[\d?]+)?)\s*->\s*([^:\s]+):([\d?]+(?:-[\d?]+)?)(!?)\s*$")
+
+
+def parse_relations(text):
+    """{AniList id: [(first, last or None, to AniList id, to first)]} from anime-relations.txt."""
+    rules, on = {}, False
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("::"):
+            on = line == "::rules"
+            continue
+        m = _RULE.match(line) if on else None
+        if not m:
+            continue
+        src, srange, dst, drange, bang = m.groups()
+        src_id = src.split("|")[2] if src.count("|") == 2 else "?"
+        dst_id = src_id if dst == "~" else (dst.split("|")[2] if dst.count("|") == 2 else "?")
+        if dst_id == "~":
+            dst_id = src_id
+        lo, _, hi = srange.partition("-")
+        dlo = drange.partition("-")[0]
+        if not (src_id.isdigit() and dst_id.isdigit() and lo.isdigit() and dlo.isdigit()):
+            continue
+        last = int(hi) if hi.isdigit() else (None if hi == "?" else int(lo))
+        rule = (int(lo), last, int(dst_id), int(dlo))
+        rules.setdefault(int(src_id), []).append(rule)
+        if bang:   # the later season's own name counting on ("Kusuriya no Hitorigoto 3rd Season - 49")
+            rules.setdefault(int(dst_id), []).append((int(lo), last, int(dst_id), int(dlo)))
+    return rules
+
+
+def relation_rules():
+    try:
+        mtime = RELATIONS_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if mtime != _RELATIONS["mtime"]:
+        try:
+            _RELATIONS["rules"] = parse_relations(RELATIONS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _RELATIONS["rules"] = {}
+        _RELATIONS["mtime"] = mtime
+    return _RELATIONS["rules"]
+
+
+def refresh_relations(max_age=86400):
+    """Download the file again when it's older than a day (Taiga checks it at start too). Background threads only;
+    a failure keeps the old copy."""
+    try:
+        if time.time() - RELATIONS_FILE.stat().st_mtime < max_age:
+            return False
+    except OSError:
+        pass
+    try:
+        req = urllib.request.Request(RELATIONS_URL, headers={"User-Agent": "Kura"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            text = resp.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError):
+        return False
+    if "::rules" not in text or not parse_relations(text):
+        return False
+    tmp = RELATIONS_FILE.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, RELATIONS_FILE)
+    return True
+
+
+def redirect_episode(mid, episode):
+    """(AniList id, episode) an anime-relations rule sends this episode to, or None."""
+    for lo, hi, dst, dlo in relation_rules().get(mid, ()):
+        if episode >= lo and (hi is None or episode <= hi):
+            return dst, dlo + episode - lo
+    return None
+
+
+def relation_season(entry, episode, cache):
+    """(season, episode within it) from an anime-relations rule ("161645:49-60 -> 195516:1-12" = season 3), counting
+    "Part 2" entries into the season before like the folders do. None without a rule (or with one that leads off
+    the show's TV seasons: a special of its own)."""
+    hop = redirect_episode(entry["id"], episode)
+    if not hop:
+        return None
+    dst, ep = hop
+    for k, parts in enumerate(numbered_seasons(entry, cache) or [], 1):
+        ids = [e["id"] for e in parts]
+        if dst in ids:
+            before = [episode_count(i, cache) for i in ids[:ids.index(dst)]]
+            if not all(before):
+                return None
+            return k, sum(before) + ep
+    return None
+
+
 def target_season(entry, episode, cache, show_dir):
     """Which season a continuously numbered episode belongs to: your folders' ranges when they
     have them, else AniList's episode counts. (season, episode within it) or (None, episode)."""
+    ruled = relation_season(entry, episode, cache)   # Taiga's anime-relations first: it knows, folders guess
+    if ruled:
+        return ruled
     starts = {**continuous_starts(show_dir), **remembered_starts(show_dir)}
     if starts:
+        # a folder's lowest number is only where it starts when nothing is missing: episodes that came out of order
+        # ("52" sorted before 49 and 50) would make season 3 start at 52. Where AniList's counts say a season starts
+        # earlier, that wins; seasons before the folders' ranges use AniList's starts too (47 is season 2, not 1).
+        # Later seasons stay with your folders: a "Season 2" holding 53-95 keeps them.
+        known = anilist_starts(entry, cache)
+        top = max(starts)
+        starts = {**{k: v for k, v in known.items() if k < top},
+                  **{k: min(v, known.get(k, v)) for k, v in starts.items()}}
         fits = [k for k, first in starts.items() if first <= episode]
         if fits:
             k = max(fits)

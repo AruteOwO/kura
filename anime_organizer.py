@@ -105,6 +105,7 @@ OVERRIDES = {}
 FOLDER_SEASONS = {}   # {show folder name, lowercase: {subfolder name: season number}} ("counts as Season 2")
 DISPLAY_TITLES = {}   # {AniList ID as text: the title Kura shows}
 EPISODE_SPLIT = {}    # {AniList ID as text: AniList episodes per file} (two-in-one episodes)
+SIDES = {}            # {AniList ID: True = Hentai side, False = Anime side}: your own choice, over AniList's 18+ flag
 
 # ======================================================================
 
@@ -123,7 +124,8 @@ def load_user_overrides():
     """Your fixes from user_overrides.json into OVERRIDES / SEASON_COVERS / FOLDER_SEASONS / DISPLAY_TITLES /
     EPISODE_SPLIT (kept as the same dict objects, so every module that holds them sees the change). The file:
     {"titles": {folder or title, lowercase: AniList id}, "seasons": {show folder, lowercase: {"2": id}},
-     "folder_seasons": {show folder, lowercase: {subfolder: n}}, "display": {"id": title}, "split": {"id": 2}}."""
+     "folder_seasons": {show folder, lowercase: {subfolder: n}}, "display": {"id": title}, "split": {"id": 2},
+     "sides": {"id": "adult" / "anime"}}."""
     try:
         data = json.loads(USER_OVERRIDES_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -138,6 +140,8 @@ def load_user_overrides():
     DISPLAY_TITLES.update(data.get("display") or {})
     EPISODE_SPLIT.clear()
     EPISODE_SPLIT.update({k: int(v) for k, v in (data.get("split") or {}).items() if int(v) > 1})
+    SIDES.clear()
+    SIDES.update({int(k): v == "adult" for k, v in (data.get("sides") or {}).items() if str(k).isdigit()})
     return data
 
 
@@ -1130,6 +1134,23 @@ def is_adult_entry(entry, cache):
 
 
 QUERY_ADULT_MANY = "query ($ids: [Int]) { Page(perPage: 50) { media(id_in: $ids, type: ANIME) { id isAdult } } }"
+
+
+def side_is_adult(entry, cache):
+    """Which library a show's episodes go to: your own choice (Kura: Move to the Hentai / Anime side; a later
+    season follows the show it belongs to), else AniList's 18+ flag."""
+    if not entry:
+        return False
+    own = SIDES.get(entry["id"])
+    if own is None and SIDES:
+        try:
+            for m in (show_family(entry, cache) or {}).get("seasons", []):
+                own = SIDES.get(m["entry"]["id"])
+                if own is not None:
+                    break
+        except Exception:
+            own = None
+    return own if own is not None else is_adult_entry(entry, cache)
 
 
 def adult_ids(ids, cache):
@@ -2144,10 +2165,13 @@ def sort_file(video, library, cache, dry):
                          "skip": "the name doesn't say which show"})
         return None, None
     season = forced_season or season
-    if entry and ADULT_LIBRARY_DIR and is_adult_entry(entry, cache):   # 18+: the adult library instead
+    if entry and ADULT_LIBRARY_DIR and side_is_adult(entry, cache):   # 18+: the adult library instead
         library = Path(ADULT_LIBRARY_DIR)
         library.mkdir(parents=True, exist_ok=True)
-        log.info(f"  (18+ on AniList: into {library})")
+        log.info(f"  ({'18+ on AniList' if is_adult_entry(entry, cache) else 'you moved it to the Hentai side'}: "
+                 f"into {library})")
+    elif entry and SIDES and is_adult_entry(entry, cache):
+        log.info("  (18+ on AniList, but you moved it to the Anime side)")
     is_movie = want_movie or (entry is not None and entry["format"] == "MOVIE" and episode is None)
     fmt = (entry or {}).get("format")
     if fmt in ("OVA", "SPECIAL") and not types & {"MOVIE", "GEKIJOUBAN"}:

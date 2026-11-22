@@ -137,9 +137,21 @@ MEDIA_KEYS = ("id", "format", "status", "episodes", "season", "seasonYear", "sit
 ADULT = {"on": False}
 
 
-def is_adult(media):
-    """AniList's 18+ flag; entries synced before Kura asked for it: the Hentai genre."""
+def real_adult(media):
+    """AniList's 18+ flag itself (not your own choice of side): which site a show's torrents are on."""
     m = media or {}
+    if m.get("isAdult") is not None:
+        return bool(m["isAdult"])
+    return "Hentai" in (m.get("genres") or [])
+
+
+def is_adult(media):
+    """A show of the Hentai side: your own choice (Move to the Hentai / Anime side, org.SIDES), else AniList's 18+
+    flag; entries synced before Kura asked for it: the Hentai genre."""
+    m = media or {}
+    own = org.SIDES.get(m.get("id")) if org.SIDES else None
+    if own is not None:
+        return own
     if m.get("isAdult") is not None:
         return bool(m["isAdult"])
     return "Hentai" in (m.get("genres") or [])

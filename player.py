@@ -2807,10 +2807,24 @@ class PlayerView(QWidget):
             mpv_mod, self, keep_open="yes", input_default_bindings=False, osc=False, **decode, **extra,
             input_vo_keyboard=False, alang=s.get("player_audio_lang", "jpn,ja,eng"),
             slang=s.get("player_sub_lang", "eng,en"), sub_auto="fuzzy", volume=s.get("player_volume", 100),
-            volume_max=130, ytdl=False)
+            volume_max=130, ytdl=False,
+            # Read minutes ahead from local files too (mpv's default there is ~1 s): the library is a USB hard drive
+            # whose own timer spins it down when idle, and after a long pause playback froze until it woke up
+            # (user, Nov 2026). Paused, mpv keeps filling this, so an un-pause plays from memory meanwhile.
+            cache="yes", demuxer_max_bytes="300MiB", demuxer_max_back_bytes="64MiB")
         self.mpv = self.video.mpv
         self.video.installEventFilter(self)
         self.marks_ready.connect(self.on_marks)
+        # Settings → Player → Close a paused episode after: mpv says when it pauses (its own thread, so the window
+        # never waits on it); a timer closes the player once it has stayed paused that long
+        self.paused_since = None
+        try:
+            self.mpv.observe_property("pause", lambda _n, v: setattr(
+                self, "paused_since", (self.paused_since or time.monotonic()) if v else None))
+        except Exception:
+            pass
+        self.pause_close_timer = QTimer(self, interval=15000, timeout=self.close_if_left_paused)
+        self.pause_close_timer.start()
 
         # top: round buttons in the corner (the title is in the dock)
         self.top = Bar(self, fade_down=True)
@@ -3719,7 +3733,8 @@ class PlayerView(QWidget):
                     self.place_floating()
                     self.show_controls()
                 elif self.settings.get("player_autonext", True) and nxt_i is not None:
-                    limit = int(self.settings.get("player_still_watching", 3) or 0)
+                    on = self.settings.get("player_still_watching_on", True)
+                    limit = int(self.settings.get("player_still_watching", 3) or 0) if on else 0
                     if limit and self.auto_streak >= limit:   # nobody's touched anything for a while
                         self.still_card.ask(self.current.get("title") or "", self.auto_streak)
                         self.place_floating()
@@ -3900,6 +3915,55 @@ class PlayerView(QWidget):
             took = time.perf_counter() - t0
             logging.getLogger("kura").info(f"Player: un-paused after {away:.0f} min, the command took {took:.2f} s")
             self.paused_at = None
+            self.watch_after_pause(away)
+
+    def close_if_left_paused(self):
+        """Paused longer than Settings → Player → Close a paused episode (switch + minutes): the player closes,
+        keeping your place as a normal close does. (A long pause left the drive asleep and the player holding the
+        file; user, Nov 21 2026.)"""
+        mins = (self.settings.get("player_close_paused", 15) or 0) if self.settings.get("player_close_paused_on", True) else 0
+        since = self.paused_since
+        if not mins or since is None or not self.current or time.monotonic() - since < mins * 60:
+            return
+        logging.getLogger("kura").info(f"Player: closed after {mins} min paused (Settings → Player)")
+        self.paused_since = None
+        self.close_requested.emit()
+
+    def watch_after_pause(self, away):
+        """20 s after un-pausing from 5+ min: one kura.log line saying whether playback had to wait for the file (the
+        drive waking up), how much was in memory and how many frames were dropped. The waits come from mpv's own
+        thread (observed), so the window never asks mpv and waits."""
+        try:
+            buffered = self.mpv.demuxer_cache_duration or 0.0
+            drops = (self.mpv.frame_drop_count or 0) + (self.mpv.decoder_frame_drop_count or 0)
+        except Exception:
+            return
+        rec = {"t": time.monotonic(), "waits": [], "since": None}
+
+        def seen(_name, waiting):
+            if waiting and rec["since"] is None:
+                rec["since"] = time.monotonic()
+            elif not waiting and rec["since"] is not None:
+                rec["waits"].append(time.monotonic() - rec["since"])
+                rec["since"] = None
+        try:
+            self.mpv.observe_property("paused-for-cache", seen)
+        except Exception:
+            return
+
+        def report():
+            try:
+                self.mpv.unobserve_property("paused-for-cache", seen)
+                now = (self.mpv.frame_drop_count or 0) + (self.mpv.decoder_frame_drop_count or 0)
+            except Exception:
+                return
+            waited = sum(rec["waits"]) + (time.monotonic() - rec["since"] if rec["since"] else 0)
+            times = len(rec["waits"]) + (1 if rec["since"] else 0)
+            logging.getLogger("kura").info(
+                f"Player: 20 s after the {away:.0f} min pause: waited {waited:.1f} s for the file"
+                + (f" ({times} times)" if times > 1 else "") +
+                f", {buffered:.0f} s were in memory, {max(0, now - drops)} frames dropped")
+        QTimer.singleShot(20000, report)
 
     def skip(self, seconds):
         self.mpv.seek(seconds, "relative")
